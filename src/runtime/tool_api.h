@@ -24,18 +24,6 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     define the interface for implementing and plug-in the tools &
- *     runtime components into rDSN.
- *     In rDSN, both developement tools and runtime libraries
- *     (e.g., high performance components) are considered tools.
- *
- * Revision history:
- *     Mar., 2015, @imzhenyu (Zhenyu Guo), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 /*!
 @defgroup tool-api-hooks Join Points
 @ingroup tool-api
@@ -50,19 +38,30 @@ Component providers define the interface for the local components (e.g., network
 
 #pragma once
 
-// providers
-#include "utils/factory_store.h"
-#include "runtime/task/task_queue.h"
-#include "runtime/task/task_worker.h"
-#include "runtime/rpc/network.h"
+#include <stddef.h>
+#include <string>
+#include <vector>
+
+#include "rpc/message_parser.h"
+#include "rpc/network.h"
 #include "runtime/env_provider.h"
-#include "runtime/rpc/message_parser.h"
-#include "utils/logging_provider.h"
-#include "runtime/task/timer_service.h"
-#include "utils/sys_exit_hook.h"
+#include "task/task_queue.h"
+#include "task/task_spec.h"
+#include "task/task_worker.h"
+#include "task/timer_service.h"
+#include "utils/factory_store.h"
+#include "utils/join_point.h"
+#include "utils/logging_provider.h" // IWYU pragma: keep
 
 namespace dsn {
+class service_node;
+struct service_spec;
+
 namespace tools {
+
+// Define the interface for implementing and plug-in the tools & runtime components into rDSN.
+// In rDSN, both developement tools and runtime libraries (e.g., high performance components) are
+// considered tools.
 
 /*!
 @addtogroup tool-api-providers

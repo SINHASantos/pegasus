@@ -25,22 +25,33 @@
  */
 
 #include "service_engine.h"
-#include "runtime/task/task_engine.h"
-#include "runtime/rpc/rpc_engine.h"
 
-#include "utils/fmt_logging.h"
-#include "utils/filesystem.h"
-#include "utils/smart_pointers.h"
-#include "runtime/env_provider.h"
-#include "utils/command_manager.h"
-#include "runtime/tool_api.h"
+// IWYU pragma: no_include <ext/alloc_traits.h>
+#include <functional>
+#include <list>
+#include <unordered_map>
+#include <utility>
+
+#include "common/gpid.h"
+#include "fmt/core.h"
+#include "nlohmann/json.hpp"
+#include "rpc/rpc_engine.h"
+#include "rpc/rpc_message.h"
 #include "runtime/node_scoper.h"
-
-using namespace dsn::utils;
+#include "task/task.h"
+#include "task/task_engine.h"
+#include "task/task_spec.h"
+#include "utils/command_manager.h"
+#include "utils/factory_store.h"
+#include "utils/filesystem.h"
+#include "utils/fmt_logging.h"
+#include "utils/join_point.h"
+#include "utils/string_conv.h"
+#include "utils/strings.h"
 
 namespace dsn {
 
-service_node::service_node(service_app_spec &app_spec) { _app_spec = app_spec; }
+service_node::service_node(service_app_spec &app_spec) : _app_spec(app_spec) {}
 
 bool service_node::rpc_register_handler(task_code code,
                                         const char *extra_name,
@@ -57,7 +68,7 @@ bool service_node::rpc_unregister_handler(dsn::task_code rpc_code)
 error_code service_node::init_rpc_engine()
 {
     // init rpc engine
-    _rpc = make_unique<rpc_engine>(this);
+    _rpc = std::make_unique<rpc_engine>(this);
 
     // start rpc engine
     return _rpc->start(_app_spec);
@@ -66,7 +77,7 @@ error_code service_node::init_rpc_engine()
 dsn::error_code service_node::start_app()
 {
     CHECK(_entity, "entity hasn't initialized");
-    _entity->set_address(rpc()->primary_address());
+    _entity->set_host_port(rpc()->primary_host_port());
 
     std::vector<std::string> args;
     utils::split_args(spec().arguments.c_str(), args);
@@ -109,7 +120,7 @@ error_code service_node::start()
         dsn::utils::filesystem::create_directory(spec().data_dir);
 
     // init task engine
-    _computation = make_unique<task_engine>(this);
+    _computation = std::make_unique<task_engine>(this);
     _computation->create(_app_spec.pools);
     CHECK(!_computation->is_started(), "task engine must not be started at this point");
 
@@ -134,22 +145,19 @@ error_code service_node::start()
     return err;
 }
 
-void service_node::get_runtime_info(const std::string &indent,
-                                    const std::vector<std::string> &args,
-                                    /*out*/ std::stringstream &ss)
+std::string service_node::get_runtime_info(const std::vector<std::string> &args) const
 {
-    ss << indent << full_name() << ":" << std::endl;
-
-    std::string indent2 = indent + "\t";
-    _computation->get_runtime_info(indent2, args, ss);
+    nlohmann::json info;
+    info[full_name()] = _computation->get_runtime_info(args);
+    return info.dump(2);
 }
 
-void service_node::get_queue_info(
-    /*out*/ std::stringstream &ss)
+nlohmann::json service_node::get_queue_info() const
 {
-    ss << "{\"app_name\":\"" << full_name() << "\",\n\"thread_pool\":[\n";
-    _computation->get_queue_info(ss);
-    ss << "]}";
+    nlohmann::json info;
+    info["app_name"] = full_name();
+    info["thread_pool"] = _computation->get_queue_info();
+    return info;
 }
 
 rpc_request_task *service_node::generate_intercepted_request_task(message_ex *req)
@@ -179,41 +187,29 @@ service_engine::service_engine()
 {
     _env = nullptr;
 
-    _cmds.emplace_back(dsn::command_manager::instance().register_command(
-        {"engine"},
-        "engine - get engine internal information",
-        "engine [app-id]",
+    _cmds.emplace_back(dsn::command_manager::instance().register_single_command(
+        "engine",
+        "Get engine internal information, including threadpools and threads and queues in each "
+        "threadpool",
+        "[app-id]",
         &service_engine::get_runtime_info));
 
-    _cmds.emplace_back(dsn::command_manager::instance().register_command(
-        {"system.queue"},
-        "system.queue - get queue internal information",
+    _cmds.emplace_back(dsn::command_manager::instance().register_single_command(
         "system.queue",
+        "Get queue internal information, including the threadpool each queue belongs to, and the "
+        "queue name and size",
+        "",
         &service_engine::get_queue_info));
 }
 
 service_engine::~service_engine() { _nodes_by_app_id.clear(); }
 
-void service_engine::init_before_toollets(const service_spec &spec)
-{
-    _spec = spec;
-
-    // init common for all per-node providers
-    message_ex::s_local_hash =
-        (uint32_t)dsn_config_get_value_uint64("core",
-                                              "local_hash",
-                                              0,
-                                              "a same hash value from two processes indicate the "
-                                              "rpc code are registered in the same order, "
-                                              "and therefore the mapping between rpc code string "
-                                              "and integer is the same, which we leverage "
-                                              "for fast rpc handler lookup optimization");
-}
+void service_engine::init_before_toollets(const service_spec &spec) { _spec = spec; }
 
 void service_engine::init_after_toollets()
 {
     // init common providers (second half)
-    _env = factory_store<env_provider>::create(
+    _env = utils::factory_store<env_provider>::create(
         _spec.env_factory_name.c_str(), PROVIDER_TYPE_MAIN, nullptr);
     tls_dsn.env = _env;
 }
@@ -247,39 +243,47 @@ void service_engine::start_node(service_app_spec &app_spec)
 
 std::string service_engine::get_runtime_info(const std::vector<std::string> &args)
 {
-    std::stringstream ss;
-    if (args.size() == 0) {
-        ss << "" << service_engine::instance()._nodes_by_app_id.size()
-           << " nodes available:" << std::endl;
-        for (auto &kv : service_engine::instance()._nodes_by_app_id) {
-            ss << "\t" << kv.second->id() << "." << kv.second->full_name() << std::endl;
+    // Overview.
+    if (args.empty()) {
+        nlohmann::json overview;
+        nlohmann::json nodes;
+        for (const auto &nodes_by_app_id : service_engine::instance()._nodes_by_app_id) {
+            nodes.emplace_back(fmt::format(
+                "{}.{}", nodes_by_app_id.second->id(), nodes_by_app_id.second->full_name()));
         }
-    } else {
-        std::string indent = "";
-        int id = atoi(args[0].c_str());
-        auto it = service_engine::instance()._nodes_by_app_id.find(id);
-        if (it != service_engine::instance()._nodes_by_app_id.end()) {
-            auto args2 = args;
-            args2.erase(args2.begin());
-            it->second->get_runtime_info(indent, args2, ss);
-        } else {
-            ss << "cannot find node with given app id";
-        }
+        overview["available_nodes"] = nodes;
+        return overview.dump(2);
     }
-    return ss.str();
+
+    // Invalid argument.
+    int id;
+    if (!dsn::buf2int32(args[0], id)) {
+        nlohmann::json err_msg;
+        err_msg["error"] = "invalid argument, only one integer argument is acceptable";
+        return err_msg.dump(2);
+    }
+
+    // The query id is not found.
+    const auto &it = service_engine::instance()._nodes_by_app_id.find(id);
+    if (it == service_engine::instance()._nodes_by_app_id.end()) {
+        nlohmann::json err_msg;
+        err_msg["error"] = fmt::format("cannot find node with given app id({})", id);
+        return err_msg.dump(2);
+    }
+
+    // Query a special id.
+    auto tmp_args = args;
+    tmp_args.erase(tmp_args.begin());
+    return it->second->get_runtime_info(tmp_args);
 }
 
 std::string service_engine::get_queue_info(const std::vector<std::string> &args)
 {
-    std::stringstream ss;
-    ss << "[";
-    for (auto &it : service_engine::instance()._nodes_by_app_id) {
-        if (it.first != service_engine::instance()._nodes_by_app_id.begin()->first)
-            ss << ",";
-        it.second->get_queue_info(ss);
+    nlohmann::json info;
+    for (const auto &nodes_by_app_id : service_engine::instance()._nodes_by_app_id) {
+        info.emplace_back(nodes_by_app_id.second->get_queue_info());
     }
-    ss << "]";
-    return ss.str();
+    return info.dump(2);
 }
 
 bool service_engine::is_simulator() const { return _simulator; }

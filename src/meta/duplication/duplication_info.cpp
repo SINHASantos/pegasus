@@ -16,13 +16,23 @@
 // under the License.
 
 #include "duplication_info.h"
-#include "meta/meta_data.h"
 
-#include <rapidjson/prettywriter.h>
+#include "common/duplication_common.h"
+#include "runtime/api_layer1.h"
+#include "utils/flags.h"
 #include "utils/fmt_logging.h"
 
-namespace dsn {
-namespace replication {
+DSN_DEFINE_uint64(replication,
+                  dup_progress_min_update_period_ms,
+                  5000,
+                  "The minimum period in milliseconds that progress of duplication is updated");
+
+DSN_DEFINE_uint64(replication,
+                  dup_progress_min_report_period_ms,
+                  5ULL * 60 * 1000,
+                  "The minimum period in milliseconds that progress of duplication is reported");
+
+namespace dsn::replication {
 
 /*extern*/ void json_encode(dsn::json::JsonWriter &out, const duplication_status::type &s)
 {
@@ -48,7 +58,7 @@ namespace replication {
         s = it->second;
         return true;
     }
-    LOG_ERROR_F("unexpected duplication_status name: {}", name);
+    LOG_ERROR("unexpected duplication_status name: {}", name);
 
     // for forward compatibility issue, duplication of unexpected status
     // will be marked as invisible.
@@ -77,7 +87,7 @@ namespace replication {
         fmode = it->second;
         return true;
     }
-    LOG_ERROR_F("unexpected duplication_fail_mode name: {}", name);
+    LOG_ERROR("unexpected duplication_fail_mode name: {}", name);
     // marked as default value.
     fmode = duplication_fail_mode::FAIL_SLOW;
     return false;
@@ -115,8 +125,13 @@ void duplication_info::init_progress(int partition_index, decree d)
     zauto_write_lock l(_lock);
 
     auto &p = _progress[partition_index];
+
+    p.last_committed_decree = invalid_decree;
     p.volatile_decree = p.stored_decree = d;
+    p.is_altering = false;
+    p.last_progress_update_ms = 0;
     p.is_inited = true;
+    p.checkpoint_prepared = false;
 }
 
 bool duplication_info::alter_progress(int partition_index,
@@ -125,9 +140,18 @@ bool duplication_info::alter_progress(int partition_index,
     zauto_write_lock l(_lock);
 
     partition_progress &p = _progress[partition_index];
+
+    // last_committed_decree could be update at any time no matter whether progress is
+    // initialized or busy updating, since it is not persisted to remote meta storage.
+    // It is just collected from the primary replica of each partition.
+    if (confirm_entry.__isset.last_committed_decree) {
+        p.last_committed_decree = confirm_entry.last_committed_decree;
+    }
+
     if (!p.is_inited) {
         return false;
     }
+
     if (p.is_altering) {
         return false;
     }
@@ -136,15 +160,19 @@ bool duplication_info::alter_progress(int partition_index,
     if (p.volatile_decree < confirm_entry.confirmed_decree) {
         p.volatile_decree = confirm_entry.confirmed_decree;
     }
-    if (p.volatile_decree != p.stored_decree) {
-        // progress update is not supposed to be too frequent.
-        if (dsn_now_ms() > p.last_progress_update_ms + PROGRESS_UPDATE_PERIOD_MS) {
-            p.is_altering = true;
-            p.last_progress_update_ms = dsn_now_ms();
-            return true;
-        }
+
+    if (p.volatile_decree == p.stored_decree) {
+        return false;
     }
-    return false;
+
+    // Progress update is not supposed to be too frequent.
+    if (dsn_now_ms() < p.last_progress_update_ms + FLAGS_dup_progress_min_update_period_ms) {
+        return false;
+    }
+
+    p.is_altering = true;
+    p.last_progress_update_ms = dsn_now_ms();
+    return true;
 }
 
 void duplication_info::persist_progress(int partition_index)
@@ -162,58 +190,90 @@ void duplication_info::persist_status()
     zauto_write_lock l(_lock);
 
     if (!_is_altering) {
-        LOG_ERROR_PREFIX("callers never write a duplication that is not altering to meta store");
+        LOG_ERROR_PREFIX("the status of this duplication is not being altered: status={}, "
+                         "next_status={}, master_app_id={}, master_app_name={}, "
+                         "follower_cluster_name={}, follower_app_name={}",
+                         duplication_status_to_string(_status),
+                         duplication_status_to_string(_next_status),
+                         app_id,
+                         app_name,
+                         remote_cluster_name,
+                         remote_app_name);
         return;
     }
-    LOG_INFO_PREFIX("change duplication status from {} to {} successfully [app_id: {}]",
+
+    LOG_INFO_PREFIX("change duplication status from {} to {} successfully: master_app_id={}, "
+                    "master_app_name={}, follower_cluster_name={}, follower_app_name={}",
                     duplication_status_to_string(_status),
                     duplication_status_to_string(_next_status),
-                    app_id);
+                    app_id,
+                    app_name,
+                    remote_cluster_name,
+                    remote_app_name);
 
     _is_altering = false;
     _status = _next_status;
+    // Now we don't know what exactly is the next status, thus set DS_INIT temporarily.
     _next_status = duplication_status::DS_INIT;
     _fail_mode = _next_fail_mode;
 }
 
 std::string duplication_info::to_string() const
 {
-    return duplication_entry_to_string(to_duplication_entry());
+    return duplication_entry_to_string(to_partition_level_entry_for_list());
 }
 
 blob duplication_info::to_json_blob() const
 {
     json_helper copy;
     copy.create_timestamp_ms = create_timestamp_ms;
-    copy.remote = follower_cluster_name;
+    copy.remote = remote_cluster_name;
     copy.status = _next_status;
     copy.fail_mode = _next_fail_mode;
+    copy.remote_app_name = remote_app_name;
+    copy.remote_replica_count = remote_replica_count;
     return json::json_forwarder<json_helper>::encode(copy);
 }
 
 void duplication_info::report_progress_if_time_up()
 {
-    // progress report is not supposed to be too frequent.
-    if (dsn_now_ms() > _last_progress_report_ms + PROGRESS_REPORT_PERIOD_MS) {
-        _last_progress_report_ms = dsn_now_ms();
-        LOG_INFO_F("duplication report: {}", to_string());
+    // Progress report is not supposed to be too frequent.
+    if (dsn_now_ms() < _last_progress_report_ms + FLAGS_dup_progress_min_report_period_ms) {
+        return;
     }
+
+    _last_progress_report_ms = dsn_now_ms();
+    LOG_INFO("duplication report: {}", to_string());
 }
 
 duplication_info_s_ptr duplication_info::decode_from_blob(dupid_t dup_id,
                                                           int32_t app_id,
                                                           const std::string &app_name,
                                                           int32_t partition_count,
-                                                          std::string store_path,
+                                                          int32_t replica_count,
+                                                          const std::string &store_path,
                                                           const blob &json)
 {
     json_helper info;
     if (!json::json_forwarder<json_helper>::decode(json, info)) {
         return nullptr;
     }
-    std::vector<rpc_address> meta_list;
-    if (!dsn::replication::replica_helper::load_meta_servers(
-            meta_list, duplication_constants::kClustersSectionName.c_str(), info.remote.c_str())) {
+
+    if (info.remote_app_name.empty()) {
+        // remote_app_name is missing, which means meta data in remote storage(zk) is
+        // still of old version(< v2.6.0).
+        info.remote_app_name = app_name;
+    }
+
+    if (info.remote_replica_count == 0) {
+        // remote_replica_count is missing, which means meta data in remote storage(zk) is
+        // still of old version(< v2.6.0).
+        info.remote_replica_count = replica_count;
+    }
+
+    std::vector<host_port> meta_list;
+    if (!dsn::replication::replica_helper::load_servers_from_config(
+            duplication_constants::kClustersSectionName, info.remote, meta_list)) {
         return nullptr;
     }
 
@@ -221,27 +281,22 @@ duplication_info_s_ptr duplication_info::decode_from_blob(dupid_t dup_id,
                                                   app_id,
                                                   app_name,
                                                   partition_count,
+                                                  info.remote_replica_count,
                                                   info.create_timestamp_ms,
-                                                  std::move(info.remote),
+                                                  info.remote,
+                                                  info.remote_app_name,
                                                   std::move(meta_list),
-                                                  std::move(store_path));
+                                                  store_path);
     dup->_status = info.status;
     dup->_fail_mode = info.fail_mode;
     return dup;
 }
 
-void duplication_info::append_if_valid_for_query(
-    const app_state &app,
-    /*out*/ std::vector<duplication_entry> &entry_list) const
+void duplication_info::append_as_entry(std::vector<duplication_entry> &entry_list) const
 {
     zauto_read_lock l(_lock);
 
-    entry_list.emplace_back(to_duplication_entry());
-    duplication_entry &ent = entry_list.back();
-    // the confirmed decree is not useful for displaying
-    // the overall state of duplication
-    ent.__isset.progress = false;
+    entry_list.emplace_back(to_partition_level_entry_for_list());
 }
 
-} // namespace replication
-} // namespace dsn
+} // namespace dsn::replication

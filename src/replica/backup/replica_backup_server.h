@@ -17,20 +17,12 @@
 
 #pragma once
 
-#include "meta_admin_types.h"
-#include "partition_split_types.h"
-#include "duplication_types.h"
-#include "bulk_load_types.h"
-#include "backup_types.h"
-#include "consensus_types.h"
-#include "replica_admin_types.h"
-#include "runtime/rpc/rpc_holder.h"
-
 #include "common/backup_common.h"
 
 namespace dsn {
 namespace replication {
 
+class backup_clear_request;
 class replica_stub;
 
 // A server distributes the cold-backup task to the targeted replica.
@@ -38,6 +30,7 @@ class replica_backup_server
 {
 public:
     explicit replica_backup_server(const replica_stub *rs);
+    ~replica_backup_server();
 
 private:
     void on_cold_backup(backup_rpc rpc);

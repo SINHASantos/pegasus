@@ -23,11 +23,12 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #pragma once
 
 #include "runtime/service_app.h"
-#include "runtime/rpc/rpc_holder.h"
-#include "runtime/rpc/serialization.h"
+#include "rpc/rpc_holder.h"
+#include "rpc/serialization.h"
 
 namespace dsn {
 /*!
@@ -246,4 +247,4 @@ inline void serverlet<T>::reply(dsn::message_ex *request, const TResponse &resp)
     dsn_rpc_reply(msg);
 }
 /*@}*/
-} // end namespace
+} // namespace dsn

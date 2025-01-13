@@ -23,9 +23,11 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-#include "utils/fixed_size_buffer_pool.h"
+
+#include <stdio.h>
+
 #include "common/gpid.h"
-#include <cstring>
+#include "utils/fixed_size_buffer_pool.h"
 
 namespace dsn {
 
@@ -41,4 +43,4 @@ const char *gpid::to_string() const
     snprintf(b, bf.get_chunk_size(), "%d.%d", _value.u.app_id, _value.u.partition_index);
     return b;
 }
-}
+} // namespace dsn

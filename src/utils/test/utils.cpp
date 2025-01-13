@@ -24,29 +24,30 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
+#include <stddef.h>
+#include <list>
+#include <map>
+#include <set>
+#include <string>
+#include <tuple>
+#include <type_traits>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
-#include <gtest/gtest.h>
-
-#include "runtime/api_layer1.h"
+#include "gtest/gtest.h"
 #include "utils/autoref_ptr.h"
 #include "utils/binary_reader.h"
 #include "utils/binary_writer.h"
 #include "utils/crc.h"
+#include "utils/error_code.h"
 #include "utils/link.h"
 #include "utils/rand.h"
 #include "utils/strings.h"
 #include "utils/utils.h"
+#include "utils_types.h"
 
-using namespace ::dsn;
-using namespace ::dsn::utils;
+namespace dsn::utils {
 
 TEST(core, get_last_component)
 {
@@ -114,6 +115,208 @@ TEST(core, check_c_string_empty)
         check_nonempty(p);
     }
 }
+
+using c_string_equality = std::tuple<const char *, const char *, bool, bool>;
+
+class CStringEqualityTest : public testing::TestWithParam<c_string_equality>
+{
+};
+
+TEST_P(CStringEqualityTest, CStringEquals)
+{
+    const char *lhs;
+    const char *rhs;
+    bool is_equal;
+    bool is_equal_ignore_case;
+    std::tie(lhs, rhs, is_equal, is_equal_ignore_case) = GetParam();
+
+    EXPECT_EQ(is_equal, dsn::utils::equals(lhs, rhs));
+
+    EXPECT_EQ(is_equal_ignore_case, dsn::utils::iequals(lhs, rhs));
+
+    if (rhs != nullptr) {
+        // Since NULL pointer cannot be used to construct std::string, related test cases
+        // are neglected.
+        std::string rhs_str(rhs);
+        EXPECT_EQ(is_equal_ignore_case, dsn::utils::iequals(lhs, rhs_str));
+    }
+
+    if (lhs != nullptr) {
+        // Since NULL pointer cannot be used to construct std::string, related test cases
+        // are neglected.
+        std::string lhs_str(lhs);
+        EXPECT_EQ(is_equal_ignore_case, dsn::utils::iequals(lhs_str, rhs));
+    }
+}
+
+const std::vector<c_string_equality> c_string_equality_tests = {
+    {nullptr, nullptr, true, true}, {nullptr, "", false, false}, {nullptr, "a", false, false},
+    {nullptr, "abc", false, false}, {"", nullptr, false, false}, {"a", nullptr, false, false},
+    {"abc", nullptr, false, false}, {"", "", true, true},        {"", "a", false, false},
+    {"", "abc", false, false},      {"a", "", false, false},     {"abc", "", false, false},
+    {"a", "a", true, true},         {"a", "A", false, true},     {"A", "A", true, true},
+    {"abc", "abc", true, true},     {"aBc", "abc", false, true}, {"abc", "ABC", false, true},
+    {"a", "abc", false, false},     {"A", "abc", false, false},  {"abc", "a", false, false},
+    {"Abc", "a", false, false},
+};
+
+INSTANTIATE_TEST_SUITE_P(StringTest,
+                         CStringEqualityTest,
+                         testing::ValuesIn(c_string_equality_tests));
+
+using c_string_n_bytes_equality = std::tuple<const char *, const char *, size_t, bool, bool, bool>;
+
+class CStringNBytesEqualityTest : public testing::TestWithParam<c_string_n_bytes_equality>
+{
+};
+
+TEST_P(CStringNBytesEqualityTest, CStringNBytesEquals)
+{
+    const char *lhs;
+    const char *rhs;
+    size_t n;
+    bool is_equal;
+    bool is_equal_ignore_case;
+    bool is_equal_memory;
+    std::tie(lhs, rhs, n, is_equal, is_equal_ignore_case, is_equal_memory) = GetParam();
+
+    EXPECT_EQ(is_equal, dsn::utils::equals(lhs, rhs, n));
+
+    EXPECT_EQ(is_equal_ignore_case, dsn::utils::iequals(lhs, rhs, n));
+
+    if (rhs != nullptr) {
+        // Since NULL pointer cannot be used to construct std::string, related test cases
+        // are neglected.
+        std::string rhs_str(rhs);
+        EXPECT_EQ(is_equal_ignore_case, dsn::utils::iequals(lhs, rhs_str, n));
+    }
+
+    if (lhs != nullptr) {
+        // Since NULL pointer cannot be used to construct std::string, related test cases
+        // are neglected.
+        std::string lhs_str(lhs);
+        EXPECT_EQ(is_equal_ignore_case, dsn::utils::iequals(lhs_str, rhs, n));
+    }
+
+    EXPECT_EQ(is_equal_memory, dsn::utils::mequals(lhs, rhs, n));
+}
+
+const std::vector<c_string_n_bytes_equality> c_string_n_bytes_equality_tests = {
+    {nullptr, nullptr, 0, true, true, true},
+    {nullptr, nullptr, 1, true, true, true},
+    {nullptr, "", 0, false, false, false},
+    {nullptr, "", 1, false, false, false},
+    {nullptr, "a", 0, false, false, false},
+    {nullptr, "a", 1, false, false, false},
+    {nullptr, "abc", 0, false, false, false},
+    {nullptr, "abc", 1, false, false, false},
+    {"", nullptr, 0, false, false, false},
+    {"", nullptr, 1, false, false, false},
+    {"a", nullptr, 0, false, false, false},
+    {"a", nullptr, 1, false, false, false},
+    {"abc", nullptr, 0, false, false, false},
+    {"abc", nullptr, 1, false, false, false},
+    {"", "", 0, true, true, true},
+    {"", "", 1, true, true, true},
+    {"\0", "a", 1, false, false, false},
+    {"\0\0\0", "abc", 3, false, false, false},
+    {"a", "\0", 1, false, false, false},
+    {"abc", "\0\0\0", 3, false, false, false},
+    {"a", "a", 1, true, true, true},
+    {"a", "A", 1, false, true, false},
+    {"A", "A", 1, true, true, true},
+    {"abc", "abc", 3, true, true, true},
+    {"aBc", "abc", 3, false, true, false},
+    {"abc", "ABC", 3, false, true, false},
+    {"a\0\0", "abc", 3, false, false, false},
+    {"A\0\0", "abc", 3, false, false, false},
+    {"abc", "a\0\0", 3, false, false, false},
+    {"abc", "xyz", 0, true, true, true},
+    {"Abc", "a\0\0", 3, false, false, false},
+    {"a", "abc", 1, true, true, true},
+    {"a", "Abc", 1, false, true, false},
+    {"abc", "a", 1, true, true, true},
+    {"Abc", "a", 1, false, true, false},
+    {"abc", "abd", 2, true, true, true},
+    {"abc", "ABd", 2, false, true, false},
+    {"abc\0opq", "abc\0xyz", 7, true, true, false},
+    {"abc\0opq", "ABC\0xyz", 7, false, true, false},
+    {"abc\0xyz", "abc\0xyz", 7, true, true, true},
+};
+
+INSTANTIATE_TEST_SUITE_P(StringTest,
+                         CStringNBytesEqualityTest,
+                         testing::ValuesIn(c_string_n_bytes_equality_tests));
+
+struct pattern_match_case
+{
+    std::string str;
+    std::string pattern;
+    pattern_match_type::type match_type;
+    error_code expected_err;
+};
+
+class PatternMatchTest : public testing::TestWithParam<pattern_match_case>
+{
+};
+
+const std::vector<pattern_match_case> pattern_match_tests = {
+    // Everything would be matched even if pattern is empty.
+    {"abc", "", pattern_match_type::PMT_MATCH_ALL, ERR_OK},
+    // Everything would be matched even if it is not matched completely.
+    {"abc", "xyz", pattern_match_type::PMT_MATCH_ALL, ERR_OK},
+    // It is matched exactly.
+    {"abc", "abc", pattern_match_type::PMT_MATCH_EXACT, ERR_OK},
+    // Empty string is matched exactly with empty pattern.
+    {"", "", pattern_match_type::PMT_MATCH_EXACT, ERR_OK},
+    // Non-empty string cannot be matched exactly with empty pattern.
+    {"abc", "", pattern_match_type::PMT_MATCH_EXACT, ERR_NOT_MATCHED},
+    // The string whose content is different from pattern would not be matched.
+    {"abc", "xyz", pattern_match_type::PMT_MATCH_EXACT, ERR_NOT_MATCHED},
+    // The pattern as a sub string would not be matched.
+    {"abc", "ab", pattern_match_type::PMT_MATCH_EXACT, ERR_NOT_MATCHED},
+    // It is matched with same prefix for anywhere.
+    {"abcdef", "ab", pattern_match_type::PMT_MATCH_ANYWHERE, ERR_OK},
+    // It is matched with same middle for anywhere.
+    {"abcdef", "cd", pattern_match_type::PMT_MATCH_ANYWHERE, ERR_OK},
+    // It is matched with same postfix for anywhere.
+    {"abcdef", "ef", pattern_match_type::PMT_MATCH_ANYWHERE, ERR_OK},
+    // It is matched with empty content for anywhere.
+    {"abcdef", "", pattern_match_type::PMT_MATCH_ANYWHERE, ERR_OK},
+    // It is not matched with different content for anywhere.
+    {"abcdef", "xyz", pattern_match_type::PMT_MATCH_ANYWHERE, ERR_NOT_MATCHED},
+    // It is matched for prefix.
+    {"abcdef", "ab", pattern_match_type::PMT_MATCH_PREFIX, ERR_OK},
+    // It is not matched with same middle for prefix.
+    {"abcdef", "cd", pattern_match_type::PMT_MATCH_PREFIX, ERR_NOT_MATCHED},
+    // It is not matched with same postfix for prefix.
+    {"abcdef", "ef", pattern_match_type::PMT_MATCH_PREFIX, ERR_NOT_MATCHED},
+    // It is not matched with different content for prefix.
+    {"abcdef", "xyz", pattern_match_type::PMT_MATCH_PREFIX, ERR_NOT_MATCHED},
+    // It is matched with empty content for prefix.
+    {"abcdef", "", pattern_match_type::PMT_MATCH_PREFIX, ERR_OK},
+    // It is matched for postfix.
+    {"abcdef", "ef", pattern_match_type::PMT_MATCH_POSTFIX, ERR_OK},
+    // It is not matched with same prefix for postfix.
+    {"abcdef", "ab", pattern_match_type::PMT_MATCH_POSTFIX, ERR_NOT_MATCHED},
+    // It is not matched with same middle for postfix.
+    {"abcdef", "cd", pattern_match_type::PMT_MATCH_POSTFIX, ERR_NOT_MATCHED},
+    // It is not matched with different content for postfix.
+    {"abcdef", "xyz", pattern_match_type::PMT_MATCH_PREFIX, ERR_NOT_MATCHED},
+    // It is matched with empty content for postfix.
+    {"abcdef", "", pattern_match_type::PMT_MATCH_POSTFIX, ERR_OK},
+    // PMT_MATCH_REGEX is still not supported.
+    {"unsupported", ".*", pattern_match_type::PMT_MATCH_REGEX, ERR_NOT_IMPLEMENTED},
+};
+
+TEST_P(PatternMatchTest, PatternMatch)
+{
+    const auto &test_case = GetParam();
+    const auto actual_err = pattern_match(test_case.str, test_case.pattern, test_case.match_type);
+    EXPECT_EQ(test_case.expected_err, actual_err);
+}
+
+INSTANTIATE_TEST_SUITE_P(StringTest, PatternMatchTest, testing::ValuesIn(pattern_match_tests));
 
 // For containers such as std::unordered_set, the expected result will be deduplicated
 // at initialization. Therefore, it can be used to compare with actual result safely.
@@ -309,6 +512,28 @@ TEST(core, dlink)
     EXPECT_TRUE(count == 0);
 }
 
+TEST(core, find_string_prefix)
+{
+    struct test_case
+    {
+        std::string input;
+        char separator;
+        std::string expected_prefix;
+    } tests[] = {{"", ' ', ""},
+                 {"abc.def", ' ', ""},
+                 {"abc.def", '.', "abc"},
+                 {"ab.cd.ef", '.', "ab"},
+                 {"abc...def", '.', "abc"},
+                 {".abc.def", '.', ""},
+                 {" ", ' ', ""},
+                 {"..", '.', ""},
+                 {". ", ' ', "."}};
+    for (const auto &test : tests) {
+        auto actual_output = find_string_prefix(test.input, test.separator);
+        EXPECT_EQ(actual_output, test.expected_prefix);
+    }
+}
+
 class foo : public ::dsn::ref_counter
 {
 public:
@@ -414,3 +639,36 @@ TEST(core, get_intersection)
     ASSERT_EQ(intersection.size(), 1);
     ASSERT_EQ(*intersection.begin(), 3);
 }
+
+struct has_space_case
+{
+    std::string str;
+    bool expected_has_space;
+};
+
+class HasSpaceTest : public testing::TestWithParam<has_space_case>
+{
+};
+
+TEST_P(HasSpaceTest, HasSpace)
+{
+    const auto &space_case = GetParam();
+    EXPECT_EQ(space_case.expected_has_space, has_space(space_case.str));
+}
+
+const std::vector<has_space_case> has_space_tests = {
+    {"abc xyz", true},
+    {" abcxyz", true},
+    {"abcxyz ", true},
+    {"abc  xyz", true},
+    {"abc\r\nxyz", true},
+    {"abc\r\nxyz", true},
+    {"abc\txyz", true},
+    {"abc\txyz", true},
+    {"abcxyz", false},
+    {"abc_xyz", false},
+};
+
+INSTANTIATE_TEST_SUITE_P(StringTest, HasSpaceTest, testing::ValuesIn(has_space_tests));
+
+} // namespace dsn::utils

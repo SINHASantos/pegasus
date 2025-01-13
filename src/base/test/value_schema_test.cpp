@@ -17,10 +17,21 @@
  * under the License.
  */
 
+#include <rocksdb/slice.h>
+#include <stdint.h>
+#include <array>
+#include <limits>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "base/pegasus_value_schema.h"
 #include "base/value_schema_manager.h"
-
-#include <gtest/gtest.h>
+#include "gtest/gtest.h"
+#include "utils/blob.h"
+#include <string_view>
+#include "value_field.h"
 
 using namespace pegasus;
 
@@ -41,15 +52,15 @@ uint64_t extract_time_tag(value_schema *schema, const std::string &raw_value)
 std::string generate_value(value_schema *schema,
                            uint32_t expire_ts,
                            uint64_t time_tag,
-                           dsn::string_view user_data)
+                           std::string_view user_data)
 {
     std::string write_buf;
     std::vector<rocksdb::Slice> write_slices;
     value_params params{write_buf, write_slices};
     params.fields[value_field_type::EXPIRE_TIMESTAMP] =
-        dsn::make_unique<expire_timestamp_field>(expire_ts);
-    params.fields[value_field_type::TIME_TAG] = dsn::make_unique<time_tag_field>(time_tag);
-    params.fields[value_field_type::USER_DATA] = dsn::make_unique<user_data_field>(user_data);
+        std::make_unique<expire_timestamp_field>(expire_ts);
+    params.fields[value_field_type::TIME_TAG] = std::make_unique<time_tag_field>(time_tag);
+    params.fields[value_field_type::USER_DATA] = std::make_unique<user_data_field>(user_data);
 
     rocksdb::SliceParts sparts = schema->generate_value(params);
     std::string raw_value;
@@ -106,7 +117,9 @@ TEST(value_schema, update_expire_ts)
         uint32_t expire_ts;
         uint32_t update_expire_ts;
     } tests[] = {
-        {0, 1000, 10086}, {1, 1000, 10086}, {2, 1000, 10086},
+        {0, 1000, 10086},
+        {1, 1000, 10086},
+        {2, 1000, 10086},
     };
 
     for (const auto &t : tests) {
@@ -116,7 +129,7 @@ TEST(value_schema, update_expire_ts)
         std::string raw_value = generate_value(schema, t.expire_ts, 0, "");
 
         std::unique_ptr<value_field> field =
-            dsn::make_unique<expire_timestamp_field>(t.update_expire_ts);
+            std::make_unique<expire_timestamp_field>(t.update_expire_ts);
         schema->update_field(raw_value, std::move(field));
         ASSERT_EQ(t.update_expire_ts, extract_expire_ts(schema, raw_value));
     }

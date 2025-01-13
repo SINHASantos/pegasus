@@ -17,9 +17,61 @@
  * under the License.
  */
 
-#include "shell/commands.h"
+// IWYU pragma: no_include <bits/getopt_core.h>
+#include <boost/cstdint.hpp>
+#include <boost/lexical_cast.hpp>
+#include <fmt/core.h>
+#include <fmt/format.h>
 #include <fmt/printf.h>
+#include <getopt.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <pegasus/error.h>
+#include <rocksdb/statistics.h>
+#include <stdio.h>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "client/replication_ddl_client.h"
+#include "common/gpid.h"
+#include "dsn.layer2_types.h"
+#include "geo/lib/geo_client.h"
 #include "idl_utils.h"
+#include "pegasus/client.h"
+#include "pegasus_key_schema.h"
+#include "pegasus_utils.h"
+#include "rpc/rpc_host_port.h"
+#include "rrdb/rrdb_types.h"
+#include "shell/args.h"
+#include "shell/command_executor.h"
+#include "shell/command_helper.h"
+#include "shell/command_utils.h"
+#include "shell/commands.h"
+#include "shell/sds/sds.h"
+#include "task/async_calls.h"
+#include "utils/blob.h"
+#include "utils/defer.h"
+#include "utils/error_code.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/metrics.h"
+#include "utils/output_utils.h"
+#include "utils/string_conv.h"
+
+DSN_DEFINE_int32(threadpool.THREAD_POOL_DEFAULT,
+                 worker_count,
+                 0,
+                 "get THREAD_POOL_DEFAULT worker_count.");
 
 static void
 print_current_scan_state(const std::vector<std::unique_ptr<scan_data_context>> &contexts,
@@ -1223,17 +1275,17 @@ bool hash_scan(command_executor *e, shell_context *sc, arguments args)
                 stderr, "ERROR: get scanner failed: %s\n", sc->pg_client->get_error_string(ret));
         }
     } else {
-        std::string hash_key;
+        std::string got_hash_key;
         std::string sort_key;
         std::string value;
         pegasus::pegasus_client::internal_info info;
         while ((max_count <= 0 || count < max_count) &&
-               !(ret = scanner->next(hash_key, sort_key, value, &info))) {
+               !(ret = scanner->next(got_hash_key, sort_key, value, &info))) {
             if (!validate_filter(value_filter_type, value_filter_pattern, value))
                 continue;
             fprintf(file,
                     "\"%s\" : \"%s\"",
-                    pegasus::utils::c_escape_string(hash_key, sc->escape_all).c_str(),
+                    pegasus::utils::c_escape_string(got_hash_key, sc->escape_all).c_str(),
                     pegasus::utils::c_escape_string(sort_key, sc->escape_all).c_str());
             if (!options.no_value) {
                 fprintf(file,
@@ -1460,13 +1512,13 @@ bool full_scan(command_executor *e, shell_context *sc, arguments args)
         for (int i = 0; i < scanners.size(); i++) {
             if (partition >= 0 && partition != i)
                 continue;
-            std::string hash_key;
+            std::string got_hash_key;
             std::string sort_key;
             std::string value;
             pegasus::pegasus_client::internal_info info;
             pegasus::pegasus_client::pegasus_scanner *scanner = scanners[i];
             while ((max_count <= 0 || count < max_count) &&
-                   !(ret = scanner->next(hash_key, sort_key, value, &info))) {
+                   !(ret = scanner->next(got_hash_key, sort_key, value, &info))) {
                 if (sort_key_filter_type == pegasus::pegasus_client::FT_MATCH_EXACT &&
                     sort_key.length() > sort_key_filter_pattern.length())
                     continue;
@@ -1474,7 +1526,7 @@ bool full_scan(command_executor *e, shell_context *sc, arguments args)
                     continue;
                 fprintf(file,
                         "\"%s\" : \"%s\"",
-                        pegasus::utils::c_escape_string(hash_key, sc->escape_all).c_str(),
+                        pegasus::utils::c_escape_string(got_hash_key, sc->escape_all).c_str(),
                         pegasus::utils::c_escape_string(sort_key, sc->escape_all).c_str());
                 if (!options.no_value) {
                     fprintf(file,
@@ -1818,13 +1870,10 @@ bool copy_data(command_executor *e, shell_context *sc, arguments args)
                 "WARN: used multi_set will lose accurate ttl time per value! "
                 "ttl time will be assign the max value of this batch data.\n");
         op = SCAN_AND_MULTI_SET;
+
+        fprintf(stderr, "INFO: THREAD_POOL_DEFAULT worker_count = %d\n", FLAGS_worker_count);
         // threadpool worker_count should greater than source app scanner count
-        int worker_count = dsn_config_get_value_int64("threadpool.THREAD_POOL_DEFAULT",
-                                                      "worker_count",
-                                                      0,
-                                                      "get THREAD_POOL_DEFAULT worker_count.");
-        fprintf(stderr, "INFO: THREAD_POOL_DEFAULT worker_count = %d\n", worker_count);
-        if (worker_count <= split_count) {
+        if (FLAGS_worker_count <= split_count) {
             fprintf(stderr,
                     "INFO: THREAD_POOL_DEFAULT worker_count should greater than source app scanner "
                     "count %d",
@@ -2166,6 +2215,93 @@ bool clear_data(command_executor *e, shell_context *sc, arguments args)
     return true;
 }
 
+namespace {
+
+inline dsn::metric_filters rdb_estimated_keys_filters(int32_t table_id)
+{
+    dsn::metric_filters filters;
+    filters.with_metric_fields = {dsn::kMetricNameField, dsn::kMetricSingleValueField};
+    filters.entity_types = {"replica"};
+    filters.entity_attrs = {"table_id", std::to_string(table_id)};
+    filters.entity_metrics = {"rdb_estimated_keys"};
+    return filters;
+}
+
+// Given a table and all of its partitions, aggregate partition-level stats for rdb_estimated_keys.
+// All selected partitions should have their primary replicas on this node.
+std::unique_ptr<aggregate_stats_calcs>
+create_rdb_estimated_keys_stats_calcs(const int32_t table_id,
+                                      const std::vector<dsn::partition_configuration> &pcs,
+                                      const dsn::host_port &node,
+                                      const std::string &entity_type,
+                                      std::vector<row_data> &rows)
+{
+    CHECK_EQ(rows.size(), pcs.size());
+
+    partition_stat_map sums;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        if (pcs[i].hp_primary != node) {
+            // Ignore once the replica of the metrics is not the primary of the partition.
+            continue;
+        }
+
+        // Add (table id, partition_id, metric_name) as dimensions.
+        sums.emplace(dsn::gpid(table_id, i),
+                     stat_var_map({{"rdb_estimated_keys", &rows[i].rdb_estimate_num_keys}}));
+    }
+
+    auto calcs = std::make_unique<aggregate_stats_calcs>();
+    calcs->create_sums<partition_aggregate_stats>(entity_type, std::move(sums));
+    return calcs;
+}
+
+// Aggregate the partition-level rdb_estimated_keys for the specified table.
+bool get_rdb_estimated_keys_stats(shell_context *sc,
+                                  const std::string &table_name,
+                                  std::vector<row_data> &rows)
+{
+    std::vector<node_desc> nodes;
+    if (!fill_nodes(sc, "replica-server", nodes)) {
+        LOG_ERROR("get replica server node list failed");
+        return false;
+    }
+
+    int32_t table_id = 0;
+    int32_t partition_count = 0;
+    std::vector<dsn::partition_configuration> pcs;
+    const auto &err = sc->ddl_client->list_app(table_name, table_id, partition_count, pcs);
+    if (err != ::dsn::ERR_OK) {
+        LOG_ERROR("list app {} failed, error = {}", table_name, err);
+        return false;
+    }
+    CHECK_EQ(pcs.size(), partition_count);
+
+    const auto &results =
+        get_metrics(nodes, rdb_estimated_keys_filters(table_id).to_query_string());
+
+    rows.clear();
+    rows.reserve(partition_count);
+    for (int32_t i = 0; i < partition_count; ++i) {
+        rows.emplace_back(std::to_string(i));
+    }
+
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        RETURN_SHELL_IF_GET_METRICS_FAILED(
+            results[i], nodes[i], "rdb_estimated_keys for table(id={})", table_id);
+
+        auto calcs =
+            create_rdb_estimated_keys_stats_calcs(table_id, pcs, nodes[i].hp, "replica", rows);
+        RETURN_SHELL_IF_PARSE_METRICS_FAILED(calcs->aggregate_metrics(results[i].body()),
+                                             nodes[i],
+                                             "aggregate rdb_estimated_keys for table(id={})",
+                                             table_id);
+    }
+
+    return true;
+}
+
+} // anonymous namespace
+
 bool count_data(command_executor *e, shell_context *sc, arguments args)
 {
     static struct option long_options[] = {{"precise", no_argument, 0, 'c'},
@@ -2306,18 +2442,18 @@ bool count_data(command_executor *e, shell_context *sc, arguments args)
             return false;
         }
 
-        // get estimate key number
         std::vector<row_data> rows;
-        std::string app_name = sc->pg_client->get_app_name();
-        if (!get_app_stat(sc, app_name, rows)) {
-            fprintf(stderr, "ERROR: query app stat from server failed");
+        const std::string table_name(sc->pg_client->get_app_name());
+        CHECK(!table_name.empty(), "table_name must be non-empty, see data_operations()");
+
+        if (!get_rdb_estimated_keys_stats(sc, table_name, rows)) {
+            fprintf(stderr, "ERROR: get rdb_estimated_keys stats failed");
             return true;
         }
 
-        rows.resize(rows.size() + 1);
-        row_data &sum = rows.back();
-        sum.row_name = "(total:" + std::to_string(rows.size() - 1) + ")";
-        for (int i = 0; i < rows.size() - 1; ++i) {
+        rows.emplace_back(fmt::format("(total:{})", rows.size() - 1));
+        auto &sum = rows.back();
+        for (size_t i = 0; i < rows.size() - 1; ++i) {
             const row_data &row = rows[i];
             sum.rdb_estimate_num_keys += row.rdb_estimate_num_keys;
         }
@@ -2734,12 +2870,12 @@ bool calculate_hash_value(command_executor *e, shell_context *sc, arguments args
     if (!sc->current_app_name.empty()) {
         int32_t app_id;
         int32_t partition_count;
-        std::vector<::dsn::partition_configuration> partitions;
+        std::vector<::dsn::partition_configuration> pcs;
         ::dsn::error_code err =
-            sc->ddl_client->list_app(sc->current_app_name, app_id, partition_count, partitions);
+            sc->ddl_client->list_app(sc->current_app_name, app_id, partition_count, pcs);
         if (err != ::dsn::ERR_OK) {
-            std::cout << "list app [" << sc->current_app_name
-                      << "] failed, error=" << err.to_string() << std::endl;
+            std::cout << "list app [" << sc->current_app_name << "] failed, error=" << err
+                      << std::endl;
             return true;
         }
         uint64_t partition_index = key_hash % (uint64_t)partition_count;
@@ -2747,17 +2883,11 @@ bool calculate_hash_value(command_executor *e, shell_context *sc, arguments args
         tp.add_row_name_and_data("app_id", app_id);
         tp.add_row_name_and_data("partition_count", partition_count);
         tp.add_row_name_and_data("partition_index", partition_index);
-        if (partitions.size() > partition_index) {
-            ::dsn::partition_configuration &pc = partitions[partition_index];
-            tp.add_row_name_and_data("primary", pc.primary.to_string());
-
-            std::ostringstream oss;
-            for (int i = 0; i < pc.secondaries.size(); ++i) {
-                if (i != 0)
-                    oss << ",";
-                oss << pc.secondaries[i].to_string();
-            }
-            tp.add_row_name_and_data("secondaries", oss.str());
+        if (pcs.size() > partition_index) {
+            const auto &pc = pcs[partition_index];
+            tp.add_row_name_and_data("primary", pc.hp_primary.to_string());
+            tp.add_row_name_and_data("secondaries",
+                                     fmt::format("{}", fmt::join(pc.hp_secondaries, ",")));
         }
     }
     tp.output(std::cout);

@@ -17,15 +17,21 @@
 
 #pragma once
 
-#include "perf_counter/perf_counter_wrapper.h"
-#include "replica/duplication/mutation_duplicator.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <memory>
 
+#include "common/replication_other_types.h"
+#include "replica/duplication/mutation_duplicator.h"
 #include "replica/mutation.h"
 #include "replica/prepare_list.h"
+#include "replica/replica_base.h"
+#include "utils/errors.h"
+#include "utils/metrics.h"
 
 namespace dsn {
 namespace replication {
-
+class replica;
 class replica_duplicator;
 
 class mutation_buffer : public prepare_list
@@ -36,10 +42,10 @@ public:
                     int max_count,
                     mutation_committer committer);
 
-    void commit(decree d, commit_type ct);
+    void commit(decree d, commit_type ct) override;
 
 private:
-    perf_counter_wrapper _counter_dulication_mutation_loss_count;
+    METRIC_VAR_DECLARE_gauge_int64(dup_recent_lost_mutations);
 };
 
 // A sorted array of committed mutations that are ready for duplication.
@@ -51,15 +57,19 @@ public:
 
     explicit mutation_batch(replica_duplicator *r);
 
+    // Add mutations to prepare list. Only those who have been committed would be
+    // duplicated to the remote cluster.
     error_s add(mutation_ptr mu);
 
+    // Add the committed mutation to the loading list, which would be shipped to
+    // the remote cluster later.
     void add_mutation_if_valid(mutation_ptr &, decree start_decree);
 
     mutation_tuple_set move_all_mutations();
 
     decree last_decree() const;
 
-    // mutations with decree < d will be ignored.
+    // Mutations with decree < d will be ignored.
     void set_start_decree(decree d);
 
     void reset_mutation_buffer(decree d);
@@ -71,6 +81,8 @@ public:
 private:
     friend class replica_duplicator_test;
     friend class mutation_batch_test;
+
+    replica *_replica;
 
     std::unique_ptr<prepare_list> _mutation_buffer;
     mutation_tuple_set _loaded_mutations;

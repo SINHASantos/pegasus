@@ -19,12 +19,28 @@
 
 #pragma once
 
-#include <string>
 #include <pegasus/client.h>
 #include <rrdb/rrdb.client.h>
+#include <stdint.h>
+#include <functional>
+#include <list>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "rpc/rpc_host_port.h"
+#include "rrdb/rrdb_types.h"
+#include "utils/blob.h"
 #include "utils/zlocks.h"
-#include "base/pegasus_key_schema.h"
-#include "base/pegasus_utils.h"
+
+namespace dsn {
+class error_code;
+class message_ex;
+class task_tracker;
+} // namespace dsn
 
 namespace pegasus {
 namespace client {
@@ -348,7 +364,7 @@ private:
 private:
     std::string _cluster_name;
     std::string _app_name;
-    ::dsn::rpc_address _meta_server;
+    ::dsn::host_port _meta_server;
     ::dsn::apps::rrdb_client *_client;
 
     ///

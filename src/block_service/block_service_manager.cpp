@@ -16,13 +16,22 @@
 // under the License.
 
 #include "block_service_manager.h"
-#include "block_service/fds/fds_service.h"
+
+#include <algorithm>
+#include <utility>
+#include <vector>
+
+#include "block_service/block_service.h"
 #include "block_service/hdfs/hdfs_service.h"
 #include "block_service/local/local_service.h"
-
-#include "utils/fmt_logging.h"
+#include "fmt/core.h"
+#include "task/task_code.h"
+#include "task/task_tracker.h"
+#include "utils/config_api.h"
 #include "utils/factory_store.h"
 #include "utils/filesystem.h"
+#include "utils/fmt_logging.h"
+#include "utils/strings.h"
 
 namespace dsn {
 namespace dist {
@@ -30,10 +39,6 @@ namespace block_service {
 
 block_service_registry::block_service_registry()
 {
-    CHECK(utils::factory_store<block_filesystem>::register_factory(
-              "fds_service", block_filesystem::create<fds_service>, PROVIDER_TYPE_MAIN),
-          "register fds_service failed");
-
     CHECK(utils::factory_store<block_filesystem>::register_factory(
               "hdfs_service", block_filesystem::create<hdfs_service>, PROVIDER_TYPE_MAIN),
           "register hdfs_service failed");
@@ -71,9 +76,9 @@ block_filesystem *block_service_manager::get_or_create_block_filesystem(const st
     block_filesystem *fs =
         utils::factory_store<block_filesystem>::create(provider_type, PROVIDER_TYPE_MAIN);
     if (fs == nullptr) {
-        LOG_ERROR_F("acquire block filesystem failed, provider = {}, provider_type = {}",
-                    provider,
-                    std::string(provider_type));
+        LOG_ERROR("acquire block filesystem failed, provider = {}, provider_type = {}",
+                  provider,
+                  provider_type);
         return nullptr;
     }
 
@@ -84,13 +89,13 @@ block_filesystem *block_service_manager::get_or_create_block_filesystem(const st
     utils::split_args(arguments, args);
     dsn::error_code err = fs->initialize(args);
 
+    const auto provider_desc = fmt::format(
+        "provider = {}, provider_type = {}, args = {}", provider, provider_type, arguments);
     if (dsn::ERR_OK == err) {
-        LOG_INFO_F("create block filesystem ok for provider {}", provider);
+        LOG_INFO("create block filesystem ok for {}", provider_desc);
         _fs_map.emplace(provider, std::unique_ptr<block_filesystem>(fs));
     } else {
-        LOG_ERROR_F("create block file system err {} for provider {}",
-                    std::string(err.to_string()),
-                    provider);
+        LOG_ERROR("create block filesystem failed for {}, error = {}", provider_desc, err);
         delete fs;
         fs = nullptr;
     }
@@ -103,10 +108,11 @@ static create_file_response create_block_file_sync(const std::string &remote_fil
                                                    task_tracker *tracker)
 {
     create_file_response ret;
-    fs->create_file(create_file_request{remote_file_path, ignore_meta},
-                    TASK_CODE_EXEC_INLINED,
-                    [&ret](const create_file_response &resp) { ret = resp; },
-                    tracker);
+    fs->create_file(
+        create_file_request{remote_file_path, ignore_meta},
+        TASK_CODE_EXEC_INLINED,
+        [&ret](const create_file_response &resp) { ret = resp; },
+        tracker);
     tracker->wait_outstanding_tasks();
     return ret;
 }
@@ -115,10 +121,11 @@ static download_response
 download_block_file_sync(const std::string &local_file_path, block_file *bf, task_tracker *tracker)
 {
     download_response ret;
-    bf->download(download_request{local_file_path, 0, -1},
-                 TASK_CODE_EXEC_INLINED,
-                 [&ret](const download_response &resp) { ret = resp; },
-                 tracker);
+    bf->download(
+        download_request{local_file_path, 0, -1},
+        TASK_CODE_EXEC_INLINED,
+        [&ret](const download_response &resp) { ret = resp; },
+        tracker);
     tracker->wait_outstanding_tasks();
     return ret;
 }
@@ -144,7 +151,7 @@ error_code block_service_manager::download_file(const std::string &remote_dir,
     // local file exists
     const std::string local_file_name = utils::filesystem::path_combine(local_dir, file_name);
     if (utils::filesystem::file_exists(local_file_name)) {
-        LOG_INFO_F("local file({}) exists", local_file_name);
+        LOG_INFO("local file({}) exists", local_file_name);
         return ERR_PATH_ALREADY_EXIST;
     }
 
@@ -156,7 +163,7 @@ error_code block_service_manager::download_file(const std::string &remote_dir,
         create_block_file_sync(remote_file_name, false /*ignore file meta*/, fs, &tracker);
     error_code err = create_resp.err;
     if (err != ERR_OK) {
-        LOG_ERROR_F("create file({}) failed with error({})", remote_file_name, err.to_string());
+        LOG_ERROR("create file({}) failed with error({})", remote_file_name, err);
         return err;
     }
     block_file_ptr bf = create_resp.file_handle;
@@ -167,17 +174,17 @@ error_code block_service_manager::download_file(const std::string &remote_dir,
         // error, however, if file damaged on remote file provider, bulk load should stop,
         // return ERR_CORRUPTION instead
         if (resp.err == ERR_OBJECT_NOT_FOUND) {
-            LOG_ERROR_F("download file({}) failed, file on remote file provider is damaged",
-                        local_file_name);
+            LOG_ERROR("download file({}) failed, file on remote file provider is damaged",
+                      local_file_name);
             return ERR_CORRUPTION;
         }
         return resp.err;
     }
 
-    LOG_INFO_F("download file({}) succeed, file_size = {}, md5 = {}",
-               local_file_name.c_str(),
-               resp.downloaded_size,
-               resp.file_md5);
+    LOG_INFO("download file({}) succeed, file_size = {}, md5 = {}",
+             local_file_name,
+             resp.downloaded_size,
+             resp.file_md5);
     download_file_size = resp.downloaded_size;
     download_file_md5 = resp.file_md5;
     return ERR_OK;

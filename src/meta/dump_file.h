@@ -37,14 +37,14 @@
 #include "utils/api_utilities.h"
 #include "utils/error_code.h"
 #include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
+#include "task/task_code.h"
 #include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
+#include "rpc/serialization.h"
+#include "rpc/rpc_stream.h"
 #include "runtime/serverlet.h"
 #include "runtime/service_app.h"
 #include "utils/fmt_logging.h"
-#include "runtime/rpc/rpc_address.h"
+#include "rpc/rpc_address.h"
 #include "utils/crc.h"
 #include <cstdio>
 #include <cerrno>
@@ -53,7 +53,7 @@
 #define log_error_and_return(buffer, length)                                                       \
     do {                                                                                           \
         ::dsn::utils::safe_strerror_r(errno, buffer, length);                                      \
-        LOG_ERROR("append file failed, reason(%s)", buffer);                                       \
+        LOG_ERROR("append file failed, reason({})", buffer);                                       \
         return -1;                                                                                 \
     } while (0)
 
@@ -63,6 +63,8 @@ struct block_header
     uint32_t crc32;
 };
 
+// TODO(yingchun): use rocksdb APIs to unify the file operations.
+// A tool to dump app_states of meta server to local file, used by remote command "meta.dump".
 class dump_file
 {
 public:
@@ -131,7 +133,7 @@ public:
             size_t cnt = fread(raw_mem + len, 1, hdr.length - len, _file_handle);
             if (len + cnt < hdr.length) {
                 if (feof(_file_handle)) {
-                    LOG_ERROR("unexpected file end, start offset of this block (%u)",
+                    LOG_ERROR("unexpected file end, start offset of this block ({})",
                               ftell(_file_handle) - len - sizeof(hdr));
                     return -1;
                 } else if (errno != EINTR) {
@@ -142,8 +144,8 @@ public:
         }
         _crc = dsn::utils::crc32_calc(raw_mem, len, _crc);
         if (_crc != hdr.crc32) {
-            LOG_ERROR("file %s data error, block offset(%ld)",
-                      _filename.c_str(),
+            LOG_ERROR("file {} data error, block offset({})",
+                      _filename,
                       ftell(_file_handle) - hdr.length - sizeof(hdr));
             return -1;
         }

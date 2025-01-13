@@ -15,29 +15,49 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <fmt/core.h>
+#include <fmt/format.h>
+#include <rapidjson/ostreamwrapper.h>
+#include <algorithm>
+#include <map>
+#include <memory>
+#include <set>
+#include <sstream>
 #include <string>
+#include <unordered_map>
+#include <utility>
 
-#include "runtime/api_layer1.h"
-#include "common/serialization_helper/dsn.layer2_types.h"
-#include "common/replica_envs.h"
-#include "meta_admin_types.h"
-#include "partition_split_types.h"
-#include "duplication_types.h"
-#include "bulk_load_types.h"
 #include "backup_types.h"
-#include "consensus_types.h"
-#include "replica_admin_types.h"
+#include "bulk_load_types.h"
 #include "common//duplication_common.h"
-#include "utils/config_api.h"
+#include "common/bulk_load_common.h"
+#include "common/gpid.h"
+#include "common/replica_envs.h"
+#include "common/replication.codes.h"
+#include "common/replication_common.h"
+#include "common/replication_enums.h"
+#include "common/serialization_helper/dsn.layer2_types.h"
+#include "duplication_types.h"
+#include "http/http_status_code.h"
+#include "meta/duplication/meta_duplication_service.h"
+#include "meta/meta_backup_service.h"
+#include "meta/meta_bulk_load_service.h"
+#include "meta/meta_rpc_types.h"
+#include "meta/meta_service.h"
+#include "meta_admin_types.h"
+#include "meta_http_service.h"
+#include "meta_server_failure_detector.h"
+#include "rpc/rpc_host_port.h"
+#include "runtime/api_layer1.h"
+#include "server_load_balancer.h"
+#include "server_state.h"
+#include "utils/error_code.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
 #include "utils/output_utils.h"
 #include "utils/time_utils.h"
 
-#include "meta_http_service.h"
-#include "meta_server_failure_detector.h"
-#include "server_load_balancer.h"
-#include "server_state.h"
-#include "meta/duplication/meta_duplication_service.h"
-#include "meta/meta_bulk_load_service.h"
+DSN_DECLARE_string(hosts_list);
 
 namespace dsn {
 namespace replication {
@@ -64,26 +84,32 @@ void meta_http_service::get_app_handler(const http_request &req, http_response &
         } else if (p.first == "detail") {
             detailed = true;
         } else {
-            resp.status_code = http_status_code::bad_request;
+            resp.status_code = http_status_code::kBadRequest;
             return;
         }
     }
     if (!redirect_if_not_primary(req, resp))
         return;
 
-    configuration_query_by_index_request request;
-    configuration_query_by_index_response response;
+    if (app_name.empty()) {
+        resp.status_code = http_status_code::kBadRequest;
+        resp.body = "app name shouldn't be empty";
+        return;
+    }
+
+    query_cfg_request request;
+    query_cfg_response response;
 
     request.app_name = app_name;
     _service->_state->query_configuration_by_index(request, response);
     if (response.err == ERR_OBJECT_NOT_FOUND) {
-        resp.status_code = http_status_code::not_found;
+        resp.status_code = http_status_code::kNotFound;
         resp.body = fmt::format("table not found: \"{}\"", app_name);
         return;
     }
     if (response.err != dsn::ERR_OK) {
-        resp.body = response.err.to_string();
-        resp.status_code = http_status_code::internal_server_error;
+        resp.body = response.err;
+        resp.status_code = http_status_code::kInternalServerError;
         return;
     }
 
@@ -109,47 +135,40 @@ void meta_http_service::get_app_handler(const http_request &req, http_response &
         tp_details.add_column("replica_count");
         tp_details.add_column("primary");
         tp_details.add_column("secondaries");
-        std::map<rpc_address, std::pair<int, int>> node_stat;
+        std::map<host_port, std::pair<int, int>> node_stat;
 
         int total_prim_count = 0;
         int total_sec_count = 0;
         int fully_healthy = 0;
         int write_unhealthy = 0;
         int read_unhealthy = 0;
-        for (const auto &p : response.partitions) {
+        for (const auto &pc : response.partitions) {
             int replica_count = 0;
-            if (!p.primary.is_invalid()) {
+            if (pc.hp_primary) {
                 replica_count++;
-                node_stat[p.primary].first++;
+                node_stat[pc.hp_primary].first++;
                 total_prim_count++;
             }
-            replica_count += p.secondaries.size();
-            total_sec_count += p.secondaries.size();
-            if (!p.primary.is_invalid()) {
-                if (replica_count >= p.max_replica_count)
+            replica_count += pc.hp_secondaries.size();
+            total_sec_count += pc.hp_secondaries.size();
+            if (pc.hp_primary) {
+                if (replica_count >= pc.max_replica_count) {
                     fully_healthy++;
-                else if (replica_count < 2)
+                } else if (replica_count < 2) {
                     write_unhealthy++;
+                }
             } else {
                 write_unhealthy++;
                 read_unhealthy++;
             }
-            tp_details.add_row(p.pid.get_partition_index());
-            tp_details.append_data(p.ballot);
-            std::stringstream oss;
-            oss << replica_count << "/" << p.max_replica_count;
-            tp_details.append_data(oss.str());
-            tp_details.append_data((p.primary.is_invalid() ? "-" : p.primary.to_std_string()));
-            oss.str("");
-            oss << "[";
-            for (int j = 0; j < p.secondaries.size(); j++) {
-                if (j != 0)
-                    oss << ",";
-                oss << p.secondaries[j].to_std_string();
-                node_stat[p.secondaries[j]].second++;
+            tp_details.add_row(pc.pid.get_partition_index());
+            tp_details.append_data(pc.ballot);
+            tp_details.append_data(fmt::format("{}/{}", replica_count, pc.max_replica_count));
+            tp_details.append_data(pc.hp_primary ? pc.hp_primary.to_string() : "-");
+            tp_details.append_data(fmt::format("[{}]", fmt::join(pc.hp_secondaries, ",")));
+            for (const auto &secondary : pc.hp_secondaries) {
+                node_stat[secondary].second++;
             }
-            oss << "]";
-            tp_details.append_data(oss.str());
         }
         mtp.add(std::move(tp_details));
 
@@ -160,7 +179,7 @@ void meta_http_service::get_app_handler(const http_request &req, http_response &
         tp_nodes.add_column("secondary");
         tp_nodes.add_column("total");
         for (auto &kv : node_stat) {
-            tp_nodes.add_row(kv.first.to_std_string());
+            tp_nodes.add_row(kv.first.to_string());
             tp_nodes.append_data(kv.second.first);
             tp_nodes.append_data(kv.second.second);
             tp_nodes.append_data(kv.second.first + kv.second.second);
@@ -183,7 +202,7 @@ void meta_http_service::get_app_handler(const http_request &req, http_response &
 
     mtp.output(out, dsn::utils::table_printer::output_format::kJsonCompact);
     resp.body = out.str();
-    resp.status_code = http_status_code::ok;
+    resp.status_code = http_status_code::kOk;
 }
 
 void meta_http_service::list_app_handler(const http_request &req, http_response &resp)
@@ -193,7 +212,7 @@ void meta_http_service::list_app_handler(const http_request &req, http_response 
         if (p.first == "detail") {
             detailed = true;
         } else {
-            resp.status_code = http_status_code::bad_request;
+            resp.status_code = http_status_code::kBadRequest;
             return;
         }
     }
@@ -206,8 +225,8 @@ void meta_http_service::list_app_handler(const http_request &req, http_response 
     _service->_state->list_apps(request, response);
 
     if (response.err != dsn::ERR_OK) {
-        resp.body = response.err.to_string();
-        resp.status_code = http_status_code::internal_server_error;
+        resp.body = response.err;
+        resp.status_code = http_status_code::kInternalServerError;
         return;
     }
     std::vector<::dsn::app_info> &apps = response.infos;
@@ -236,7 +255,7 @@ void meta_http_service::list_app_handler(const http_request &req, http_response 
         status_str = status_str.substr(status_str.find("AS_") + 3);
         std::string create_time = "-";
         if (app.create_second > 0) {
-            char buf[24];
+            char buf[24] = {0};
             dsn::utils::time_ms_to_string((uint64_t)app.create_second * 1000, buf);
             create_time = buf;
         }
@@ -246,12 +265,12 @@ void meta_http_service::list_app_handler(const http_request &req, http_response 
             available_app_count++;
         } else if (app.status == app_status::AS_DROPPED && app.expire_second > 0) {
             if (app.drop_second > 0) {
-                char buf[24];
+                char buf[24] = {0};
                 dsn::utils::time_ms_to_string((uint64_t)app.drop_second * 1000, buf);
                 drop_time = buf;
             }
             if (app.expire_second > 0) {
-                char buf[24];
+                char buf[24] = {0};
                 dsn::utils::time_ms_to_string((uint64_t)app.expire_second * 1000, buf);
                 drop_expire_time = buf;
             }
@@ -288,8 +307,8 @@ void meta_http_service::list_app_handler(const http_request &req, http_response 
             if (info.status != app_status::AS_AVAILABLE) {
                 continue;
             }
-            configuration_query_by_index_request request;
-            configuration_query_by_index_response response;
+            query_cfg_request request;
+            query_cfg_response response;
             request.app_name = info.app_name;
             _service->_state->query_configuration_by_index(request, response);
             CHECK_EQ(info.app_id, response.app_id);
@@ -297,18 +316,18 @@ void meta_http_service::list_app_handler(const http_request &req, http_response 
             int fully_healthy = 0;
             int write_unhealthy = 0;
             int read_unhealthy = 0;
-            for (int i = 0; i < response.partitions.size(); i++) {
-                const dsn::partition_configuration &p = response.partitions[i];
+            for (const auto &pc : response.partitions) {
                 int replica_count = 0;
-                if (!p.primary.is_invalid()) {
+                if (pc.hp_primary) {
                     replica_count++;
                 }
-                replica_count += p.secondaries.size();
-                if (!p.primary.is_invalid()) {
-                    if (replica_count >= p.max_replica_count)
+                replica_count += pc.hp_secondaries.size();
+                if (pc.hp_primary) {
+                    if (replica_count >= pc.max_replica_count) {
                         fully_healthy++;
-                    else if (replica_count < 2)
+                    } else if (replica_count < 2) {
                         write_unhealthy++;
+                    }
                 } else {
                     write_unhealthy++;
                     read_unhealthy++;
@@ -348,7 +367,7 @@ void meta_http_service::list_app_handler(const http_request &req, http_response 
     mtp.output(out, dsn::utils::table_printer::output_format::kJsonCompact);
 
     resp.body = out.str();
-    resp.status_code = http_status_code::ok;
+    resp.status_code = http_status_code::kOk;
 }
 
 void meta_http_service::list_node_handler(const http_request &req, http_response &resp)
@@ -358,19 +377,19 @@ void meta_http_service::list_node_handler(const http_request &req, http_response
         if (p.first == "detail") {
             detailed = true;
         } else {
-            resp.status_code = http_status_code::bad_request;
+            resp.status_code = http_status_code::kBadRequest;
             return;
         }
     }
     if (!redirect_if_not_primary(req, resp))
         return;
 
-    std::map<dsn::rpc_address, list_nodes_helper> tmp_map;
+    std::map<dsn::host_port, list_nodes_helper> tmp_map;
     for (const auto &node : _service->_alive_set) {
-        tmp_map.emplace(node, list_nodes_helper(node.to_std_string(), "ALIVE"));
+        tmp_map.emplace(node, list_nodes_helper(node.to_string(), "ALIVE"));
     }
     for (const auto &node : _service->_dead_set) {
-        tmp_map.emplace(node, list_nodes_helper(node.to_std_string(), "UNALIVE"));
+        tmp_map.emplace(node, list_nodes_helper(node.to_string(), "UNALIVE"));
     }
     int alive_node_count = (_service->_alive_set).size();
     int unalive_node_count = (_service->_dead_set).size();
@@ -381,23 +400,22 @@ void meta_http_service::list_node_handler(const http_request &req, http_response
         request.status = dsn::app_status::AS_AVAILABLE;
         _service->_state->list_apps(request, response);
         for (const auto &app : response.infos) {
-            configuration_query_by_index_request request_app;
-            configuration_query_by_index_response response_app;
+            query_cfg_request request_app;
+            query_cfg_response response_app;
             request_app.app_name = app.app_name;
             _service->_state->query_configuration_by_index(request_app, response_app);
             CHECK_EQ(app.app_id, response_app.app_id);
             CHECK_EQ(app.partition_count, response_app.partition_count);
 
-            for (int i = 0; i < response_app.partitions.size(); i++) {
-                const dsn::partition_configuration &p = response_app.partitions[i];
-                if (!p.primary.is_invalid()) {
-                    auto find = tmp_map.find(p.primary);
+            for (const auto &pc : response_app.partitions) {
+                if (pc.hp_primary) {
+                    auto find = tmp_map.find(pc.hp_primary);
                     if (find != tmp_map.end()) {
                         find->second.primary_count++;
                     }
                 }
-                for (int j = 0; j < p.secondaries.size(); j++) {
-                    auto find = tmp_map.find(p.secondaries[j]);
+                for (const auto &secondary : pc.hp_secondaries) {
+                    auto find = tmp_map.find(secondary);
                     if (find != tmp_map.end()) {
                         find->second.secondary_count++;
                     }
@@ -436,30 +454,28 @@ void meta_http_service::list_node_handler(const http_request &req, http_response
     mtp.output(out, dsn::utils::table_printer::output_format::kJsonCompact);
 
     resp.body = out.str();
-    resp.status_code = http_status_code::ok;
+    resp.status_code = http_status_code::kOk;
 }
 
 void meta_http_service::get_cluster_info_handler(const http_request &req, http_response &resp)
 {
-    if (!redirect_if_not_primary(req, resp))
+    if (!redirect_if_not_primary(req, resp)) {
         return;
+    }
 
     dsn::utils::table_printer tp;
     std::ostringstream out;
     std::string meta_servers_str;
     int ms_size = _service->_opts.meta_servers.size();
     for (int i = 0; i < ms_size; i++) {
-        meta_servers_str += _service->_opts.meta_servers[i].to_std_string();
+        meta_servers_str += _service->_opts.meta_servers[i].to_string();
         if (i != ms_size - 1) {
             meta_servers_str += ",";
         }
     }
     tp.add_row_name_and_data("meta_servers", meta_servers_str);
-    tp.add_row_name_and_data("primary_meta_server", dsn_primary_address().to_std_string());
-    std::string zk_hosts =
-        dsn_config_get_value_string("zookeeper", "hosts_list", "", "zookeeper_hosts");
-    zk_hosts.erase(std::remove_if(zk_hosts.begin(), zk_hosts.end(), ::isspace), zk_hosts.end());
-    tp.add_row_name_and_data("zookeeper_hosts", zk_hosts);
+    tp.add_row_name_and_data("primary_meta_server", dsn_primary_host_port().to_string());
+    tp.add_row_name_and_data("zookeeper_hosts", FLAGS_hosts_list);
     tp.add_row_name_and_data("zookeeper_root", _service->_cluster_root);
     tp.add_row_name_and_data(
         "meta_function_level",
@@ -476,7 +492,7 @@ void meta_http_service::get_cluster_info_handler(const http_request &req, http_r
     tp.output(out, dsn::utils::table_printer::output_format::kJsonCompact);
 
     resp.body = out.str();
-    resp.status_code = http_status_code::ok;
+    resp.status_code = http_status_code::kOk;
 }
 
 void meta_http_service::get_app_envs_handler(const http_request &req, http_response &resp)
@@ -493,7 +509,7 @@ void meta_http_service::get_app_envs_handler(const http_request &req, http_respo
         }
     }
     if (app_name.empty()) {
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         resp.body = "app name shouldn't be empty";
         return;
     }
@@ -505,7 +521,7 @@ void meta_http_service::get_app_envs_handler(const http_request &req, http_respo
     _service->_state->list_apps(request, response);
     if (response.err != dsn::ERR_OK) {
         resp.body = response.err.to_string();
-        resp.status_code = http_status_code::internal_server_error;
+        resp.status_code = http_status_code::kInternalServerError;
         return;
     }
 
@@ -524,7 +540,7 @@ void meta_http_service::get_app_envs_handler(const http_request &req, http_respo
     std::ostringstream out;
     tp.output(out, dsn::utils::table_printer::output_format::kJsonCompact);
     resp.body = out.str();
-    resp.status_code = http_status_code::ok;
+    resp.status_code = http_status_code::kOk;
 }
 
 std::string set_to_string(const std::set<int32_t> &s)
@@ -543,17 +559,17 @@ void meta_http_service::query_backup_policy_handler(const http_request &req, htt
 
     if (_service->_backup_handler == nullptr) {
         resp.body = "cold_backup_disabled";
-        resp.status_code = http_status_code::not_found;
+        resp.status_code = http_status_code::kNotFound;
         return;
     }
-    auto request = dsn::make_unique<configuration_query_backup_policy_request>();
+    auto request = std::make_unique<configuration_query_backup_policy_request>();
     std::vector<std::string> policy_names;
     for (const auto &p : req.query_args) {
         if (p.first == "name") {
             policy_names.push_back(p.second);
         } else {
             resp.body = "Invalid parameter";
-            resp.status_code = http_status_code::bad_request;
+            resp.status_code = http_status_code::kBadRequest;
             return;
         }
     }
@@ -582,7 +598,7 @@ void meta_http_service::query_backup_policy_handler(const http_request &req, htt
     std::ostringstream out;
     tp_query_backup_policy.output(out, dsn::utils::table_printer::output_format::kJsonCompact);
     resp.body = out.str();
-    resp.status_code = http_status_code::ok;
+    resp.status_code = http_status_code::kOk;
 }
 
 void meta_http_service::query_duplication_handler(const http_request &req, http_response &resp)
@@ -591,15 +607,15 @@ void meta_http_service::query_duplication_handler(const http_request &req, http_
         return;
     }
     if (_service->_dup_svc == nullptr) {
-        resp.body = "duplication is not enabled [duplication_enabled=false]";
-        resp.status_code = http_status_code::not_found;
+        resp.body = "duplication is not enabled [FLAGS_duplication_enabled=false]";
+        resp.status_code = http_status_code::kNotFound;
         return;
     }
     duplication_query_request rpc_req;
     auto it = req.query_args.find("name");
     if (it == req.query_args.end()) {
         resp.body = "name should not be empty";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
     rpc_req.app_name = it->second;
@@ -608,13 +624,13 @@ void meta_http_service::query_duplication_handler(const http_request &req, http_
     if (rpc_resp.err != ERR_OK) {
         resp.body = rpc_resp.err.to_string();
         if (rpc_resp.err == ERR_APP_NOT_EXIST) {
-            resp.status_code = http_status_code::not_found;
+            resp.status_code = http_status_code::kNotFound;
         } else {
-            resp.status_code = http_status_code::internal_server_error;
+            resp.status_code = http_status_code::kInternalServerError;
         }
         return;
     }
-    resp.status_code = http_status_code::ok;
+    resp.status_code = http_status_code::kOk;
     resp.body = duplication_query_response_to_string(rpc_resp);
 }
 
@@ -626,7 +642,7 @@ void meta_http_service::start_bulk_load_handler(const http_request &req, http_re
 
     if (_service->_bulk_load_svc == nullptr) {
         resp.body = "bulk load is not enabled";
-        resp.status_code = http_status_code::not_found;
+        resp.status_code = http_status_code::kNotFound;
         return;
     }
 
@@ -634,31 +650,32 @@ void meta_http_service::start_bulk_load_handler(const http_request &req, http_re
     bool ret = json::json_forwarder<start_bulk_load_request>::decode(req.body, request);
     if (!ret) {
         resp.body = "invalid request structure";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
     if (request.app_name.empty()) {
         resp.body = "app_name should not be empty";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
     if (request.cluster_name.empty()) {
         resp.body = "cluster_name should not be empty";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
     if (request.file_provider_type.empty()) {
         resp.body = "file_provider_type should not be empty";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
     if (request.remote_root_path.empty()) {
         resp.body = "remote_root_path should not be empty";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
+    // TODO(yingchun): Also deal the 'ingest_behind' parameter.
 
-    auto rpc_req = dsn::make_unique<start_bulk_load_request>(request);
+    auto rpc_req = std::make_unique<start_bulk_load_request>(request);
     start_bulk_load_rpc rpc(std::move(rpc_req), LPC_META_CALLBACK);
     _service->_bulk_load_svc->on_start_bulk_load(rpc);
 
@@ -670,7 +687,7 @@ void meta_http_service::start_bulk_load_handler(const http_request &req, http_re
     std::ostringstream out;
     tp.output(out, dsn::utils::table_printer::output_format::kJsonCompact);
     resp.body = out.str();
-    resp.status_code = http_status_code::ok;
+    resp.status_code = http_status_code::kOk;
 }
 
 void meta_http_service::query_bulk_load_handler(const http_request &req, http_response &resp)
@@ -681,18 +698,18 @@ void meta_http_service::query_bulk_load_handler(const http_request &req, http_re
 
     if (_service->_bulk_load_svc == nullptr) {
         resp.body = "bulk load is not enabled";
-        resp.status_code = http_status_code::not_found;
+        resp.status_code = http_status_code::kNotFound;
         return;
     }
 
     auto it = req.query_args.find("name");
     if (it == req.query_args.end()) {
         resp.body = "name should not be empty";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
 
-    auto rpc_req = dsn::make_unique<query_bulk_load_request>();
+    auto rpc_req = std::make_unique<query_bulk_load_request>();
     rpc_req->app_name = it->second;
     query_bulk_load_rpc rpc(std::move(rpc_req), LPC_META_CALLBACK);
     _service->_bulk_load_svc->on_query_bulk_load_status(rpc);
@@ -704,7 +721,7 @@ void meta_http_service::query_bulk_load_handler(const http_request &req, http_re
     std::ostringstream out;
     tp.output(out, dsn::utils::table_printer::output_format::kJsonCompact);
     resp.body = out.str();
-    resp.status_code = http_status_code::ok;
+    resp.status_code = http_status_code::kOk;
 }
 
 void meta_http_service::start_compaction_handler(const http_request &req, http_response &resp)
@@ -719,38 +736,41 @@ void meta_http_service::start_compaction_handler(const http_request &req, http_r
 
     if (!ret) {
         resp.body = "invalid request structure";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
     if (info.app_name.empty()) {
         resp.body = "app_name should not be empty";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
     if (info.type.empty() || (info.type != "once" && info.type != "periodic")) {
         resp.body = "type should ony be 'once' or 'periodic'";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
     if (info.target_level < -1) {
         resp.body = "target_level should be >= -1";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
-    if (info.bottommost_level_compaction.empty() || (info.bottommost_level_compaction != "skip" &&
-                                                     info.bottommost_level_compaction != "force")) {
+    if (info.bottommost_level_compaction.empty() ||
+        (info.bottommost_level_compaction !=
+             replica_envs::MANUAL_COMPACT_BOTTOMMOST_LEVEL_COMPACTION_SKIP &&
+         info.bottommost_level_compaction !=
+             replica_envs::MANUAL_COMPACT_BOTTOMMOST_LEVEL_COMPACTION_FORCE)) {
         resp.body = "bottommost_level_compaction should ony be 'skip' or 'force'";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
     if (info.max_concurrent_running_count < 0) {
         resp.body = "max_running_count should be >= 0";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
     if (info.type == "periodic" && info.trigger_time.empty()) {
         resp.body = "trigger_time should not be empty when type is periodic";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
 
@@ -782,22 +802,22 @@ void meta_http_service::update_scenario_handler(const http_request &req, http_re
         return;
     }
 
-    // validate paramters
+    // validate parameters
     usage_scenario_info info;
     bool ret = json::json_forwarder<usage_scenario_info>::decode(req.body, info);
     if (!ret) {
         resp.body = "invalid request structure";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
     if (info.app_name.empty()) {
         resp.body = "app_name should not be empty";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
     if (info.scenario.empty() || (info.scenario != "bulk_load" && info.scenario != "normal")) {
         resp.body = "scenario should ony be 'normal' or 'bulk_load'";
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         return;
     }
 
@@ -811,14 +831,31 @@ void meta_http_service::update_scenario_handler(const http_request &req, http_re
 
 bool meta_http_service::redirect_if_not_primary(const http_request &req, http_response &resp)
 {
-#ifdef DSN_MOCK_TEST
-    return true;
-#endif
-    rpc_address leader;
-    if (_service->_failure_detector->get_leader(&leader))
+#ifdef MOCK_TEST
+    // To enable MOCK_TEST, the option BUILD_TEST for cmake should be opened by:
+    //     cmake -DBUILD_TEST=ON ...
+    // which could be done by building Pegasus with tests by:
+    //     ./run.sh build --test ...
+    //
+    // If `_service->_balancer` is not null, it must has been initialized by mocking, in which case
+    // just returning true is ok.
+    //
+    // Otherwise, once `_service->_balancer` is null, which means this must be a standby meta
+    // server, returning true would lead to coredump due to null `_service->_balancer` while
+    // processing requests in `get_cluster_info_handler`. Thus it should go through the following
+    // normal process instead of just returning true.
+    if (_service->_balancer) {
         return true;
+    }
+#endif
+
+    host_port leader;
+    if (_service->_failure_detector->get_leader(&leader)) {
+        return true;
+    }
+
     // set redirect response
-    resp.location = "http://" + leader.to_std_string() + '/' + req.path;
+    resp.location = fmt::format("http://{}/{}", leader, req.path);
     if (!req.query_args.empty()) {
         resp.location += '?';
         for (const auto &i : req.query_args) {
@@ -828,7 +865,7 @@ bool meta_http_service::redirect_if_not_primary(const http_request &req, http_re
     }
     resp.location.erase(std::remove(resp.location.begin(), resp.location.end(), '\0'),
                         resp.location.end()); // remove final '\0'
-    resp.status_code = http_status_code::temporary_redirect;
+    resp.status_code = http_status_code::kTemporaryRedirect;
     return false;
 }
 
@@ -843,7 +880,7 @@ void meta_http_service::update_app_env(const std::string &app_name,
     request.__set_keys(keys);
     request.__set_values(values);
 
-    auto rpc_req = dsn::make_unique<configuration_update_app_env_request>(request);
+    auto rpc_req = std::make_unique<configuration_update_app_env_request>(request);
     update_app_env_rpc rpc(std::move(rpc_req), LPC_META_STATE_NORMAL);
     _service->_state->set_app_envs(rpc);
 
@@ -855,7 +892,7 @@ void meta_http_service::update_app_env(const std::string &app_name,
     std::ostringstream out;
     tp.output(out, dsn::utils::table_printer::output_format::kJsonCompact);
     resp.body = out.str();
-    resp.status_code = http_status_code::ok;
+    resp.status_code = http_status_code::kOk;
 }
 
 } // namespace replication

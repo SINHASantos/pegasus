@@ -15,12 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "http/http_server.h"
+#include <functional>
+#include <string>
 
-#include "replica_stub.h"
+#include "common/replication_common.h"
+#include "http/http_server.h"
+#include "metadata_types.h"
+#include "utils/fmt_logging.h"
 
 namespace dsn {
 namespace replication {
+class replica_stub;
 
 class replica_http_service : public http_server_base
 {
@@ -32,22 +37,32 @@ public:
                                    this,
                                    std::placeholders::_1,
                                    std::placeholders::_2),
-                         "ip:port/replica/duplication?appid=<appid>");
+                         "appid=<appid>",
+                         "Query the duplication status of an app.");
         register_handler("data_version",
                          std::bind(&replica_http_service::query_app_data_version_handler,
                                    this,
                                    std::placeholders::_1,
                                    std::placeholders::_2),
-                         "ip:port/replica/data_version?app_id=<app_id>");
+                         "app_id=<app_id>",
+                         "Query the data version of an app.");
         register_handler("manual_compaction",
                          std::bind(&replica_http_service::query_manual_compaction_handler,
                                    this,
                                    std::placeholders::_1,
                                    std::placeholders::_2),
-                         "ip:port/replica/maual_compaction?app_id=<app_id>");
+                         "app_id=<app_id>",
+                         "Query the manual compaction status of an app.");
     }
 
-    std::string path() const override { return "replica"; }
+    ~replica_http_service()
+    {
+        deregister_http_call("replica/duplication");
+        deregister_http_call("replica/data_version");
+        deregister_http_call("replica/manual_compaction");
+    }
+
+    std::string path() const override { return replication_options::kReplicaAppType; }
 
     void query_duplication_handler(const http_request &req, http_response &resp);
     void query_app_data_version_handler(const http_request &req, http_response &resp);

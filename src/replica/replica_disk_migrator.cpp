@@ -17,14 +17,26 @@
  * under the License.
  */
 
-#include "replica/replica_stub.h"
-#include "replica_disk_migrator.h"
-
 #include <boost/algorithm/string/replace.hpp>
+#include <fmt/core.h>
+
+#include <string_view>
+#include "common/fs_manager.h"
+#include "common/gpid.h"
+#include "common/replication.codes.h"
+#include "common/replication_enums.h"
+#include "metadata_types.h"
+#include "replica/replica.h"
+#include "replica/replica_stub.h"
+#include "replica/replication_app_base.h"
+#include "replica_disk_migrator.h"
+#include "task/async_calls.h"
+#include "utils/error_code.h"
+#include "utils/fail_point.h"
 #include "utils/filesystem.h"
 #include "utils/fmt_logging.h"
-#include "replica/replication_app_base.h"
-#include "utils/fail_point.h"
+#include "utils/thread_access_checker.h"
+#include "utils/load_dump_object.h"
 
 namespace dsn {
 namespace replication {
@@ -44,7 +56,6 @@ void replica_disk_migrator::on_migrate_replica(replica_disk_migrate_rpc rpc)
         LPC_REPLICATION_COMMON,
         _replica->tracker(),
         [=]() {
-
             if (!check_migration_args(rpc)) {
                 return;
             }
@@ -111,55 +122,12 @@ bool replica_disk_migrator::check_migration_args(replica_disk_migrate_rpc rpc)
         return false;
     }
 
-    bool valid_origin_disk = false;
-    bool valid_target_disk = false;
-    // _dir_nodes: std::vector<std::shared_ptr<dir_node>>
-    for (const auto &dir_node : _replica->get_replica_stub()->_fs_manager._dir_nodes) {
-        if (dir_node->tag == req.origin_disk) {
-            valid_origin_disk = true;
-            if (!dir_node->has(req.pid)) {
-                std::string err_msg =
-                    fmt::format("Invalid replica(replica({}) doesn't exist on origin disk({}))",
-                                req.pid,
-                                req.origin_disk);
-                LOG_ERROR_PREFIX(
-                    "received replica disk migrate request(origin={}, target={}), err = {}",
-                    req.origin_disk,
-                    req.target_disk,
-                    err_msg);
-                resp.err = ERR_OBJECT_NOT_FOUND;
-                resp.__set_hint(err_msg);
-                return false;
-            }
-        }
-
-        if (dir_node->tag == req.target_disk) {
-            valid_target_disk = true;
-            if (dir_node->has(get_gpid())) {
-                std::string err_msg =
-                    fmt::format("Invalid replica(replica({}) has existed on target disk({}))",
-                                req.pid,
-                                req.target_disk);
-                LOG_ERROR_PREFIX(
-                    "received replica disk migrate request(origin={}, target={}), err = {}",
-                    req.origin_disk,
-                    req.target_disk,
-                    err_msg);
-                resp.err = ERR_PATH_ALREADY_EXIST;
-                resp.__set_hint(err_msg);
-                return false;
-            }
-        }
-    }
-
-    if (!valid_origin_disk || !valid_target_disk) {
-        std::string invalid_disk_tag = !valid_origin_disk ? req.origin_disk : req.target_disk;
-        std::string err_msg = fmt::format("Invalid disk tag({} doesn't exist)", invalid_disk_tag);
-        LOG_ERROR_PREFIX("received replica disk migrate request(origin={}, target={}), err = {}",
-                         req.origin_disk,
-                         req.target_disk,
-                         err_msg);
-        resp.err = ERR_OBJECT_NOT_FOUND;
+    std::string err_msg;
+    auto ec = _replica->get_replica_stub()->_fs_manager.validate_migrate_op(
+        req.pid, req.origin_disk, req.target_disk, err_msg);
+    if (ec != ERR_OK) {
+        LOG_ERROR_PREFIX(err_msg);
+        resp.err = ec;
         resp.__set_hint(err_msg);
         return false;
     }
@@ -196,7 +164,7 @@ void replica_disk_migrator::migrate_replica(const replica_disk_migrate_request &
 // THREAD_POOL_REPLICATION_LONG
 bool replica_disk_migrator::init_target_dir(const replica_disk_migrate_request &req)
 {
-    FAIL_POINT_INJECT_F("init_target_dir", [this](string_view) -> bool {
+    FAIL_POINT_INJECT_F("init_target_dir", [this](std::string_view) -> bool {
         reset_status();
         return false;
     });
@@ -242,7 +210,7 @@ bool replica_disk_migrator::init_target_dir(const replica_disk_migrate_request &
 // THREAD_POOL_REPLICATION_LONG
 bool replica_disk_migrator::migrate_replica_checkpoint(const replica_disk_migrate_request &req)
 {
-    FAIL_POINT_INJECT_F("migrate_replica_checkpoint", [this](string_view) -> bool {
+    FAIL_POINT_INJECT_F("migrate_replica_checkpoint", [this](std::string_view) -> bool {
         reset_status();
         return false;
     });
@@ -252,7 +220,7 @@ bool replica_disk_migrator::migrate_replica_checkpoint(const replica_disk_migrat
         LOG_ERROR_PREFIX("disk migration(origin={}, target={}) sync_checkpoint failed({})",
                          req.origin_disk,
                          req.target_disk,
-                         sync_checkpoint_err.to_string());
+                         sync_checkpoint_err);
         reset_status();
         return false;
     }
@@ -265,7 +233,7 @@ bool replica_disk_migrator::migrate_replica_checkpoint(const replica_disk_migrat
                          req.origin_disk,
                          req.target_disk,
                          _target_data_dir,
-                         copy_checkpoint_err.to_string(),
+                         copy_checkpoint_err,
                          _target_replica_dir);
         reset_status();
         utils::filesystem::remove_path(_target_replica_dir);
@@ -278,29 +246,31 @@ bool replica_disk_migrator::migrate_replica_checkpoint(const replica_disk_migrat
 // THREAD_POOL_REPLICATION_LONG
 bool replica_disk_migrator::migrate_replica_app_info(const replica_disk_migrate_request &req)
 {
-    FAIL_POINT_INJECT_F("migrate_replica_app_info", [this](string_view) -> bool {
+    FAIL_POINT_INJECT_F("migrate_replica_app_info", [this](std::string_view) -> bool {
         reset_status();
         return false;
     });
     replica_init_info init_info = _replica->get_app()->init_info();
-    const auto &store_init_info_err = init_info.store(_target_replica_dir);
+    const auto &store_init_info_err = utils::dump_rjobj_to_file(
+        init_info,
+        utils::filesystem::path_combine(_target_replica_dir, replica_init_info::kInitInfo));
     if (store_init_info_err != ERR_OK) {
         LOG_ERROR_PREFIX("disk migration(origin={}, target={}) stores app init info failed({})",
                          req.origin_disk,
                          req.target_disk,
-                         store_init_info_err.to_string());
+                         store_init_info_err);
         reset_status();
         return false;
     }
 
     const auto &store_info_err = _replica->store_app_info(
         _replica->_app_info,
-        utils::filesystem::path_combine(_target_replica_dir, replica::kAppInfo));
+        utils::filesystem::path_combine(_target_replica_dir, replica_app_info::kAppInfo));
     if (store_info_err != ERR_OK) {
         LOG_ERROR_PREFIX("disk migration(origin={}, target={}) stores app info failed({})",
                          req.origin_disk,
                          req.target_disk,
-                         store_info_err.to_string());
+                         store_info_err);
         reset_status();
         return false;
     }

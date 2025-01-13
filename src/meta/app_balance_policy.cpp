@@ -15,49 +15,52 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "utils/command_manager.h"
-#include "utils/fmt_logging.h"
+#include <algorithm>
+#include <functional>
+#include <iterator>
+#include <set>
+
 #include "app_balance_policy.h"
-#include "meta_service.h"
+#include "common/gpid.h"
+#include "gutil/map_util.h"
+#include "meta/load_balance_policy.h"
+#include "metadata_types.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+
+DSN_DEFINE_bool(meta_server, balancer_in_turn, false, "balance the apps one-by-one/concurrently");
+DSN_DEFINE_bool(meta_server, only_primary_balancer, false, "only try to make the primary balanced");
+DSN_DEFINE_bool(meta_server,
+                only_move_primary,
+                false,
+                "only try to make the primary balanced by move");
 
 namespace dsn {
-namespace replication {
 
+namespace replication {
 app_balance_policy::app_balance_policy(meta_service *svc) : load_balance_policy(svc)
 {
     if (_svc != nullptr) {
-        _balancer_in_turn = _svc->get_meta_options()._lb_opts.balancer_in_turn;
-        _only_primary_balancer = _svc->get_meta_options()._lb_opts.only_primary_balancer;
-        _only_move_primary = _svc->get_meta_options()._lb_opts.only_move_primary;
+        _balancer_in_turn = FLAGS_balancer_in_turn;
+        _only_primary_balancer = FLAGS_only_primary_balancer;
+        _only_move_primary = FLAGS_only_move_primary;
     } else {
         _balancer_in_turn = false;
         _only_primary_balancer = false;
         _only_move_primary = false;
     }
-    _cmds.emplace_back(dsn::command_manager::instance().register_command(
-        {"meta.lb.balancer_in_turn"},
-        "meta.lb.balancer_in_turn <true|false>",
-        "control whether do app balancer in turn",
-        [this](const std::vector<std::string> &args) {
-            return remote_command_set_bool_flag(_balancer_in_turn, "lb.balancer_in_turn", args);
-        }));
+    _cmds.emplace_back(dsn::command_manager::instance().register_bool_command(
+        _balancer_in_turn, "meta.lb.balancer_in_turn", "control whether do app balancer in turn"));
 
-    _cmds.emplace_back(dsn::command_manager::instance().register_command(
-        {"meta.lb.only_primary_balancer"},
-        "meta.lb.only_primary_balancer <true|false>",
-        "control whether do only primary balancer",
-        [this](const std::vector<std::string> &args) {
-            return remote_command_set_bool_flag(
-                _only_primary_balancer, "lb.only_primary_balancer", args);
-        }));
+    _cmds.emplace_back(dsn::command_manager::instance().register_bool_command(
+        _only_primary_balancer,
+        "meta.lb.only_primary_balancer",
+        "control whether do only primary balancer"));
 
-    _cmds.emplace_back(dsn::command_manager::instance().register_command(
-        {"meta.lb.only_move_primary"},
-        "meta.lb.only_move_primary <true|false>",
-        "control whether only move primary in balancer",
-        [this](const std::vector<std::string> &args) {
-            return remote_command_set_bool_flag(_only_move_primary, "lb.only_move_primary", args);
-        }));
+    _cmds.emplace_back(dsn::command_manager::instance().register_bool_command(
+        _only_move_primary,
+        "meta.lb.only_move_primary",
+        "control whether only move primary in balancer"));
 }
 
 void app_balance_policy::balance(bool checker, const meta_view *global_view, migration_list *list)
@@ -112,8 +115,8 @@ bool app_balance_policy::copy_secondary(const std::shared_ptr<app_state> &app, b
     const app_mapper &apps = *_global_view->apps;
     int replicas_low = app->partition_count / _alive_nodes;
 
-    std::unique_ptr<copy_replica_operation> operation = dsn::make_unique<copy_secondary_operation>(
-        app, apps, nodes, address_vec, address_id, replicas_low);
+    std::unique_ptr<copy_replica_operation> operation = std::make_unique<copy_secondary_operation>(
+        app, apps, nodes, host_port_vec, host_port_id, replicas_low);
     return operation->start(_migration_result);
 }
 
@@ -121,20 +124,21 @@ copy_secondary_operation::copy_secondary_operation(
     const std::shared_ptr<app_state> app,
     const app_mapper &apps,
     node_mapper &nodes,
-    const std::vector<dsn::rpc_address> &address_vec,
-    const std::unordered_map<dsn::rpc_address, int> &address_id,
+    const std::vector<dsn::host_port> &host_port_vec,
+    const std::unordered_map<dsn::host_port, int> &host_port_id,
     int replicas_low)
-    : copy_replica_operation(app, apps, nodes, address_vec, address_id), _replicas_low(replicas_low)
+    : copy_replica_operation(app, apps, nodes, host_port_vec, host_port_id),
+      _replicas_low(replicas_low)
 {
 }
 
 bool copy_secondary_operation::can_continue()
 {
-    int id_min = *_ordered_address_ids.begin();
-    int id_max = *_ordered_address_ids.rbegin();
+    int id_min = *_ordered_host_port_ids.begin();
+    int id_max = *_ordered_host_port_ids.rbegin();
     if (_partition_counts[id_max] <= _replicas_low ||
         _partition_counts[id_max] - _partition_counts[id_min] <= 1) {
-        LOG_INFO_F("{}: stop copy secondary coz it will be balanced later", _app->get_logname());
+        LOG_INFO("{}: stop copy secondary coz it will be balanced later", _app->get_logname());
         return false;
     }
     return true;
@@ -147,32 +151,32 @@ int copy_secondary_operation::get_partition_count(const node_state &ns) const
 
 bool copy_secondary_operation::can_select(gpid pid, migration_list *result)
 {
-    int id_max = *_ordered_address_ids.rbegin();
-    const node_state &max_ns = _nodes.at(_address_vec[id_max]);
+    int id_max = *_ordered_host_port_ids.rbegin();
+    const node_state &max_ns = _nodes.at(_host_port_vec[id_max]);
     if (max_ns.served_as(pid) == partition_status::PS_PRIMARY) {
-        LOG_DEBUG_F("{}: skip gpid({}.{}) coz it is primary",
-                    _app->get_logname(),
-                    pid.get_app_id(),
-                    pid.get_partition_index());
+        LOG_DEBUG("{}: skip gpid({}.{}) coz it is primary",
+                  _app->get_logname(),
+                  pid.get_app_id(),
+                  pid.get_partition_index());
         return false;
     }
 
     // if the pid have been used
-    if (result->find(pid) != result->end()) {
-        LOG_DEBUG_F("{}: skip gpid({}.{}) coz it is already copyed",
-                    _app->get_logname(),
-                    pid.get_app_id(),
-                    pid.get_partition_index());
+    if (gutil::ContainsKey(*result, pid)) {
+        LOG_DEBUG("{}: skip gpid({}.{}) coz it is already copyed",
+                  _app->get_logname(),
+                  pid.get_app_id(),
+                  pid.get_partition_index());
         return false;
     }
 
-    int id_min = *_ordered_address_ids.begin();
-    const node_state &min_ns = _nodes.at(_address_vec[id_min]);
+    int id_min = *_ordered_host_port_ids.begin();
+    const node_state &min_ns = _nodes.at(_host_port_vec[id_min]);
     if (min_ns.served_as(pid) != partition_status::PS_INACTIVE) {
-        LOG_DEBUG_F("{}: skip gpid({}.{}) coz it is already a member on the target node",
-                    _app->get_logname(),
-                    pid.get_app_id(),
-                    pid.get_partition_index());
+        LOG_DEBUG("{}: skip gpid({}.{}) coz it is already a member on the target node",
+                  _app->get_logname(),
+                  pid.get_app_id(),
+                  pid.get_partition_index());
         return false;
     }
     return true;

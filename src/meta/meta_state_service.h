@@ -24,44 +24,23 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     interface of the reliable meta state service
- *     it is usually for storing meta state of dist systems, such as membership
- *
- * Revision history:
- *     2015-10-28, Weijie Sun, first version
- *     2015-11-05, @imzhenyu (Zhenyu Guo), adjust the interface, so that
- *                (1) return task_ptr/tracker for callers to cancel or wait;
- *                (2) add factory for provider registration;
- *                (3) add cb_code parameter, then users can specify where the callback
- *                    should be executed
- *     2015-11-06, @imzhenyu (Zhenyu Guo), add watch/unwatch API
- *     2015-12-28, @shengofsun (Weijie SUn), add transaction api
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
-#include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
-#include "runtime/serverlet.h"
-#include "runtime/service_app.h"
-#include "runtime/rpc/rpc_address.h"
-#include "utils/error_code.h"
-#include "runtime/task/future_types.h"
-#include <string>
 #include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "task/future_types.h"
+#include "task/task.h"
+#include "task/task_code.h"
+#include "utils/autoref_ptr.h"
+#include "utils/blob.h"
+#include "utils/error_code.h"
 
 namespace dsn {
+class task_tracker;
+
 namespace dist {
 typedef std::function<void(error_code ec, const blob &val)> err_value_callback;
 typedef future_task<error_code, blob> err_value_future;
@@ -72,6 +51,8 @@ typedef std::function<void(error_code ec, const std::vector<std::string> &ret_st
 typedef future_task<error_code, std::vector<std::string>> err_stringv_future;
 typedef dsn::ref_ptr<err_stringv_future> err_stringv_future_ptr;
 
+// The interface of the reliable meta state service.
+// It is usually for storing meta state of dist systems, such as membership.
 class meta_state_service
 {
 public:
@@ -196,5 +177,5 @@ public:
                                   const err_stringv_callback &cb_get_children,
                                   dsn::task_tracker *tracker = nullptr) = 0;
 };
-}
-}
+} // namespace dist
+} // namespace dsn

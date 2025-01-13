@@ -15,11 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
+#include <memory>
+#include <string>
+#include <utility>
 
-#include "replica/replica.h"
+#include "common/fs_manager.h"
+#include "common/gpid.h"
+#include "common/replication_common.h"
+#include "common/replication_other_types.h"
+#include "consensus_types.h"
+#include "dsn.layer2_types.h"
+#include "gtest/gtest.h"
 #include "mock_utils.h"
 #include "replica/duplication/test/duplication_test_base.h"
+#include "replica/prepare_list.h"
+#include "replica/replica_context.h"
+#include "utils/fmt_logging.h"
 
 namespace dsn {
 namespace replication {
@@ -33,11 +44,14 @@ public:
 
     std::unique_ptr<mock_replica> create_duplicating_replica()
     {
-        gpid gpid(1, 1);
-        app_info app_info;
-        app_info.app_type = "replica";
-        app_info.duplicating = true;
-        auto r = make_unique<mock_replica>(stub.get(), gpid, app_info, "./");
+        gpid pid(1, 0);
+        app_info ai;
+        ai.app_type = replication_options::kReplicaAppType;
+        ai.duplicating = true;
+
+        dir_node *dn = stub->get_fs_manager()->find_best_dir_for_new_replica(pid);
+        CHECK_NOTNULL(dn, "");
+        auto r = std::make_unique<mock_replica>(stub.get(), pid, ai, dn);
         r->as_primary();
         return r;
     }
@@ -117,7 +131,6 @@ public:
             {0, invalid_decree, 5, 2, invalid_decree, 1},
             // learn_start_decree_for_dup(3) > learn_start_decree_no_dup(2)
             {1, invalid_decree, 5, 2, invalid_decree, 2},
-
         };
 
         int id = 1;
@@ -135,8 +148,8 @@ public:
             auto dup = create_test_duplicator(tt.min_confirmed_decree);
             add_dup(_replica.get(), std::move(dup));
 
-            ASSERT_EQ(_replica->get_learn_start_decree(req), tt.wlearn_start_decree) << "case #"
-                                                                                     << id;
+            ASSERT_EQ(_replica->get_learn_start_decree(req), tt.wlearn_start_decree)
+                << "case #" << id;
             id++;
         }
     }
@@ -164,9 +177,11 @@ public:
     }
 };
 
-TEST_F(replica_learn_test, get_learn_start_decree) { test_get_learn_start_decree(); }
+INSTANTIATE_TEST_SUITE_P(, replica_learn_test, ::testing::Values(false, true));
 
-TEST_F(replica_learn_test, get_max_gced_decree_for_learn) { test_get_max_gced_decree_for_learn(); }
+TEST_P(replica_learn_test, get_learn_start_decree) { test_get_learn_start_decree(); }
+
+TEST_P(replica_learn_test, get_max_gced_decree_for_learn) { test_get_max_gced_decree_for_learn(); }
 
 } // namespace replication
 } // namespace dsn

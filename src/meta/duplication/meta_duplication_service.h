@@ -17,11 +17,33 @@
 
 #pragma once
 
-#include "meta/server_state.h"
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "common/duplication_common.h"
+#include "meta/duplication/duplication_info.h"
 #include "meta/meta_data.h"
+#include "meta/server_state.h"
+#include "utils/fmt_logging.h"
 
 namespace dsn {
+class error_code;
+class host_port;
+class zrwlock_nr;
+
 namespace replication {
+class configuration_create_app_response;
+class duplication_confirm_entry;
+class duplication_list_request;
+class duplication_list_response;
+class duplication_query_request;
+class duplication_query_response;
+class meta_service;
 
 /// On meta storage, duplication info are stored in the following layout:
 ///
@@ -49,7 +71,11 @@ public:
 
     /// See replication.thrift for possible errors for each rpc.
 
+    // Query duplications for one table.
     void query_duplication_info(const duplication_query_request &, duplication_query_response &);
+
+    // List duplications for one or multiple tables.
+    void list_duplication_info(const duplication_list_request &, duplication_list_response &);
 
     void add_duplication(duplication_add_rpc rpc);
 
@@ -63,7 +89,8 @@ public:
 private:
     void do_add_duplication(std::shared_ptr<app_state> &app,
                             duplication_info_s_ptr &dup,
-                            duplication_add_rpc &rpc);
+                            duplication_add_rpc &rpc,
+                            const error_code &resp_err);
 
     void do_modify_duplication(std::shared_ptr<app_state> &app,
                                duplication_info_s_ptr &dup,
@@ -82,8 +109,37 @@ private:
                                        int32_t partition_idx,
                                        const duplication_confirm_entry &confirm_entry);
 
+    // Send a request to the follower cluster to create a table for duplication. This request
+    // is idempotent and is allowed to be sent multiple times as long as the duplication is at
+    // the status of DS_PREPARE.
     void create_follower_app_for_duplication(const std::shared_ptr<duplication_info> &dup,
                                              const std::shared_ptr<app_state> &app);
+
+    // Send a request to the follower cluster to mark a table as created for duplication. This
+    // request is idempotent and is allowed to be sent multiple times as long as the duplication
+    // is at the status of DS_APP.
+    void mark_follower_app_created_for_duplication(const std::shared_ptr<duplication_info> &dup,
+                                                   const std::shared_ptr<app_state> &app);
+
+    // Send a request to the follower cluster to create a table or mark it as some specific
+    // status.
+    void do_create_follower_app_for_duplication(
+        const std::shared_ptr<duplication_info> &dup,
+        const std::shared_ptr<app_state> &app,
+        const std::string &create_status,
+        std::function<void(error_code, configuration_create_app_response &&)> create_callback);
+
+    // Callback for the response of creaing a new table.
+    void on_follower_app_creating_for_duplication(const std::shared_ptr<duplication_info> &dup,
+                                                  error_code err,
+                                                  configuration_create_app_response &&resp);
+
+    // Callback for the response of marking a table as created.
+    void on_follower_app_created_for_duplication(const std::shared_ptr<duplication_info> &dup,
+                                                 error_code err,
+                                                 configuration_create_app_response &&resp);
+
+    // Check if the whole follower table(including all of its partitions and replicas) is ready.
     void check_follower_app_if_create_completed(const std::shared_ptr<duplication_info> &dup);
 
     // Get zk path for duplication.
@@ -104,8 +160,10 @@ private:
     // Create a new duplication from INIT state.
     // Thread-Safe
     std::shared_ptr<duplication_info>
-    new_dup_from_init(const std::string &follower_cluster_name,
-                      std::vector<rpc_address> &&follower_cluster_metas,
+    new_dup_from_init(const std::string &remote_cluster_name,
+                      const std::string &remote_app_name,
+                      const int32_t remote_replica_count,
+                      std::vector<host_port> &&remote_cluster_metas,
                       std::shared_ptr<app_state> &app) const;
 
     // get lock to protect access of app table

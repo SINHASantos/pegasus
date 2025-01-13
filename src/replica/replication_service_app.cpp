@@ -25,19 +25,23 @@
  */
 
 #include "replica/replication_service_app.h"
-#include "http/http_server.h"
 
+#include "common/gpid.h"
 #include "common/replication_common.h"
-#include "replica_stub.h"
-#include "replica_http_service.h"
+#include "http/http_server.h"
 #include "http/service_version.h"
+#include "replica_http_service.h"
+#include "replica_stub.h"
 
 namespace dsn {
+class message_ex;
+
 namespace replication {
 
 void replication_service_app::register_all()
 {
-    dsn::service_app::register_factory<replication_service_app>("replica");
+    dsn::service_app::register_factory<replication_service_app>(
+        replication_options::kReplicaAppType.c_str());
 }
 
 replication_service_app::replication_service_app(const service_app_info *info) : service_app(info)

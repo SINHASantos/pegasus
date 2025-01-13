@@ -17,19 +17,21 @@
 
 #pragma once
 
-#include <atomic>
-
-#include "replica/replica_stub.h"
+#include <map>
+#include <string>
 
 #include "common//duplication_common.h"
-#include "utils/chrono_literals.h"
+#include "common/gpid.h"
+#include "common/replication_other_types.h"
+#include "duplication_types.h"
+#include "task/task.h"
+#include "utils/zlocks.h"
 
 namespace dsn {
+class error_code;
+
 namespace replication {
-
-using namespace literals::chrono_literals;
-
-constexpr int DUPLICATION_SYNC_PERIOD_SECOND = 10;
+class replica_stub;
 
 // Per-server(replica_stub)-instance.
 class duplication_sync_timer
@@ -50,6 +52,7 @@ public:
         decree not_duplicated{0};
         decree not_confirmed{0};
         duplication_fail_mode::type fail_mode{duplication_fail_mode::FAIL_SLOW};
+        std::string remote_app_name;
     };
     std::multimap<dupid_t, replica_dup_state> get_dup_states(int app_id, /*out*/ bool *app_found);
 
@@ -65,10 +68,6 @@ private:
     update_duplication_map(const std::map<app_id, std::map<dupid_t, duplication_entry>> &dup_map);
 
     void on_duplication_sync_reply(error_code err, const duplication_sync_response &resp);
-
-    std::vector<replica_ptr> get_all_primaries();
-
-    std::vector<replica_ptr> get_all_replicas();
 
 private:
     friend class duplication_sync_timer_test;

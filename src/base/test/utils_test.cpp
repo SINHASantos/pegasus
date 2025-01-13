@@ -17,8 +17,11 @@
  * under the License.
  */
 
+#include <list>
+#include <string>
+
 #include "../pegasus_utils.h"
-#include <gtest/gtest.h>
+#include "gtest/gtest.h"
 
 namespace pegasus {
 namespace utils {

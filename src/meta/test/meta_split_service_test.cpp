@@ -24,18 +24,47 @@
  * THE SOFTWARE.
  */
 
-#include <gtest/gtest.h>
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/fmt_logging.h"
-#include "common/replica_envs.h"
+#include <boost/cstdint.hpp>
+#include <boost/lexical_cast.hpp>
+#include <string.h>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
+#include "common/gpid.h"
+#include "common/json_helper.h"
+#include "common/partition_split_common.h"
+#include "common/replica_envs.h"
+#include "common/replication.codes.h"
+#include "common/replication_other_types.h"
+#include "dsn.layer2_types.h"
+#include "gtest/gtest.h"
+#include "meta/meta_data.h"
+#include "meta/meta_rpc_types.h"
+#include "meta/meta_server_failure_detector.h"
+#include "meta/meta_service.h"
+#include "meta/meta_split_service.h"
+#include "meta/meta_state_service_utils.h"
+#include "meta/server_state.h"
+#include "meta/table_metrics.h"
+#include "meta_admin_types.h"
 #include "meta_service_test_app.h"
 #include "meta_test_base.h"
-#include "meta/meta_split_service.h"
-#include "meta/meta_server_failure_detector.h"
+#include "metadata_types.h"
+#include "partition_split_types.h"
+#include "rpc/rpc_address.h"
+#include "rpc/rpc_host_port.h"
+#include "utils/blob.h"
+#include "utils/error_code.h"
+#include "utils/fmt_logging.h"
 
 namespace dsn {
 namespace replication {
@@ -59,7 +88,7 @@ public:
 
     error_code start_partition_split(const std::string &app_name, int new_partition_count)
     {
-        auto request = dsn::make_unique<start_partition_split_request>();
+        auto request = std::make_unique<start_partition_split_request>();
         request->app_name = app_name;
         request->new_partition_count = new_partition_count;
 
@@ -71,7 +100,7 @@ public:
 
     query_split_response query_partition_split(const std::string &app_name)
     {
-        auto request = dsn::make_unique<query_split_request>();
+        auto request = std::make_unique<query_split_request>();
         request->app_name = app_name;
 
         query_split_rpc rpc(std::move(request), RPC_CM_QUERY_PARTITION_SPLIT);
@@ -85,7 +114,7 @@ public:
                                        const int32_t pidx,
                                        const int32_t old_partition_count = 0)
     {
-        auto req = make_unique<control_split_request>();
+        auto req = std::make_unique<control_split_request>();
         req->__set_app_name(app_name);
         req->__set_control_type(type);
         req->__set_parent_pidx(pidx);
@@ -100,28 +129,28 @@ public:
 
     error_code register_child(int32_t parent_index, ballot req_parent_ballot, bool wait_zk)
     {
-        partition_configuration parent_config;
-        parent_config.ballot = req_parent_ballot;
-        parent_config.last_committed_decree = 5;
-        parent_config.max_replica_count = 3;
-        parent_config.pid = gpid(app->app_id, parent_index);
+        partition_configuration parent_pc;
+        parent_pc.ballot = req_parent_ballot;
+        parent_pc.last_committed_decree = 5;
+        parent_pc.max_replica_count = 3;
+        parent_pc.pid = gpid(app->app_id, parent_index);
 
-        partition_configuration child_config;
-        child_config.ballot = PARENT_BALLOT + 1;
-        child_config.last_committed_decree = 5;
-        child_config.pid = gpid(app->app_id, parent_index + PARTITION_COUNT);
+        partition_configuration child_pc;
+        child_pc.ballot = PARENT_BALLOT + 1;
+        child_pc.last_committed_decree = 5;
+        child_pc.pid = gpid(app->app_id, parent_index + PARTITION_COUNT);
 
         // mock node state
         node_state node;
         node.put_partition(gpid(app->app_id, PARENT_INDEX), true);
         mock_node_state(NODE, node);
 
-        auto request = dsn::make_unique<register_child_request>();
+        auto request = std::make_unique<register_child_request>();
         request->app.app_name = app->app_name;
         request->app.app_id = app->app_id;
-        request->parent_config = parent_config;
-        request->child_config = child_config;
-        request->primary_address = NODE;
+        request->parent_config = parent_pc;
+        request->child_config = child_pc;
+        SET_IP_AND_HOST_PORT_BY_DNS(*request, primary, NODE);
 
         register_child_rpc rpc(std::move(request), RPC_CM_REGISTER_CHILD_REPLICA);
         split_svc().register_child_on_meta(rpc);
@@ -134,7 +163,7 @@ public:
 
     error_code notify_stop_split(split_status::type req_split_status)
     {
-        auto req = make_unique<notify_stop_split_request>();
+        auto req = std::make_unique<notify_stop_split_request>();
         req->__set_app_name(NAME);
         req->__set_parent_gpid(dsn::gpid(app->app_id, PARENT_INDEX));
         req->__set_meta_split_status(req_split_status);
@@ -149,7 +178,7 @@ public:
 
     query_child_state_response query_child_state()
     {
-        auto req = make_unique<query_child_state_request>();
+        auto req = std::make_unique<query_child_state_request>();
         req->__set_app_name(NAME);
         req->__set_pid(dsn::gpid(app->app_id, PARENT_INDEX));
         req->__set_partition_count(PARTITION_COUNT);
@@ -163,7 +192,7 @@ public:
 
     int32_t on_config_sync(configuration_query_by_node_request req)
     {
-        auto request = make_unique<configuration_query_by_node_request>(req);
+        auto request = std::make_unique<configuration_query_by_node_request>(req);
         configuration_query_by_node_rpc rpc(std::move(request), RPC_CM_CONFIG_SYNC);
         _ss->on_config_sync(rpc);
         wait_all();
@@ -179,16 +208,17 @@ public:
     void mock_app_partition_split_context()
     {
         app->partition_count = NEW_PARTITION_COUNT;
-        app->partitions.resize(app->partition_count);
+        app->pcs.resize(app->partition_count);
+        _ss->get_table_metric_entities().resize_partitions(app->app_id, app->partition_count);
         app->helpers->contexts.resize(app->partition_count);
         app->helpers->split_states.splitting_count = app->partition_count / 2;
         for (int i = 0; i < app->partition_count; ++i) {
-            app->helpers->contexts[i].config_owner = &app->partitions[i];
-            app->partitions[i].pid = gpid(app->app_id, i);
+            app->helpers->contexts[i].pc = &app->pcs[i];
+            app->pcs[i].pid = gpid(app->app_id, i);
             if (i >= app->partition_count / 2) {
-                app->partitions[i].ballot = invalid_ballot;
+                app->pcs[i].ballot = invalid_ballot;
             } else {
-                app->partitions[i].ballot = PARENT_BALLOT;
+                app->pcs[i].ballot = PARENT_BALLOT;
                 app->helpers->contexts[i].stage = config_status::not_pending;
                 app->helpers->split_states.status[i] = split_status::SPLITTING;
             }
@@ -198,7 +228,8 @@ public:
     void clear_app_partition_split_context()
     {
         app->partition_count = PARTITION_COUNT;
-        app->partitions.resize(app->partition_count);
+        app->pcs.resize(app->partition_count);
+        _ss->get_table_metric_entities().resize_partitions(app->app_id, app->partition_count);
         app->helpers->contexts.resize(app->partition_count);
         app->helpers->split_states.splitting_count = 0;
         app->helpers->split_states.status.clear();
@@ -207,15 +238,16 @@ public:
     void mock_only_one_partition_split(split_status::type split_status)
     {
         app->partition_count = NEW_PARTITION_COUNT;
-        app->partitions.resize(app->partition_count);
+        app->pcs.resize(app->partition_count);
+        _ss->get_table_metric_entities().resize_partitions(app->app_id, app->partition_count);
         app->helpers->contexts.resize(app->partition_count);
         for (int i = 0; i < app->partition_count; ++i) {
-            app->helpers->contexts[i].config_owner = &app->partitions[i];
-            app->partitions[i].pid = dsn::gpid(app->app_id, i);
+            app->helpers->contexts[i].pc = &app->pcs[i];
+            app->pcs[i].pid = dsn::gpid(app->app_id, i);
             if (i >= app->partition_count / 2) {
-                app->partitions[i].ballot = invalid_ballot;
+                app->pcs[i].ballot = invalid_ballot;
             } else {
-                app->partitions[i].ballot = PARENT_BALLOT;
+                app->pcs[i].ballot = PARENT_BALLOT;
                 app->helpers->contexts[i].stage = config_status::not_pending;
             }
         }
@@ -225,7 +257,7 @@ public:
 
     void mock_child_registered()
     {
-        app->partitions[CHILD_INDEX].ballot = PARENT_BALLOT;
+        app->pcs[CHILD_INDEX].ballot = PARENT_BALLOT;
         app->helpers->split_states.splitting_count--;
         app->helpers->split_states.status.erase(PARENT_INDEX);
     }
@@ -270,7 +302,7 @@ public:
         _ms.reset(meta_svc);
 
         // initialize bulk load service
-        _ms->_split_svc = make_unique<meta_split_service>(_ms.get());
+        _ms->_split_svc = std::make_unique<meta_split_service>(_ms.get());
 
         // mock splitting app
         create_splitting_app_on_remote_stroage(state->_apps_root);
@@ -288,7 +320,7 @@ public:
 
         _ms->get_meta_storage()->create_node(
             std::move(path), blob(lock_state, 0, strlen(lock_state)), [&app_root]() {
-                LOG_INFO_F("create app root {}", app_root);
+                LOG_INFO("create app root {}", app_root);
             });
         wait_all();
 
@@ -308,7 +340,7 @@ public:
             app_root + "/" + boost::lexical_cast<std::string>(ainfo.app_id),
             std::move(value),
             [this, &app_root, &ainfo]() {
-                LOG_INFO_F("create app({}) app_id={}, dir succeed", ainfo.app_name, ainfo.app_id);
+                LOG_INFO("create app({}) app_id={}, dir succeed", ainfo.app_name, ainfo.app_id);
                 for (int i = 0; i < ainfo.init_partition_count; ++i) {
                     create_partition_configuration_on_remote_storage(app_root, ainfo.app_id, i);
                 }
@@ -327,17 +359,17 @@ public:
                                                           const int32_t app_id,
                                                           const int32_t pidx)
     {
-        partition_configuration config;
-        config.max_replica_count = 3;
-        config.pid = gpid(app_id, pidx);
-        config.ballot = PARENT_BALLOT;
-        blob value = json::json_forwarder<partition_configuration>::encode(config);
+        partition_configuration pc;
+        pc.max_replica_count = 3;
+        pc.pid = gpid(app_id, pidx);
+        pc.ballot = PARENT_BALLOT;
+        blob value = json::json_forwarder<partition_configuration>::encode(pc);
         _ms->get_meta_storage()->create_node(
             app_root + "/" + boost::lexical_cast<std::string>(app_id) + "/" +
                 boost::lexical_cast<std::string>(pidx),
             std::move(value),
             [app_id, pidx, this]() {
-                LOG_INFO_F("create app({}), partition({}.{}) dir succeed", NAME, app_id, pidx);
+                LOG_INFO("create app({}), partition({}.{}) dir succeed", NAME, app_id, pidx);
             });
     }
 
@@ -347,7 +379,7 @@ public:
     const int32_t PARENT_BALLOT = 3;
     const int32_t PARENT_INDEX = 0;
     const int32_t CHILD_INDEX = 4;
-    const rpc_address NODE = rpc_address("127.0.0.1", 10086);
+    const host_port NODE = host_port("localhost", 10086);
     std::shared_ptr<app_state> app;
 };
 
@@ -475,7 +507,7 @@ TEST_F(meta_split_service_test, on_config_sync_test)
     info1.pid = pid1;
     info2.pid = pid2;
     configuration_query_by_node_request req;
-    req.node = NODE;
+    SET_IP_AND_HOST_PORT_BY_DNS(req, node, NODE);
     req.__isset.stored_replicas = true;
     req.stored_replicas.emplace_back(info1);
     req.stored_replicas.emplace_back(info2);
@@ -815,7 +847,7 @@ TEST_F(meta_split_service_failover_test, half_split_test)
     ASSERT_EQ(split_states.splitting_count, PARTITION_COUNT - 1);
     ASSERT_EQ(split_states.status.find(PARENT_INDEX), split_states.status.end());
     ASSERT_EQ(app->partition_count, NEW_PARTITION_COUNT);
-    ASSERT_EQ(app->partitions.size(), NEW_PARTITION_COUNT);
+    ASSERT_EQ(app->pcs.size(), NEW_PARTITION_COUNT);
 }
 
 } // namespace replication

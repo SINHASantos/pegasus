@@ -23,6 +23,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #pragma once
 
 #include "utils/ports.h"
@@ -40,6 +41,7 @@ public:
     __inline void lock() { _lock.lock(); }
     __inline bool try_lock() { return _lock.tryLock(); }
     __inline void unlock() { _lock.unlock(); }
+
 private:
     RecursiveBenaphore _lock;
 };
@@ -50,6 +52,7 @@ public:
     __inline void lock() { _lock.lock(); }
     __inline bool try_lock() { return _lock.tryLock(); }
     __inline void unlock() { _lock.unlock(); }
+
 private:
     NonRecursiveBenaphore _lock;
 };
@@ -178,5 +181,5 @@ public:
 private:
     rw_lock_nr *_lock;
 };
-}
-}
+} // namespace utils
+} // namespace dsn

@@ -24,32 +24,17 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     Unit-test for sim lock.
- *
- * Revision history:
- *     Nov., 2015, @xiaotz (Xiaotong Zhang), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
+#include <functional>
+#include <string>
 
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "runtime/tool_api.h"
-#include "runtime/task/task.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
-#include "common/gpid.h"
-#include "utils/utils.h"
-#include "utils/synchronize.h"
-#include <gtest/gtest.h>
-#include <thread>
-#include "runtime/service_engine.h"
-#include "runtime/task/task_engine.sim.h"
+#include "gtest/gtest.h"
+#include "runtime/global_config.h"
 #include "runtime/scheduler.h"
+#include "runtime/service_engine.h"
+#include "task/task.h"
+#include "task/task_engine.sim.h"
+#include "utils/synchronize.h"
+#include "utils/zlocks.h"
 
 TEST(tools_simulator, dsn_semaphore)
 {
@@ -101,13 +86,17 @@ namespace dsn {
 namespace test {
 typedef std::function<void()> system_callback;
 }
-}
+} // namespace dsn
 TEST(tools_simulator, scheduler)
 {
-    if (dsn::task::get_current_worker() == nullptr)
-        return;
-    if (dsn::service_engine::instance().spec().tool != "simulator")
-        return;
+    if (dsn::task::get_current_worker() == nullptr) {
+        GTEST_SKIP() << "Skip the test in non-worker thread.";
+    }
+    if (dsn::service_engine::instance().spec().tool == "nativerun") {
+        GTEST_SKIP() << "Skip the test in nativerun mode, set 'tool = simulator' in '[core]' "
+                        "section in config file to enable it.";
+    }
+    ASSERT_EQ("simulator", dsn::service_engine::instance().spec().tool);
 
     dsn::tools::sim_worker_state *s =
         dsn::tools::scheduler::task_worker_ext::get(dsn::task::get_current_worker());

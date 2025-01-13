@@ -82,6 +82,8 @@ fault_injection_enabled = false
 </PRE>
 */
 namespace dsn {
+struct service_spec;
+
 namespace tools {
 
 class fault_injector : public toollet
@@ -90,5 +92,5 @@ public:
     explicit fault_injector(const char *name);
     void install(service_spec &spec) override;
 };
-}
-}
+} // namespace tools
+} // namespace dsn

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # The MIT License (MIT)
 #
 # Copyright (c) 2015 Microsoft Corporation
@@ -28,6 +28,25 @@ if [ -z "${REPORT_DIR}" ]; then
     REPORT_DIR="."
 fi
 
+if [ -n ${TEST_OPTS} ]; then
+    if [ ! -f "./config-test.ini" ]; then
+        echo "./config-test.ini does not exists"
+        exit 1
+    fi
+
+    OPTS=`echo ${TEST_OPTS} | xargs`
+    config_kvs=(${OPTS//;/ })
+    for config_kv in ${config_kvs[@]}; do
+        config_kv=`echo $config_kv | xargs`
+        kv=(${config_kv//=/ })
+        if [ ! ${#kv[*]} -eq 2 ]; then
+            echo "Invalid config kv !"
+            exit 1
+        fi
+        sed -i '/^\s*'"${kv[0]}"'/c '"${kv[0]}"' = '"${kv[1]}" ./config-test.ini
+    done
+fi
+
 ./clear.sh
 output_xml="${REPORT_DIR}/dsn.meta.test.1.xml"
 GTEST_OUTPUT="xml:${output_xml}" ./dsn.meta.test
@@ -35,9 +54,9 @@ if [ $? -ne 0 ]; then
     echo "run dsn.meta.test failed"
     echo "---- ls ----"
     ls -l
-    if find . -name log.1.txt; then
-        echo "---- tail -n 100 log.1.txt ----"
-        tail -n 100 `find . -name log.1.txt`
+    if [ `find . -name pegasus.log.* | wc -l` -ne 0 ]; then
+            echo "---- tail -n 100 pegasus.log.* ----"
+            tail -n 100 `find . -name pegasus.log.*`
     fi
     if [ -f core ]; then
         echo "---- gdb ./dsn.meta.test core ----"

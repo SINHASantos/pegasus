@@ -24,8 +24,20 @@
  * THE SOFTWARE.
  */
 
-#include <gtest/gtest.h>
+#include <string.h>
+#include <cstdint>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include "common/json_helper.h"
+#include "gtest/gtest.h"
+#include "rpc/rpc_host_port.h"
+#include "utils/blob.h"
 
 namespace dsn {
 
@@ -492,6 +504,16 @@ TEST(json_helper, upgrade_downgrade)
     ASSERT_EQ(n2.t1.d, o.t1.d);
     ASSERT_EQ(n2.t1.s, o.t1.s);
     ASSERT_EQ(n2.c, o.c);
+}
+
+TEST(json_helper, host_port_encode_decode)
+{
+    dsn::host_port hp("localhost", 8888);
+    dsn::blob bb = dsn::json::json_forwarder<decltype(hp)>::encode(hp);
+    dsn::host_port hp2;
+    ASSERT_TRUE(dsn::json::json_forwarder<dsn::host_port>::decode(bb, hp2));
+
+    ASSERT_EQ(hp, hp2);
 }
 
 } // namespace dsn

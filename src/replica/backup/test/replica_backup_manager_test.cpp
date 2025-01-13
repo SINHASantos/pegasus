@@ -15,8 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "replica/test/replica_test_base.h"
+#include <memory>
+#include <string>
+
+#include "gtest/gtest.h"
 #include "replica/backup/replica_backup_manager.h"
+#include "replica/replication_app_base.h"
+#include "replica/test/mock_utils.h"
+#include "replica/test/replica_test_base.h"
+#include "utils/filesystem.h"
 
 namespace dsn {
 namespace replication {
@@ -30,7 +37,9 @@ public:
     }
 };
 
-TEST_F(replica_backup_manager_test, clear_cold_backup)
+INSTANTIATE_TEST_SUITE_P(, replica_backup_manager_test, ::testing::Values(false, true));
+
+TEST_P(replica_backup_manager_test, clear_cold_backup)
 {
     std::string policy_name = "test_policy";
 

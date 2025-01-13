@@ -24,30 +24,36 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #include "mutation.h"
-#include "mutation_log.h"
+
+#include <inttypes.h>
+#include <string.h>
+#include <string>
+#include <unordered_map>
+#include <utility>
+
+#include "common/gpid.h"
+#include "common/replication.codes.h"
 #include "replica.h"
-#include "utils/fmt_logging.h"
+#include "runtime/api_task.h"
+#include "task/task_spec.h"
+#include "utils/binary_reader.h"
+#include "utils/binary_writer.h"
+#include "utils/blob.h"
 #include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/latency_tracer.h"
+#include "utils/ports.h"
+
+DSN_DEFINE_uint64(
+    replication,
+    abnormal_write_trace_latency_threshold,
+    1000 * 1000 * 1000, // 1s
+    "Latency trace will be logged when exceed the write latency threshold, in nanoseconds");
+DSN_TAG_VARIABLE(abnormal_write_trace_latency_threshold, FT_MUTABLE);
 
 namespace dsn {
 namespace replication {
-
-DSN_DEFINE_uint64("replication",
-                  abnormal_write_trace_latency_threshold,
-                  1000 * 1000 * 1000, // 1s
-                  "latency trace will be logged when exceed the write latency threshold");
-DSN_TAG_VARIABLE(abnormal_write_trace_latency_threshold, FT_MUTABLE);
-
 std::atomic<uint64_t> mutation::s_tid(0);
 
 mutation::mutation()
@@ -363,8 +369,7 @@ mutation_ptr mutation_queue::add_work(task_code code, dsn::message_ex *request, 
         _pending_mutation = r->new_mutation(invalid_decree);
     }
 
-    LOG_DEBUG("add request with trace_id = %016" PRIx64
-              " into mutation with mutation_tid = %" PRIu64,
+    LOG_DEBUG("add request with trace_id = {:#018x} into mutation with mutation_tid = {}",
               request->header->trace_id,
               _pending_mutation->tid());
 
@@ -458,5 +463,5 @@ void mutation_queue::clear(std::vector<mutation_ptr> &queued_mutations)
     // is handled by prepare_list
     // _current_op_count = 0;
 }
-}
-} // namespace end
+} // namespace replication
+} // namespace dsn

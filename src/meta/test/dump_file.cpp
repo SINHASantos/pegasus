@@ -24,8 +24,18 @@
  * THE SOFTWARE.
  */
 
-#include <gtest/gtest.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "gtest/gtest.h"
 #include "meta/dump_file.h"
+#include "utils/blob.h"
+#include "utils/strings.h"
+#include "utils/utils.h"
 
 TEST(dump_file, read_write)
 {
@@ -78,7 +88,7 @@ TEST(dump_file, read_write)
         }
 
         ASSERT_EQ(block_offset, length_blocks.size());
-        ASSERT_EQ(memcmp(out_buffer.get(), buffer.get(), total_length), 0);
+        ASSERT_TRUE(dsn::utils::mequals(out_buffer.get(), buffer.get(), total_length));
     }
 
     // corrupted end

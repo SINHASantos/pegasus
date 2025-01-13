@@ -19,28 +19,30 @@
 
 #pragma once
 
-#include "replica/replica_base.h"
 #include <gtest/gtest_prod.h>
+#include <rocksdb/options.h>
+#include <rocksdb/write_batch.h>
+#include <stdint.h>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "pegasus_value_schema.h"
+#include "replica/replica_base.h"
+#include <string_view>
+#include "utils/metrics.h"
 
 namespace rocksdb {
-class DB;
-class ReadOptions;
-class WriteBatch;
 class ColumnFamilyHandle;
-class WriteOptions;
+class DB;
 } // namespace rocksdb
 
-namespace dsn {
-class perf_counter_wrapper;
-} // namespace dsn
-
 namespace pegasus {
-class pegasus_value_generator;
 
 namespace server {
+class pegasus_server_impl;
 struct db_get_context;
 struct db_write_context;
-class pegasus_server_impl;
 
 class rocksdb_wrapper : public dsn::replication::replica_base
 {
@@ -48,21 +50,22 @@ public:
     rocksdb_wrapper(pegasus_server_impl *server);
 
     /// Calls RocksDB Get and store the result into `db_get_context`.
-    /// \returns 0 if Get succeeded. On failure, a non-zero rocksdb status code is returned.
-    /// \result ctx.expired=true if record expired. Still 0 is returned.
-    /// \result ctx.found=false if record is not found. Still 0 is returned.
-    int get(dsn::string_view raw_key, /*out*/ db_get_context *ctx);
+    /// \returns rocksdb::Status::kOk if Get succeeded. On failure, a non-zero rocksdb status code
+    /// is returned.
+    /// \result ctx.expired=true if record expired. Still rocksdb::Status::kOk is returned.
+    /// \result ctx.found=false if record is not found. Still rocksdb::Status::kOk is returned.
+    int get(std::string_view raw_key, /*out*/ db_get_context *ctx);
 
     int write_batch_put(int64_t decree,
-                        dsn::string_view raw_key,
-                        dsn::string_view value,
+                        std::string_view raw_key,
+                        std::string_view value,
                         uint32_t expire_sec);
     int write_batch_put_ctx(const db_write_context &ctx,
-                            dsn::string_view raw_key,
-                            dsn::string_view value,
+                            std::string_view raw_key,
+                            std::string_view value,
                             uint32_t expire_sec);
     int write(int64_t decree);
-    int write_batch_delete(int64_t decree, dsn::string_view raw_key);
+    int write_batch_delete(int64_t decree, std::string_view raw_key);
     void clear_up_write_batch();
     int ingest_files(int64_t decree,
                      const std::vector<std::string> &sst_file_list,
@@ -81,7 +84,7 @@ private:
     rocksdb::ColumnFamilyHandle *_meta_cf;
 
     const uint32_t _pegasus_data_version;
-    dsn::perf_counter_wrapper &_pfc_recent_expire_count;
+    METRIC_VAR_DECLARE_counter(read_expired_values);
     volatile uint32_t _default_ttl;
 
     friend class rocksdb_wrapper_test;

@@ -30,10 +30,6 @@ RUN apt-get update -y; \
                        openjdk-8-jdk \
                        python3-pip \
                        libaio-dev \
-                       libsnappy-dev \
-                       libbz2-dev \
-                       libzstd-dev \
-                       liblz4-dev \
                        zlib1g \
                        zlib1g.dev \
                        patch \
@@ -50,8 +46,11 @@ RUN apt-get update -y; \
                        libtool \
                        libssl-dev \
                        bison \
+                       libkrb5-dev \
+                       libsasl2-dev \
                        maven \
-                       flex; \
+                       flex \
+                       python3-setuptools; \
     rm -rf /var/lib/apt/lists/*
 
 RUN add-apt-repository ppa:git-core/ppa -y; \
@@ -60,13 +59,13 @@ RUN add-apt-repository ppa:git-core/ppa -y; \
     apt-get install pkg-config -y --no-install-recommends; \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir cmake
+RUN pip3 install --no-cache-dir --upgrade pip && pip3 install --no-cache-dir cmake
 
-RUN wget --progress=dot:giga https://github.com/apache/thrift/archive/refs/tags/0.11.0.tar.gz -P /opt/thrift && \
-    cd /opt/thrift && tar xzf 0.11.0.tar.gz && cd thrift-0.11.0 && ./bootstrap.sh && \
+RUN wget --progress=dot:giga https://archive.apache.org/dist/thrift/0.11.0/thrift-0.11.0.tar.gz -P /opt/thrift && \
+    cd /opt/thrift && tar xzf thrift-0.11.0.tar.gz && cd thrift-0.11.0 && ./bootstrap.sh && \
     ./configure --enable-libs=no && \
     make -j$(($(nproc)/2+1)) && make install && cd - && \
-    rm -rf thrift-0.11.0 0.11.0.tar.gz
+    rm -rf thrift-0.11.0 thrift-0.11.0.tar.gz
 
 ENV JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
 ENV CLASSPATH=$JAVA_HOME/lib/

@@ -24,26 +24,41 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     a simple version of meta state service for development
- *
- * Revision history:
- *     2015-11-03, @imzhenyu (Zhenyu.Guo@microsoft.com), setup the sketch
- *     2015-11-11, Tianyi WANG, first version done
- */
-
+#include <stddef.h>
+#include <stdint.h>
+#include <functional>
+#include <memory>
 #include <queue>
-#include "utils/zlocks.h"
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
 #include "meta/meta_state_service.h"
-#include "common/replication_common.h"
+#include "rpc/serialization.h"
+#include "task/future_types.h"
+#include "task/task.h"
+#include "task/task_code.h"
+#include "task/task_spec.h"
+#include "task/task_tracker.h"
+#include "utils/binary_writer.h"
+#include "utils/blob.h"
+#include "utils/error_code.h"
+#include "utils/threadpool_code.h"
+#include "utils/zlocks.h"
 
 namespace dsn {
+class binary_reader;
+class disk_file;
+
 namespace dist {
 DEFINE_TASK_CODE_AIO(LPC_META_STATE_SERVICE_SIMPLE_INTERNAL,
                      TASK_PRIORITY_HIGH,
                      THREAD_POOL_DEFAULT);
 
+// A simple version of meta state service.
+// NOTE: Only for test purpose.
 class meta_state_service_simple : public meta_state_service
 {
 public:
@@ -108,7 +123,7 @@ private:
     {
         bool done;
         std::function<void(bool)> cb;
-        operation(bool done, std::function<void(bool)> &&cb) : done(done), cb(move(cb)) {}
+        operation(bool done, std::function<void(bool)> &&cb) : done(done), cb(std::move(cb)) {}
     };
 
 #pragma pack(push, 1)
@@ -195,6 +210,7 @@ private:
 
     template <operation_type op, typename... Args>
     struct log_struct;
+
     template <operation_type op, typename Head, typename... Tail>
     struct log_struct<op, Head, Tail...>
     {
@@ -209,12 +225,12 @@ private:
                 shared_blob.length() - sizeof(log_header);
             return shared_blob;
         }
-        static void write(binary_writer &writer, const Head &head, const Tail &... tail)
+        static void write(binary_writer &writer, const Head &head, const Tail &...tail)
         {
             marshall(writer, head, DSF_THRIFT_BINARY);
             log_struct<op, Tail...>::write(writer, tail...);
         }
-        static void parse(binary_reader &reader, Head &head, Tail &... tail)
+        static void parse(binary_reader &reader, Head &head, Tail &...tail)
         {
             unmarshall(reader, head, DSF_THRIFT_BINARY);
             log_struct<op, Tail...>::parse(reader, tail...);

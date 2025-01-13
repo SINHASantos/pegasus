@@ -30,6 +30,7 @@
 #include <atomic>
 
 #include "utils/utils.h"
+#include "utils/ports.h"
 
 ///
 /// synchronization objects of rDSN.
@@ -110,7 +111,7 @@ private:
     std::atomic<bool> _signaled;
     bool _manualReset;
 };
-}
+} // namespace dsn
 
 ///
 /// RAII wrapper of rdsn's synchronization objects
@@ -187,7 +188,7 @@ private:
     bool _locked;
     zrwlock_nr *_lock;
 };
-}
+} // namespace dsn
 
 ///
 /// utils function used to check the lock safety
@@ -196,5 +197,5 @@ namespace dsn {
 namespace lock_checker {
 void check_wait_safety();
 void check_dangling_lock();
-}
-}
+} // namespace lock_checker
+} // namespace dsn

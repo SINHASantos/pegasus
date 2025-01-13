@@ -18,22 +18,69 @@
  */
 
 #include "pegasus_mutation_duplicator.h"
-#include "pegasus_server_impl.h"
-#include "base/pegasus_rpc_types.h"
 
+#include <fmt/core.h>
+#include <pegasus/error.h>
+#include <sys/types.h>
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string_view>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "client_lib/pegasus_client_impl.h"
+#include "common/common.h"
+#include "common/duplication_common.h"
+#include "duplication_internal_types.h"
+#include "gutil/map_util.h"
+#include "pegasus/client.h"
+#include "pegasus_key_schema.h"
+#include "rpc/rpc_message.h"
+#include "rrdb/rrdb.code.definition.h"
+#include "rrdb/rrdb_types.h"
 #include "runtime/message_utils.h"
+#include "utils/autoref_ptr.h"
+#include "utils/blob.h"
 #include "utils/chrono_literals.h"
-#include <rrdb/rrdb.client.h>
+#include "utils/error_code.h"
+#include "utils/errors.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/rand.h"
+
+DSN_DECLARE_bool(dup_ignore_other_cluster_ids);
+
+METRIC_DEFINE_counter(replica,
+                      dup_shipped_successful_requests,
+                      dsn::metric_unit::kRequests,
+                      "The number of successful DUPLICATE requests sent from client");
+
+METRIC_DEFINE_counter(replica,
+                      dup_shipped_failed_requests,
+                      dsn::metric_unit::kRequests,
+                      "The number of failed DUPLICATE requests sent from client");
 
 namespace dsn {
 namespace replication {
+struct replica_base;
+
+DSN_DEFINE_uint64(replication,
+                  dup_max_allowed_write_size,
+                  1 << 20,
+                  "The maximum piece of request can be add to "
+                  "the duplication batch, 0 means no check");
+DSN_TAG_VARIABLE(dup_max_allowed_write_size, FT_MUTABLE);
 
 /// static definition of mutation_duplicator::creator.
 /*static*/ std::function<std::unique_ptr<mutation_duplicator>(
-    replica_base *, string_view, string_view)>
-    mutation_duplicator::creator = [](replica_base *r, string_view remote, string_view app) {
-        return make_unique<pegasus::server::pegasus_mutation_duplicator>(r, remote, app);
-    };
+    replica_base *, std::string_view, std::string_view)>
+    mutation_duplicator::creator =
+        [](replica_base *r, std::string_view remote, std::string_view app) {
+            return std::make_unique<pegasus::server::pegasus_mutation_duplicator>(r, remote, app);
+        };
 
 } // namespace replication
 } // namespace dsn
@@ -65,20 +112,36 @@ using namespace dsn::literals::chrono_literals;
         dsn::from_blob_to_thrift(data, thrift_request);
         return pegasus_hash_key_hash(thrift_request.hash_key);
     }
-    LOG_FATAL("unexpected task code: %s", tc.to_string());
+    LOG_FATAL("unexpected task code: {}", tc);
     __builtin_unreachable();
 }
 
 pegasus_mutation_duplicator::pegasus_mutation_duplicator(dsn::replication::replica_base *r,
-                                                         dsn::string_view remote_cluster,
-                                                         dsn::string_view app)
-    : mutation_duplicator(r), _remote_cluster(remote_cluster)
+                                                         std::string_view remote_cluster,
+                                                         std::string_view app)
+    : mutation_duplicator(r),
+      _remote_cluster(remote_cluster),
+      METRIC_VAR_INIT_replica(dup_shipped_successful_requests),
+      METRIC_VAR_INIT_replica(dup_shipped_failed_requests)
 {
     // initialize pegasus-client when this class is first time used.
     static __attribute__((unused)) bool _dummy = pegasus_client_factory::initialize(nullptr);
 
     pegasus_client *client = pegasus_client_factory::get_client(remote_cluster.data(), app.data());
     _client = static_cast<client::pegasus_client_impl *>(client);
+
+    CHECK_STRNE_PREFIX_MSG(dsn::get_current_dup_cluster_name(),
+                           remote_cluster.data(),
+                           "remote cluster should not be myself: {}",
+                           remote_cluster);
+
+    if (FLAGS_dup_ignore_other_cluster_ids) {
+        LOG_INFO_PREFIX("initialize mutation duplicator for local cluster [id:{}], "
+                        "remote cluster [id:ignored, addr:{}]",
+                        dsn::replication::get_current_dup_cluster_id(),
+                        remote_cluster);
+        return;
+    }
 
     auto ret = dsn::replication::get_duplication_cluster_id(remote_cluster.data());
     CHECK_PREFIX_MSG(ret.is_ok(), // never possible, meta server disallows such remote_cluster.
@@ -89,24 +152,15 @@ pegasus_mutation_duplicator::pegasus_mutation_duplicator(dsn::replication::repli
 
     LOG_INFO_PREFIX("initialize mutation duplicator for local cluster [id:{}], "
                     "remote cluster [id:{}, addr:{}]",
-                    get_current_cluster_id(),
+                    dsn::replication::get_current_dup_cluster_id(),
                     _remote_cluster_id,
                     remote_cluster);
 
     // never possible to duplicate data to itself
-    CHECK_NE_PREFIX_MSG(
-        get_current_cluster_id(), _remote_cluster_id, "invalid remote cluster: {}", remote_cluster);
-
-    std::string str_gpid = fmt::format("{}", get_gpid());
-    _shipped_ops.init_app_counter("app.pegasus",
-                                  fmt::format("dup_shipped_ops@{}", str_gpid).c_str(),
-                                  COUNTER_TYPE_RATE,
-                                  "the total ops of DUPLICATE requests sent from this app");
-    _failed_shipping_ops.init_app_counter(
-        "app.pegasus",
-        fmt::format("dup_failed_shipping_ops@{}", str_gpid).c_str(),
-        COUNTER_TYPE_RATE,
-        "the qps of failed DUPLICATE requests sent from this app");
+    CHECK_NE_PREFIX_MSG(dsn::replication::get_current_dup_cluster_id(),
+                        _remote_cluster_id,
+                        "invalid remote cluster: {}",
+                        remote_cluster);
 }
 
 void pegasus_mutation_duplicator::send(uint64_t hash, callback cb)
@@ -118,11 +172,12 @@ void pegasus_mutation_duplicator::send(uint64_t hash, callback cb)
         _inflights[hash].pop_front();
     }
 
-    _client->async_duplicate(rpc,
-                             [hash, cb, rpc, this](dsn::error_code err) mutable {
-                                 on_duplicate_reply(hash, std::move(cb), std::move(rpc), err);
-                             },
-                             _env.__conf.tracker);
+    _client->async_duplicate(
+        rpc,
+        [hash, cb, rpc, this](dsn::error_code err) mutable {
+            on_duplicate_reply(hash, std::move(cb), std::move(rpc), err);
+        },
+        _env.__conf.tracker);
 }
 
 void pegasus_mutation_duplicator::on_duplicate_reply(uint64_t hash,
@@ -137,7 +192,7 @@ void pegasus_mutation_duplicator::on_duplicate_reply(uint64_t hash,
     }
 
     if (perr != PERR_OK || err != dsn::ERR_OK) {
-        _failed_shipping_ops->increment();
+        METRIC_VAR_INCREMENT(dup_shipped_failed_requests);
 
         // randomly log the 1% of the failed duplicate rpc, because minor number of
         // errors are acceptable.
@@ -150,7 +205,7 @@ void pegasus_mutation_duplicator::on_duplicate_reply(uint64_t hash,
         // duplicating an illegal write to server is unacceptable, fail fast.
         CHECK_NE_PREFIX_MSG(perr, PERR_INVALID_ARGUMENT, rpc.response().error_hint);
     } else {
-        _shipped_ops->increment();
+        METRIC_VAR_INCREMENT(dup_shipped_successful_requests);
         _total_shipped_size +=
             rpc.dsn_request()->header->body_length + rpc.dsn_request()->header->hdr_length;
     }
@@ -181,33 +236,47 @@ void pegasus_mutation_duplicator::duplicate(mutation_tuple_set muts, callback cb
 {
     _total_shipped_size = 0;
 
-    auto batch_request = dsn::make_unique<dsn::apps::duplicate_request>();
+    auto batch_request = std::make_unique<dsn::apps::duplicate_request>();
     uint batch_count = 0;
     uint batch_bytes = 0;
+    // The rpc codes should be ignored:
+    // - RPC_RRDB_RRDB_DUPLICATE: Now not supports duplicating the deuplicate mutations to the
+    // remote cluster.
+    // - RPC_RRDB_RRDB_BULK_LOAD: Now not supports the control flow RPC.
+    const static std::set<int> ingnored_rpc_code = {dsn::apps::RPC_RRDB_RRDB_DUPLICATE,
+                                                    dsn::apps::RPC_RRDB_RRDB_BULK_LOAD};
+
     for (auto mut : muts) {
         // mut: 0=timestamp, 1=rpc_code, 2=raw_message
         batch_count++;
         dsn::task_code rpc_code = std::get<1>(mut);
         dsn::blob raw_message = std::get<2>(mut);
-        auto dreq = dsn::make_unique<dsn::apps::duplicate_request>();
+        auto dreq = std::make_unique<dsn::apps::duplicate_request>();
 
-        if (rpc_code == dsn::apps::RPC_RRDB_RRDB_DUPLICATE) {
-            // ignore if it is a DUPLICATE
-            // Because DUPLICATE comes from other clusters should not be forwarded to any other
-            // destinations. A DUPLICATE is meant to be targeting only one cluster.
+        if (gutil::ContainsKey(ingnored_rpc_code, rpc_code)) {
+            // It it do not recommend to use bulkload and normal writing in the same app,
+            // it may also cause inconsistency between actual data and expected data
+            // And duplication will not dup the data of bulkload to backup clusters,
+            // if you want to force use it, you can permit this risk in you own way on the clusters
+            // you maintenance. For example, you can do bulkload both on master-clusters and
+            // backup-cluster (with duplication enable) at the same time, but this will inevitably
+            // cause data inconsistency problems.
+            if (rpc_code == dsn::apps::RPC_RRDB_RRDB_BULK_LOAD) {
+                LOG_DEBUG_PREFIX("Ignore sending bulkload rpc when doing duplication");
+            }
             continue;
-        } else {
-            dsn::apps::duplicate_entry entry;
-            entry.__set_raw_message(raw_message);
-            entry.__set_task_code(rpc_code);
-            entry.__set_timestamp(std::get<0>(mut));
-            entry.__set_cluster_id(get_current_cluster_id());
-            batch_request->entries.emplace_back(std::move(entry));
-            batch_bytes += raw_message.length();
         }
 
-        if (batch_count == muts.size() ||
-            batch_bytes >= dsn::replication::FLAGS_duplicate_log_batch_bytes) {
+        dsn::apps::duplicate_entry entry;
+        entry.__set_raw_message(raw_message);
+        entry.__set_task_code(rpc_code);
+        entry.__set_timestamp(std::get<0>(mut));
+        entry.__set_cluster_id(dsn::replication::get_current_dup_cluster_id());
+        batch_request->entries.emplace_back(std::move(entry));
+        batch_bytes += raw_message.length();
+
+        if (batch_count == muts.size() || batch_bytes >= FLAGS_duplicate_log_batch_bytes ||
+            batch_bytes >= dsn::replication::FLAGS_dup_max_allowed_write_size) {
             // since all the plog's mutations of replica belong to same gpid though the hash of
             // mutation is different, use the last mutation of one batch to get and represents the
             // current hash value, it will still send to remote correct replica
@@ -217,7 +286,7 @@ void pegasus_mutation_duplicator::duplicate(mutation_tuple_set muts, callback cb
                               100_s, // TODO(wutao1): configurable timeout.
                               hash);
             _inflights[hash].push_back(std::move(rpc));
-            batch_request = dsn::make_unique<dsn::apps::duplicate_request>();
+            batch_request = std::make_unique<dsn::apps::duplicate_request>();
             batch_bytes = 0;
         }
     }

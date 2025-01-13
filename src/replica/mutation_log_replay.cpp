@@ -15,23 +15,41 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <stddef.h>
+#include <stdint.h>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "consensus_types.h"
 #include "mutation_log.h"
 #include "mutation_log_utils.h"
-#include "utils/fail_point.h"
+#include "replica/log_block.h"
+#include "replica/log_file.h"
+#include "replica/mutation.h"
+#include "utils/autoref_ptr.h"
+#include "utils/binary_reader.h"
+#include "utils/blob.h"
+#include "utils/error_code.h"
 #include "utils/errors.h"
+#include "utils/fail_point.h"
 #include "utils/fmt_logging.h"
+#include "utils/ports.h"
 
-namespace dsn {
-namespace replication {
+namespace dsn::replication {
 
 /*static*/ error_code mutation_log::replay(log_file_ptr log,
                                            replay_callback callback,
                                            /*out*/ int64_t &end_offset)
 {
     end_offset = log->start_offset();
-    LOG_INFO("start to replay mutation log %s, offset = [%" PRId64 ", %" PRId64
-             "), size = %" PRId64,
-             log->path().c_str(),
+    LOG_INFO("start to replay mutation log {}, offset = [{}, {}), size = {}",
+             log->path(),
              log->start_offset(),
              log->end_offset(),
              log->end_offset() - log->start_offset());
@@ -50,45 +68,58 @@ namespace replication {
         start_offset = static_cast<size_t>(end_offset - log->start_offset());
     }
 
-    LOG_INFO("finish to replay mutation log (%s) [err: %s]",
-             log->path().c_str(),
-             err.description().c_str());
+    LOG_INFO("finish to replay mutation log ({}) [err: {}]", log->path(), err);
     return err.code();
 }
+
+namespace {
+
+dsn::error_s read_block(dsn::replication::log_file_ptr &log,
+                        size_t start_offset,
+                        int64_t &end_offset,
+                        std::unique_ptr<dsn::binary_reader> &reader)
+{
+    log->reset_stream(start_offset); // Start reading from given offset.
+    int64_t global_start_offset = static_cast<int64_t>(start_offset) + log->start_offset();
+    end_offset = global_start_offset; // Reset end_offset to the start.
+
+    {
+        // Read the entire block into memory.
+        blob bb;
+        const auto err = log->read_next_log_block(bb);
+        if (dsn_unlikely(err != dsn::ERR_OK)) {
+            return FMT_ERR(err, "failed to read log block");
+        }
+        reader = std::make_unique<dsn::binary_reader>(std::move(bb));
+    }
+
+    end_offset += sizeof(dsn::replication::log_block_header);
+
+    // The first block is log_file_header.
+    if (global_start_offset == log->start_offset()) {
+        end_offset += log->read_file_header(*reader);
+        if (!log->is_right_header()) {
+            return FMT_ERR(dsn::ERR_INVALID_DATA, "failed to read log file header");
+        }
+        // Continue to parsing the data block.
+    }
+
+    return dsn::error_s::ok();
+}
+
+} // anonymous namespace
 
 /*static*/ error_s mutation_log::replay_block(log_file_ptr &log,
                                               replay_callback &callback,
                                               size_t start_offset,
                                               int64_t &end_offset)
 {
-    FAIL_POINT_INJECT_F("mutation_log_replay_block", [](string_view) -> error_s {
+    FAIL_POINT_INJECT_F("mutation_log_replay_block", [](std::string_view) -> error_s {
         return error_s::make(ERR_INCOMPLETE_DATA, "mutation_log_replay_block");
     });
 
-    blob bb;
     std::unique_ptr<binary_reader> reader;
-
-    log->reset_stream(start_offset); // start reading from given offset
-    int64_t global_start_offset = start_offset + log->start_offset();
-    end_offset = global_start_offset; // reset end_offset to the start.
-
-    // reads the entire block into memory
-    error_code err = log->read_next_log_block(bb);
-    if (err != ERR_OK) {
-        return error_s::make(err, "failed to read log block");
-    }
-
-    reader = dsn::make_unique<binary_reader>(bb);
-    end_offset += sizeof(log_block_header);
-
-    // The first block is log_file_header.
-    if (global_start_offset == log->start_offset()) {
-        end_offset += log->read_file_header(*reader);
-        if (!log->is_right_header()) {
-            return error_s::make(ERR_INVALID_DATA, "failed to read log file header");
-        }
-        // continue to parsing the data block
-    }
+    RETURN_NOT_OK(read_block(log, start_offset, end_offset, reader));
 
     while (!reader->is_eof()) {
         auto old_size = reader->get_remaining_size();
@@ -117,14 +148,14 @@ namespace replication {
                                            replay_callback callback,
                                            /*out*/ int64_t &end_offset)
 {
-    std::map<int, log_file_ptr> logs;
+    log_file_map_by_index logs;
     for (auto &fpath : log_files) {
         error_code err;
         log_file_ptr log = log_file::open_read(fpath.c_str(), err);
         if (log == nullptr) {
             if (err == ERR_HANDLE_EOF || err == ERR_INCOMPLETE_DATA ||
                 err == ERR_INVALID_PARAMETERS) {
-                LOG_DEBUG("skip file %s during log replay", fpath.c_str());
+                LOG_INFO("skip file {} during log replay", fpath);
                 continue;
             } else {
                 return err;
@@ -138,7 +169,7 @@ namespace replication {
     return replay(logs, callback, end_offset);
 }
 
-/*static*/ error_code mutation_log::replay(std::map<int, log_file_ptr> &logs,
+/*static*/ error_code mutation_log::replay(log_file_map_by_index &logs,
                                            replay_callback callback,
                                            /*out*/ int64_t &end_offset)
 {
@@ -154,7 +185,7 @@ namespace replication {
 
     error_s error = log_utils::check_log_files_continuity(logs);
     if (!error.is_ok()) {
-        LOG_ERROR_F("check_log_files_continuity failed: {}", error);
+        LOG_ERROR("check_log_files_continuity failed: {}", error);
         return error.code();
     }
 
@@ -164,8 +195,7 @@ namespace replication {
         log_file_ptr &log = kv.second;
 
         if (log->start_offset() != end_offset) {
-            LOG_ERROR("offset mismatch in log file offset and global offset %" PRId64
-                      " vs %" PRId64,
+            LOG_ERROR("offset mismatch in log file offset and global offset {} vs {}",
                       log->start_offset(),
                       end_offset);
             return ERR_INVALID_DATA;
@@ -181,7 +211,7 @@ namespace replication {
         } else if (err == ERR_INCOMPLETE_DATA) {
             // If the file is not corrupted, it may also return the value of ERR_INCOMPLETE_DATA.
             // In this case, the correctness is relying on the check of start_offset.
-            LOG_WARNING("delay handling error: %s", err.to_string());
+            LOG_WARNING("delay handling error: {}", err);
         } else {
             // for other errors, we should break
             break;
@@ -197,11 +227,10 @@ namespace replication {
         err = ERR_OK;
     } else {
         // bad error
-        LOG_ERROR("replay mutation log failed: %s", err.to_string());
+        LOG_ERROR("replay mutation log failed: {}", err);
     }
 
     return err;
 }
 
-} // namespace replication
-} // namespace dsn
+} // namespace dsn::replication

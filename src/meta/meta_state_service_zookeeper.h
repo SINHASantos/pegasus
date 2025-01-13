@@ -24,26 +24,28 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     meta state service implemented with zookeeper
- *
- * Revision history:
- *     2015-12-04, @shengofsun (sunweijie@xiaomi.com)
- */
-
 #pragma once
 
-#include "utils/synchronize.h"
-#include "utils/autoref_ptr.h"
-#include "runtime/task/task_tracker.h"
+#include <stdint.h>
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "meta/meta_state_service.h"
-#include "utils/distributed_lock_service.h"
+#include "task/future_types.h"
+#include "task/task.h"
+#include "task/task_code.h"
+#include "task/task_tracker.h"
+#include "utils/autoref_ptr.h"
+#include "utils/blob.h"
+#include "utils/error_code.h"
+#include "utils/synchronize.h"
 
 namespace dsn {
 namespace dist {
 
 class zookeeper_session;
+
 class meta_state_service_zookeeper : public meta_state_service, public ref_counter
 {
 public:
@@ -117,5 +119,5 @@ private:
                                          task_ptr callback,
                                          void *result /*zookeeper_session::zoo_opcontext**/);
 };
-}
-}
+} // namespace dist
+} // namespace dsn

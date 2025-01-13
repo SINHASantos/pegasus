@@ -20,8 +20,8 @@ var _ = context.Background
 var _ = reflect.DeepEqual
 var _ = bytes.Equal
 
-var _ = base.GoUnusedProtection__
 var _ = replication.GoUnusedProtection__
+var _ = base.GoUnusedProtection__
 
 func init() {
 }

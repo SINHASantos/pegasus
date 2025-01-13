@@ -24,31 +24,22 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 
-#include "runtime/tool_api.h"
+#include "runtime/env_provider.h"
 
 namespace dsn {
+class task_worker;
+
 namespace tools {
 
 class sim_env_provider : public env_provider
 {
 public:
     sim_env_provider(env_provider *inner_provider);
-    static int seed() { return _seed; }
 
 private:
     static void on_worker_start(task_worker *worker);
-    static int _seed;
 };
-}
-} // end namespace
+} // namespace tools
+} // namespace dsn

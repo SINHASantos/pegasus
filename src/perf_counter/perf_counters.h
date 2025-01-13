@@ -26,11 +26,12 @@
 
 #pragma once
 
+#include <stdint.h>
 #include <functional>
-#include <map>
-#include <queue>
-#include <sstream>
+#include <memory>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "perf_counter.h"
 #include "utils/singleton.h"
@@ -71,9 +72,7 @@ public:
     ///
     /// please call remove_counter if a previous get_app_counter/get_global_counter is called
     ///
-    bool remove_counter(const char *full_name);
-
-    perf_counter_ptr get_counter(const std::string &full_name);
+    bool remove_counter(const std::string &full_name);
 
     struct counter_snapshot
     {

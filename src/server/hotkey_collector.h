@@ -17,24 +17,27 @@
 
 #pragma once
 
-#include "meta_admin_types.h"
-#include "partition_split_types.h"
-#include "duplication_types.h"
-#include "bulk_load_types.h"
-#include "backup_types.h"
-#include "consensus_types.h"
-#include "replica_admin_types.h"
 #include <concurrentqueue/concurrentqueue.h>
-#include "replica/replica_base.h"
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "hotkey_collector_state.h"
+#include "replica/replica_base.h"
+#include "replica_admin_types.h"
+#include "utils/blob.h"
+#include <string_view>
 
 namespace pegasus {
 namespace server {
 
-class internal_collector_base;
-class hotkey_empty_data_collector;
 class hotkey_coarse_data_collector;
+class hotkey_empty_data_collector;
 class hotkey_fine_data_collector;
+class internal_collector_base;
 
 struct detect_hotkey_result
 {
@@ -47,7 +50,7 @@ struct detect_hotkey_result
     }
 };
 
-extern int get_bucket_id(dsn::string_view data, int bucket_num);
+extern int get_bucket_id(std::string_view data, int bucket_num);
 extern bool
 find_outlier_index(const std::vector<uint64_t> &captured_keys, int threshold, int &hot_index);
 

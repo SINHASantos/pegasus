@@ -15,14 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "replica.h"
-#include "mutation.h"
-#include "mutation_log.h"
-#include "replica_stub.h"
+#include <stdint.h>
+#include <chrono>
+#include <map>
+#include <string>
+#include <utility>
 
-#include "replica/replication_app_base.h"
-#include "utils/fmt_logging.h"
+#include "common/gpid.h"
 #include "common/replica_envs.h"
+#include "common/replication.codes.h"
+#include "dsn.layer2_types.h"
+#include "replica.h"
+#include "rpc/rpc_message.h"
+#include "task/async_calls.h"
+#include "utils/autoref_ptr.h"
+#include "utils/error_code.h"
+#include "utils/fmt_logging.h"
+#include "utils/metrics.h"
+#include "utils/throttling_controller.h"
 
 namespace dsn {
 namespace replication {
@@ -32,28 +42,29 @@ namespace replication {
         int64_t delay_ms = 0;                                                                      \
         auto type = _##op_type##_##throttling_type##_throttling_controller.control(                \
             request->header->client.timeout_ms, request_units, delay_ms);                          \
-        if (type != throttling_controller::PASS) {                                                 \
-            if (type == throttling_controller::DELAY) {                                            \
+        if (type != utils::throttling_controller::PASS) {                                          \
+            if (type == utils::throttling_controller::DELAY) {                                     \
                 tasking::enqueue(                                                                  \
                     LPC_##op_type##_THROTTLING_DELAY,                                              \
                     &_tracker,                                                                     \
-                    [ this, req = message_ptr(request) ]() { on_client_##op_type(req, true); },    \
+                    [this, req = message_ptr(request)]() { on_client_##op_type(req, true); },      \
                     get_gpid().thread_hash(),                                                      \
                     std::chrono::milliseconds(delay_ms));                                          \
-                _counter_recent_##op_type##_throttling_delay_count->increment();                   \
-            } else { /** type == throttling_controller::REJECT **/                                 \
+                METRIC_VAR_INCREMENT(throttling_delayed_##op_type##_requests);                     \
+            } else { /** type == utils::throttling_controller::REJECT **/                          \
                 if (delay_ms > 0) {                                                                \
-                    tasking::enqueue(LPC_##op_type##_THROTTLING_DELAY,                             \
-                                     &_tracker,                                                    \
-                                     [ this, req = message_ptr(request) ]() {                      \
-                                         response_client_##op_type(req, ERR_BUSY);                 \
-                                     },                                                            \
-                                     get_gpid().thread_hash(),                                     \
-                                     std::chrono::milliseconds(delay_ms));                         \
+                    tasking::enqueue(                                                              \
+                        LPC_##op_type##_THROTTLING_DELAY,                                          \
+                        &_tracker,                                                                 \
+                        [this, req = message_ptr(request)]() {                                     \
+                            response_client_##op_type(req, ERR_BUSY);                              \
+                        },                                                                         \
+                        get_gpid().thread_hash(),                                                  \
+                        std::chrono::milliseconds(delay_ms));                                      \
                 } else {                                                                           \
                     response_client_##op_type(request, ERR_BUSY);                                  \
                 }                                                                                  \
-                _counter_recent_##op_type##_throttling_reject_count->increment();                  \
+                METRIC_VAR_INCREMENT(throttling_rejected_##op_type##_requests);                    \
             }                                                                                      \
             return true;                                                                           \
         }                                                                                          \
@@ -77,16 +88,17 @@ bool replica::throttle_backup_request(message_ex *request)
     int64_t delay_ms = 0;
     auto type = _backup_request_qps_throttling_controller.control(
         request->header->client.timeout_ms, 1, delay_ms);
-    if (type != throttling_controller::PASS) {
-        if (type == throttling_controller::DELAY) {
-            tasking::enqueue(LPC_read_THROTTLING_DELAY,
-                             &_tracker,
-                             [ this, req = message_ptr(request) ]() { on_client_read(req, true); },
-                             get_gpid().thread_hash(),
-                             std::chrono::milliseconds(delay_ms));
-            _counter_recent_backup_request_throttling_delay_count->increment();
-        } else { /** type == throttling_controller::REJECT **/
-            _counter_recent_backup_request_throttling_reject_count->increment();
+    if (type != utils::throttling_controller::PASS) {
+        if (type == utils::throttling_controller::DELAY) {
+            tasking::enqueue(
+                LPC_read_THROTTLING_DELAY,
+                &_tracker,
+                [this, req = message_ptr(request)]() { on_client_read(req, true); },
+                get_gpid().thread_hash(),
+                std::chrono::milliseconds(delay_ms));
+            METRIC_VAR_INCREMENT(throttling_delayed_backup_requests);
+        } else { /** type == utils::throttling_controller::REJECT **/
+            METRIC_VAR_INCREMENT(throttling_rejected_backup_requests);
         }
         return true;
     }
@@ -108,7 +120,7 @@ void replica::update_throttle_envs(const std::map<std::string, std::string> &env
 
 void replica::update_throttle_env_internal(const std::map<std::string, std::string> &envs,
                                            const std::string &key,
-                                           throttling_controller &cntl)
+                                           utils::throttling_controller &cntl)
 {
     bool throttling_changed = false;
     std::string old_throttling;

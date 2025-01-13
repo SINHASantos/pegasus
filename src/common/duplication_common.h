@@ -19,28 +19,27 @@
 
 #pragma once
 
-#include "runtime/rpc/rpc_holder.h"
-#include "utils/errors.h"
-#include "meta_admin_types.h"
-#include "partition_split_types.h"
-#include "duplication_types.h"
-#include "bulk_load_types.h"
-#include "backup_types.h"
-#include "consensus_types.h"
-#include "replica_admin_types.h"
-#include "utils/flags.h"
+#include <stdint.h>
+#include <set>
+#include <string>
 
-namespace dsn {
-namespace replication {
+#include "duplication_types.h"
+#include "rpc/rpc_holder.h"
+#include "utils/errors.h"
+#include "utils/flags.h"
+#include "utils/fmt_utils.h"
 
 DSN_DECLARE_uint32(duplicate_log_batch_bytes);
 
-typedef rpc_holder<duplication_modify_request, duplication_modify_response> duplication_modify_rpc;
-typedef rpc_holder<duplication_add_request, duplication_add_response> duplication_add_rpc;
-typedef rpc_holder<duplication_query_request, duplication_query_response> duplication_query_rpc;
-typedef rpc_holder<duplication_sync_request, duplication_sync_response> duplication_sync_rpc;
+namespace dsn::replication {
 
-typedef int32_t dupid_t;
+using duplication_modify_rpc = rpc_holder<duplication_modify_request, duplication_modify_response>;
+using duplication_add_rpc = rpc_holder<duplication_add_request, duplication_add_response>;
+using duplication_query_rpc = rpc_holder<duplication_query_request, duplication_query_response>;
+using duplication_sync_rpc = rpc_holder<duplication_sync_request, duplication_sync_response>;
+using duplication_list_rpc = rpc_holder<duplication_list_request, duplication_list_response>;
+
+using dupid_t = int32_t;
 
 extern const char *duplication_status_to_string(duplication_status::type status);
 
@@ -63,30 +62,34 @@ inline bool is_duplication_status_invalid(duplication_status::type status)
 /// The returned cluster id of get_duplication_cluster_id("wuhan-mi-srv-ad") is 3.
 extern error_with<uint8_t> get_duplication_cluster_id(const std::string &cluster_name);
 
+extern uint8_t get_current_dup_cluster_id_or_default();
+
+extern uint8_t get_current_dup_cluster_id();
+
 /// Returns a json string.
 extern std::string duplication_entry_to_string(const duplication_entry &dup);
 
 /// Returns a json string.
 extern std::string duplication_query_response_to_string(const duplication_query_response &);
 
-/// Returns a mapping from cluster_name to cluster_id.
-extern const std::map<std::string, uint8_t> &get_duplication_group();
-
 extern const std::set<uint8_t> &get_distinct_cluster_id_set();
 
-inline bool is_cluster_id_configured(uint8_t cid)
-{
-    return get_distinct_cluster_id_set().find(cid) != get_distinct_cluster_id_set().end();
-}
+extern bool is_dup_cluster_id_configured(uint8_t cluster_id);
 
 struct duplication_constants
 {
     const static std::string kDuplicationCheckpointRootDir;
     const static std::string kClustersSectionName;
     // These will fill into app env and mark one app as a "follower app" and record master info
-    const static std::string kDuplicationEnvMasterClusterKey;
-    const static std::string kDuplicationEnvMasterMetasKey;
+    const static std::string kEnvMasterClusterKey;
+    const static std::string kEnvMasterMetasKey;
+    const static std::string kEnvMasterAppNameKey;
+    const static std::string kEnvFollowerAppStatusKey;
+    const static std::string kEnvFollowerAppStatusCreating;
+    const static std::string kEnvFollowerAppStatusCreated;
 };
 
-} // namespace replication
-} // namespace dsn
+USER_DEFINED_ENUM_FORMATTER(duplication_fail_mode::type)
+USER_DEFINED_ENUM_FORMATTER(duplication_status::type)
+
+} // namespace dsn::replication

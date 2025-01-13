@@ -26,9 +26,15 @@
 
 #pragma once
 
-#include "mutation_cache.h"
+#include <functional>
 
+#include "common/replication_other_types.h"
+#include "metadata_types.h"
+#include "mutation_cache.h"
+#include "replica/mutation.h"
 #include "replica/replica_base.h"
+#include "utils/error_code.h"
+#include "utils/fmt_utils.h"
 
 namespace dsn {
 namespace replication {
@@ -40,6 +46,7 @@ enum commit_type
     COMMIT_ALL_READY       // commit (last_committed, ...<all is_commit_ready mutations> ...]
     // - only valid when partition_status::PS_SECONDARY or partition_status::PS_PRIMARY
 };
+USER_DEFINED_ENUM_FORMATTER(commit_type)
 
 // prepare_list origins from the concept of `prepared list` in PacificA.
 // It stores an continuous and ordered list of mutations.
@@ -65,8 +72,9 @@ public:
     //
     // if pop_all_committed_mutations = true, pop all committed mutations, will only used during
     // bulk load ingestion
-    // if secondary_commit = true, and status is secondary or protential secondary, previous logs
+    // if secondary_commit = true, and status is secondary or potential secondary, previous logs
     // will be committed
+    // TODO(yingchun): should check return values for all callers by adding WARN_UNUSED_RESULT.
     error_code prepare(mutation_ptr &mu,
                        partition_status::type status,
                        bool pop_all_committed_mutations = false,

@@ -24,18 +24,22 @@
  * THE SOFTWARE.
  */
 
-#include "utils/fmt_logging.h"
-#include "utils/fail_point.h"
+#include <string_view>
+#include <fmt/core.h>
+#include <utility>
 
 #include "mutation_log_utils.h"
+#include "utils/error_code.h"
+#include "utils/fail_point.h"
+#include "utils/filesystem.h"
 
 namespace dsn {
 namespace replication {
 namespace log_utils {
 
-/*extern*/ error_s open_read(string_view path, /*out*/ log_file_ptr &file)
+/*extern*/ error_s open_read(std::string_view path, /*out*/ log_file_ptr &file)
 {
-    FAIL_POINT_INJECT_F("open_read", [](string_view) -> error_s {
+    FAIL_POINT_INJECT_F("open_read", [](std::string_view) -> error_s {
         return error_s::make(ERR_FILE_OPERATION_FAILED, "open_read");
     });
 
@@ -49,7 +53,7 @@ namespace log_utils {
 
 /*extern*/ error_s list_all_files(const std::string &dir, /*out*/ std::vector<std::string> &files)
 {
-    FAIL_POINT_INJECT_F("list_all_files", [](string_view) -> error_s {
+    FAIL_POINT_INJECT_F("list_all_files", [](std::string_view) -> error_s {
         return error_s::make(ERR_FILE_OPERATION_FAILED, "list_all_files");
     });
 
@@ -61,7 +65,7 @@ namespace log_utils {
 }
 
 /*extern*/
-error_s check_log_files_continuity(const std::map<int, log_file_ptr> &logs)
+error_s check_log_files_continuity(const mutation_log::log_file_map_by_index &logs)
 {
     if (logs.empty()) {
         return error_s::ok();

@@ -18,13 +18,19 @@
  */
 
 #pragma once
+
+#include <iostream>
+
+#include "client/partition_resolver.h"
+#include "duplication_internal_types.h"
 #include "rrdb.code.definition.h"
 #include "rrdb_types.h"
-#include <iostream>
+#include "rpc/rpc_holder.h"
+#include "task/task_tracker.h"
+#include "rrdb/rrdb_types.h"
+#include "rpc/rpc_holder.h"
+#include "task/task_tracker.h"
 #include "utils/optional.h"
-#include "runtime/rpc/rpc_holder.h"
-#include "runtime/task/task_tracker.h"
-#include "client/partition_resolver.h"
 
 namespace dsn {
 namespace apps {
@@ -36,7 +42,7 @@ class rrdb_client
 public:
     rrdb_client() {}
     explicit rrdb_client(const char *cluster_name,
-                         const std::vector<dsn::rpc_address> &meta_list,
+                         const std::vector<dsn::host_port> &meta_list,
                          const char *app_name)
     {
         _resolver =

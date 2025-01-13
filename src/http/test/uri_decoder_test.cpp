@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
-#include "utils/error_code.h"
 #include <http/uri_decoder.h>
+#include <string>
+
+#include "gtest/gtest.h"
+#include "utils/error_code.h"
+#include "utils/errors.h"
 
 namespace dsn {
 namespace uri {
@@ -87,5 +90,5 @@ TEST_F(uri_decoder_test, decode)
     }
 }
 
-} // namespace dsn
 } // namespace uri
+} // namespace dsn

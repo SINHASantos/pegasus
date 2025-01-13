@@ -17,10 +17,12 @@
 
 #pragma once
 
+#include "common/replication.codes.h"
+#include "meta/meta_state_service.h"
+#include "meta_state_service_utils.h"
 #include "runtime/pipeline.h"
 #include "utils/fmt_logging.h"
-
-#include "meta_state_service_utils.h"
+#include "utils/fmt_utils.h"
 
 namespace dsn {
 namespace replication {
@@ -59,6 +61,7 @@ struct op_type
         return op_type_to_string_map[v - 1];
     }
 };
+USER_DEFINED_ENUM_FORMATTER(op_type::type)
 
 /// Base class for all operations.
 struct operation : pipeline::environment
@@ -75,9 +78,9 @@ struct operation : pipeline::environment
     void on_error(T *this_instance, op_type::type type, error_code ec, const std::string &path)
     {
         if (ec == ERR_TIMEOUT) {
-            LOG_WARNING_F("request({}) on path({}) was timeout, retry after 1 second",
-                          op_type::to_string(type),
-                          path);
+            LOG_WARNING("request({}) on path({}) was timeout, retry after 1 second",
+                        op_type::to_string(type),
+                        path);
             pipeline::repeat(std::move(*this_instance), 1_s);
             return;
         }
@@ -124,11 +127,12 @@ struct on_create_recursively : operation
             args->nodes.pop();
         }
 
-        remote_storage()->create_node(_cur_path,
-                                      LPC_META_STATE_HIGH,
-                                      [op = *this](error_code ec) mutable { op.on_error(ec); },
-                                      args->nodes.empty() ? args->val : blob(),
-                                      tracker());
+        remote_storage()->create_node(
+            _cur_path,
+            LPC_META_STATE_HIGH,
+            [op = *this](error_code ec) mutable { op.on_error(ec); },
+            args->nodes.empty() ? args->val : blob(),
+            tracker());
     }
 
     void on_error(error_code ec)
@@ -164,11 +168,12 @@ struct on_create : operation
 
     void run()
     {
-        remote_storage()->create_node(args->node,
-                                      LPC_META_STATE_HIGH,
-                                      [op = *this](error_code ec) mutable { op.on_error(ec); },
-                                      args->val,
-                                      tracker());
+        remote_storage()->create_node(
+            args->node,
+            LPC_META_STATE_HIGH,
+            [op = *this](error_code ec) mutable { op.on_error(ec); },
+            args->val,
+            tracker());
     }
 
     void on_error(error_code ec)
@@ -194,11 +199,12 @@ struct on_delete : operation
 
     void run()
     {
-        remote_storage()->delete_node(args->node,
-                                      args->is_recursively_delete,
-                                      LPC_META_STATE_HIGH,
-                                      [op = *this](error_code ec) mutable { op.on_error(ec); },
-                                      tracker());
+        remote_storage()->delete_node(
+            args->node,
+            args->is_recursively_delete,
+            LPC_META_STATE_HIGH,
+            [op = *this](error_code ec) mutable { op.on_error(ec); },
+            tracker());
     }
 
     void on_error(error_code ec)
@@ -208,8 +214,8 @@ struct on_delete : operation
             return;
         }
 
-        auto type =
-            args->is_recursively_delete ? op_type::OP_DELETE_RECURSIVELY : op_type::OP_DELETE;
+        auto type = args->is_recursively_delete ? op_type::OP_DELETE_RECURSIVELY
+                                                : op_type::OP_DELETE;
         operation::on_error(this, type, ec, args->node);
     }
 };
@@ -254,11 +260,12 @@ struct on_set_data : operation
 
     void run()
     {
-        remote_storage()->set_data(args->node,
-                                   args->val,
-                                   LPC_META_STATE_HIGH,
-                                   [op = *this](error_code ec) mutable { op.on_error(ec); },
-                                   tracker());
+        remote_storage()->set_data(
+            args->node,
+            args->val,
+            LPC_META_STATE_HIGH,
+            [op = *this](error_code ec) mutable { op.on_error(ec); },
+            tracker());
     }
 
     void on_error(error_code ec)

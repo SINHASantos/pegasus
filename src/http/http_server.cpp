@@ -15,24 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "http_server.h"
+#include "http/http_server.h"
 
-#include <boost/algorithm/string.hpp>
-#include <fmt/ostream.h>
+#include <stdint.h>
+#include <string.h>
+#include <memory>
+#include <ostream>
+#include <vector>
 
-#include "builtin_http_calls.h"
-#include "http_call_registry.h"
-#include "http_message_parser.h"
-#include "http_server_impl.h"
-#include "pprof_http_service.h"
+#include "fmt/core.h"
+#include "gutil/map_util.h"
+#include "http/builtin_http_calls.h"
+#include "http/http_call_registry.h"
+#include "http/http_message_parser.h"
+#include "http/http_method.h"
+#include "http/http_server_impl.h"
+#include "http/uri_decoder.h"
+#include "nodejs/http_parser.h"
+#include "runtime/api_layer1.h"
+#include "rpc/rpc_message.h"
+#include "rpc/rpc_stream.h"
+#include "runtime/serverlet.h"
 #include "runtime/tool_api.h"
-#include "uri_decoder.h"
+#include "utils/error_code.h"
+#include "utils/fmt_logging.h"
 #include "utils/output_utils.h"
-#include "utils/time_utils.h"
+#include "utils/strings.h"
+
+DSN_DEFINE_bool(http, enable_http_server, true, "whether to enable the embedded HTTP server");
 
 namespace dsn {
-
-DSN_DEFINE_bool("http", enable_http_server, true, "whether to enable the embedded HTTP server");
 
 namespace {
 error_s update_config(const http_request &req)
@@ -46,30 +58,21 @@ error_s update_config(const http_request &req)
     return update_flag(iter->first, iter->second);
 }
 
-} // anonymous namespace
-
-/*extern*/ std::string http_status_code_to_string(http_status_code code)
+// If sub_path is 'app/duplication', the built path would be '<root_path>/app/duplication'.
+std::string build_rel_path(const std::string &root_path, const std::string &sub_path)
 {
-    switch (code) {
-    case http_status_code::ok:
-        return "200 OK";
-    case http_status_code::temporary_redirect:
-        return "307 Temporary Redirect";
-    case http_status_code::bad_request:
-        return "400 Bad Request";
-    case http_status_code::not_found:
-        return "404 Not Found";
-    case http_status_code::internal_server_error:
-        return "500 Internal Server Error";
-    default:
-        LOG_FATAL("invalid code: %d", code);
-        __builtin_unreachable();
+    std::string rel_path(root_path);
+    if (!rel_path.empty()) {
+        rel_path += '/';
     }
+    return rel_path += sub_path;
 }
+
+} // anonymous namespace
 
 /*extern*/ http_call &register_http_call(std::string full_path)
 {
-    auto call_ptr = dsn::make_unique<http_call>();
+    auto call_ptr = std::make_unique<http_call>();
     call_ptr->path = std::move(full_path);
     http_call &call = *call_ptr;
     http_call_registry::instance().add(std::move(call_ptr));
@@ -81,21 +84,35 @@ error_s update_config(const http_request &req)
     http_call_registry::instance().remove(full_path);
 }
 
-void http_service::register_handler(std::string sub_path, http_callback cb, std::string help)
+std::string http_service::get_rel_path(const std::string &sub_path) const
 {
-    CHECK(!sub_path.empty(), "");
+    return build_rel_path(path(), sub_path);
+}
+
+void http_service::register_handler(std::string sub_path, http_callback cb, std::string help) const
+{
+    register_handler(std::move(sub_path), std::move(cb), "", std::move(help));
+}
+
+void http_service::register_handler(std::string sub_path,
+                                    http_callback cb,
+                                    std::string parameters,
+                                    std::string help) const
+{
+    CHECK_FALSE(sub_path.empty());
     if (!FLAGS_enable_http_server) {
         return;
     }
-    auto call = make_unique<http_call>();
-    call->path = this->path();
-    if (!call->path.empty()) {
-        call->path += '/';
-    }
-    call->path += sub_path;
-    call->callback = std::move(cb);
-    call->help = std::move(help);
+
+    auto call = std::make_unique<http_call>();
+    call->path = get_rel_path(sub_path);
+    call->with_callback(std::move(cb)).with_help(parameters, help);
     http_call_registry::instance().add(std::move(call));
+}
+
+void http_service::deregister_handler(std::string sub_path) const
+{
+    http_call_registry::instance().remove(get_rel_path(sub_path));
 }
 
 void http_server_base::update_config_handler(const http_request &req, http_response &resp)
@@ -110,7 +127,7 @@ void http_server_base::update_config_handler(const http_request &req, http_respo
     std::ostringstream out;
     tp.output(out, dsn::utils::table_printer::output_format::kJsonCompact);
     resp.body = out.str();
-    resp.status_code = http_status_code::ok;
+    resp.status_code = http_status_code::kOk;
 }
 
 http_server::http_server() : serverlet<http_server>("http_server")
@@ -132,15 +149,15 @@ void http_server::serve(message_ex *msg)
     error_with<http_request> res = http_request::parse(msg);
     http_response resp;
     if (!res.is_ok()) {
-        resp.status_code = http_status_code::bad_request;
+        resp.status_code = http_status_code::kBadRequest;
         resp.body = fmt::format("failed to parse request: {}", res.get_error());
     } else {
         const http_request &req = res.get_value();
-        std::shared_ptr<http_call> call = http_call_registry::instance().find(req.path);
-        if (call != nullptr) {
+        auto call = http_call_registry::instance().find(req.path);
+        if (call) {
             call->callback(req, resp);
         } else {
-            resp.status_code = http_status_code::not_found;
+            resp.status_code = http_status_code::kNotFound;
             resp.body = fmt::format("service not found for \"{}\"", req.path);
         }
     }
@@ -200,7 +217,7 @@ void http_server::serve(message_ex *msg)
 
     // parse path
     std::vector<std::string> args;
-    boost::split(args, unresolved_path, boost::is_any_of("/"));
+    dsn::utils::split_args(unresolved_path.c_str(), args, '/');
     std::vector<std::string> real_args;
     for (std::string &arg : args) {
         if (!arg.empty()) {
@@ -221,7 +238,7 @@ void http_server::serve(message_ex *msg)
     // find if there are method args (<ip>:<port>/<service>/<method>?<arg>=<val>&<arg>=<val>)
     if (!unresolved_query.empty()) {
         std::vector<std::string> method_arg_val;
-        boost::split(method_arg_val, unresolved_query, boost::is_any_of("&"));
+        dsn::utils::split_args(unresolved_query.c_str(), method_arg_val, '&');
         for (const std::string &arg_val : method_arg_val) {
             size_t sep = arg_val.find_first_of('=');
             if (sep == std::string::npos) {
@@ -234,8 +251,7 @@ void http_server::serve(message_ex *msg)
             if (sep + 1 < arg_val.size()) {
                 value = arg_val.substr(sep + 1, arg_val.size() - sep);
             }
-            auto iter = ret.query_args.find(name);
-            if (iter != ret.query_args.end()) {
+            if (gutil::ContainsKey(ret.query_args, name)) {
                 return FMT_ERR(ERR_INVALID_PARAMETERS, "duplicate parameter: {}", name);
             }
             ret.query_args.emplace(std::move(name), std::move(value));
@@ -250,7 +266,7 @@ void http_server::serve(message_ex *msg)
     message_ptr resp_msg = req->create_response();
 
     std::ostringstream os;
-    os << "HTTP/1.1 " << http_status_code_to_string(resp.status_code) << "\r\n";
+    os << "HTTP/1.1 " << get_http_status_message(resp.status_code) << "\r\n";
     os << "Content-Type: " << resp.content_type << "\r\n";
     os << "Content-Length: " << resp.body.length() << "\r\n";
     if (!resp.location.empty()) {

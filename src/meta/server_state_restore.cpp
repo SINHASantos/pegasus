@@ -15,15 +15,43 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/lexical_cast.hpp>
-#include "block_service/block_service.h"
-#include "utils/fmt_logging.h"
-#include "utils/filesystem.h"
+// IWYU pragma: no_include <ext/alloc_traits.h>
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
+#include "backup_types.h"
+#include "block_service/block_service.h"
 #include "block_service/block_service_manager.h"
 #include "common/backup_common.h"
+#include "common/gpid.h"
+#include "common/json_helper.h"
+#include "common/replication.codes.h"
+#include "dsn.layer2_types.h"
+#include "meta/meta_data.h"
+#include "meta/meta_rpc_types.h"
+#include "meta/table_metrics.h"
+#include "meta_admin_types.h"
 #include "meta_service.h"
+#include "rpc/rpc_host_port.h"
+#include "rpc/rpc_message.h"
+#include "rpc/serialization.h"
 #include "server_state.h"
+#include "task/task.h"
+#include "task/task_code.h"
+#include "utils/autoref_ptr.h"
+#include "utils/blob.h"
+#include "utils/error_code.h"
+#include "utils/filesystem.h"
+#include "utils/fmt_logging.h"
+#include "utils/zlocks.h"
 
 using namespace dsn::dist::block_service;
 
@@ -42,7 +70,7 @@ void server_state::sync_app_from_backup_media(
         _meta_svc->get_block_service_manager().get_or_create_block_filesystem(
             request.backup_provider_name);
     if (blk_fs == nullptr) {
-        LOG_ERROR("acquire block_filesystem(%s) failed", request.backup_provider_name.c_str());
+        LOG_ERROR("acquire block_filesystem({}) failed", request.backup_provider_name);
         callback_tsk->enqueue_with(ERR_INVALID_PARAMETERS, dsn::blob());
         return;
     }
@@ -59,7 +87,7 @@ void server_state::sync_app_from_backup_media(
 
     error_code err = ERR_OK;
     block_file_ptr file_handle = nullptr;
-    LOG_INFO_F("start to create metadata file {}", app_metadata);
+    LOG_INFO("start to create metadata file {}", app_metadata);
     blk_fs
         ->create_file(create_file_request{app_metadata, true},
                       TASK_CODE_EXEC_INLINED,
@@ -70,7 +98,7 @@ void server_state::sync_app_from_backup_media(
         ->wait();
 
     if (err != ERR_OK) {
-        LOG_ERROR_F("create metadata file {} failed.", app_metadata);
+        LOG_ERROR("create metadata file {} failed.", app_metadata);
         callback_tsk->enqueue_with(err, dsn::blob());
         return;
     }
@@ -89,7 +117,7 @@ std::pair<dsn::error_code, std::shared_ptr<app_state>> server_state::restore_app
     dsn::app_info info;
     if (!::dsn::json::json_forwarder<dsn::app_info>::decode(app_info, info)) {
         std::string b_str(app_info.data(), app_info.length());
-        LOG_ERROR_F("decode app_info '{}' failed", b_str);
+        LOG_ERROR("decode app_info '{}' failed", b_str);
         // NOTICE : maybe find a better error_code to replace err_corruption
         res.first = ERR_CORRUPTION;
         return res;
@@ -120,6 +148,7 @@ std::pair<dsn::error_code, std::shared_ptr<app_state>> server_state::restore_app
 
             _all_apps.emplace(app->app_id, app);
             _exist_apps.emplace(info.app_name, app);
+            _table_metric_entities.create_entity(app->app_id, app->partition_count);
         }
     }
     // TODO: using one single env to replace
@@ -148,8 +177,7 @@ void server_state::restore_app(dsn::message_ex *msg)
             dsn::error_code ec = ERR_OK;
             // if err != ERR_OK, then sync_app_from_backup_media ecounter some error
             if (err != ERR_OK) {
-                LOG_ERROR("sync app_info_data from backup media failed with err(%s)",
-                          err.to_string());
+                LOG_ERROR("sync app_info_data from backup media failed with err({})", err);
                 ec = err;
             } else {
                 auto pair = restore_app_info(msg, request, app_info_data);
@@ -197,10 +225,9 @@ void server_state::on_recv_restore_report(configuration_report_restore_status_rp
         if (request.__isset.reason) {
             r_state.reason = request.reason;
         }
-        LOG_INFO("%d.%d restore report: restore_status(%s), progress(%d)",
-                 request.pid.get_app_id(),
-                 request.pid.get_partition_index(),
-                 request.restore_status.to_string(),
+        LOG_INFO("{} restore report: restore_status({}), progress({})",
+                 request.pid,
+                 request.restore_status,
                  request.progress);
     }
 }
@@ -214,30 +241,25 @@ void server_state::on_query_restore_status(configuration_query_restore_rpc rpc)
     response.err = ERR_OK;
 
     std::shared_ptr<app_state> app = get_app(request.restore_app_id);
-    if (app == nullptr) {
-        response.err = ERR_APP_NOT_EXIST;
-    } else {
-        if (app->status == app_status::AS_DROPPED) {
-            response.err = ERR_APP_DROPPED;
-        } else {
-            response.restore_progress.resize(app->partition_count,
-                                             cold_backup_constant::PROGRESS_FINISHED);
-            response.restore_status.resize(app->partition_count, ERR_OK);
-            for (int32_t i = 0; i < app->partition_count; i++) {
-                const auto &r_state = app->helpers->restore_states[i];
-                const auto &p = app->partitions[i];
-                if (!p.primary.is_invalid() || !p.secondaries.empty()) {
-                    // already have primary, restore succeed
-                    continue;
-                } else {
-                    if (r_state.progress < response.restore_progress[i]) {
-                        response.restore_progress[i] = r_state.progress;
-                    }
-                }
-                response.restore_status[i] = r_state.restore_status;
-            }
+    CHECK(app, "app must be valid");
+    if (app->status == app_status::AS_DROPPED) {
+        response.err = ERR_APP_DROPPED;
+        return;
+    }
+    response.restore_progress.resize(app->partition_count, cold_backup_constant::PROGRESS_FINISHED);
+    response.restore_status.resize(app->partition_count, ERR_OK);
+    for (int32_t i = 0; i < app->partition_count; i++) {
+        const auto &r_state = app->helpers->restore_states[i];
+        const auto &pc = app->pcs[i];
+        if (pc.hp_primary || !pc.hp_secondaries.empty()) {
+            // already have primary, restore succeed
+            continue;
         }
+        if (r_state.progress < response.restore_progress[i]) {
+            response.restore_progress[i] = r_state.progress;
+        }
+        response.restore_status[i] = r_state.restore_status;
     }
 }
-}
-}
+} // namespace replication
+} // namespace dsn

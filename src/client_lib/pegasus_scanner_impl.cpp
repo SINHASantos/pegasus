@@ -17,14 +17,46 @@
  * under the License.
  */
 
+#include <stdint.h>
+#include <chrono>
+#include <functional>
+#include <list>
+#include <memory>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "common/gpid.h"
+#include "pegasus/client.h"
+#include "pegasus/error.h"
 #include "pegasus_client_impl.h"
-#include "base/pegasus_const.h"
+#include "pegasus_key_schema.h"
+#include "rrdb/rrdb.client.h"
+#include "rrdb/rrdb_types.h"
+#include "rpc/serialization.h"
+#include "utils/blob.h"
+#include "utils/error_code.h"
+#include "utils/fmt_logging.h"
+#include "utils/synchronize.h"
+#include "utils/zlocks.h"
+
+namespace dsn {
+class message_ex;
+} // namespace dsn
 
 using namespace ::dsn;
 using namespace pegasus;
 
 namespace pegasus {
 namespace client {
+
+// TODO(yingchun): There are duplicate variables in src/server/pegasus_scan_context.h,
+// because this is in client library, it's better to avoid including too many headers.
+// We can move it to thrift which would be included by both server and client.
+static const int SCAN_CONTEXT_ID_VALID_MIN = 0;
+static const int SCAN_CONTEXT_ID_COMPLETED = -1;
+static const int SCAN_CONTEXT_ID_NOT_EXIST = -2;
 
 pegasus_client_impl::pegasus_scanner_impl::pegasus_scanner_impl(::dsn::apps::rrdb_client *client,
                                                                 std::vector<uint64_t> &&hash,
@@ -234,12 +266,13 @@ void pegasus_client_impl::pegasus_scanner_impl::_next_batch()
 
     CHECK(!_rpc_started, "");
     _rpc_started = true;
-    _client->scan(req,
-                  [this](::dsn::error_code err,
-                         dsn::message_ex *req,
-                         dsn::message_ex *resp) mutable { _on_scan_response(err, req, resp); },
-                  std::chrono::milliseconds(_options.timeout_ms),
-                  _hash);
+    _client->scan(
+        req,
+        [this](::dsn::error_code err, dsn::message_ex *req, dsn::message_ex *resp) mutable {
+            _on_scan_response(err, req, resp);
+        },
+        std::chrono::milliseconds(_options.timeout_ms),
+        _hash);
 }
 
 void pegasus_client_impl::pegasus_scanner_impl::_start_scan()
@@ -361,13 +394,13 @@ void pegasus_client_impl::pegasus_scanner_impl_wrapper::async_next(
     async_scan_next_callback_t &&callback)
 {
     // wrap shared_ptr _p with callback
-    _p->async_next([ __p = _p, user_callback = std::move(callback) ](int error_code,
-                                                                     std::string &&hash_key,
-                                                                     std::string &&sort_key,
-                                                                     std::string &&value,
-                                                                     internal_info &&info,
-                                                                     uint32_t expire_ts_seconds,
-                                                                     int32_t kv_count) {
+    _p->async_next([__p = _p, user_callback = std::move(callback)](int error_code,
+                                                                   std::string &&hash_key,
+                                                                   std::string &&sort_key,
+                                                                   std::string &&value,
+                                                                   internal_info &&info,
+                                                                   uint32_t expire_ts_seconds,
+                                                                   int32_t kv_count) {
         user_callback(error_code,
                       std::move(hash_key),
                       std::move(sort_key),

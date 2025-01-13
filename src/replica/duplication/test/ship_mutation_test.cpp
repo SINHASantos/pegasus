@@ -15,9 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "replica/duplication/mutation_batch.h"
-#include "replica/duplication/duplication_pipeline.h"
+#include <functional>
+#include <map>
+#include <memory>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "common/replication.codes.h"
 #include "duplication_test_base.h"
+#include "gtest/gtest.h"
+#include "replica/duplication/duplication_pipeline.h"
+#include "replica/duplication/mutation_batch.h"
+#include "replica/duplication/mutation_duplicator.h"
+#include "replica/duplication/replica_duplicator.h"
+#include "replica/test/mock_utils.h"
+#include "runtime/pipeline.h"
+#include "utils/chrono_literals.h"
 
 namespace dsn {
 namespace replication {
@@ -82,21 +96,23 @@ public:
 
     ship_mutation *mock_ship_mutation()
     {
-        duplicator->_ship = make_unique<ship_mutation>(duplicator.get());
+        duplicator->_ship = std::make_unique<ship_mutation>(duplicator.get());
         return duplicator->_ship.get();
     }
 
     std::unique_ptr<replica_duplicator> duplicator;
 };
 
-TEST_F(ship_mutation_test, ship_mutation_tuple_set) { test_ship_mutation_tuple_set(); }
+INSTANTIATE_TEST_SUITE_P(, ship_mutation_test, ::testing::Values(false, true));
+
+TEST_P(ship_mutation_test, ship_mutation_tuple_set) { test_ship_mutation_tuple_set(); }
 
 void retry(pipeline::base *base)
 {
     base->schedule([base]() { retry(base); }, 10_s);
 }
 
-TEST_F(ship_mutation_test, pause)
+TEST_P(ship_mutation_test, pause)
 {
     auto shipper = mock_ship_mutation();
 

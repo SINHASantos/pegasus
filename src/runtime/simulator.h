@@ -26,10 +26,16 @@
 
 #pragma once
 
+#include <string>
+#include <vector>
+
 #include "runtime/tool_api.h"
-#include "runtime/service_app.h"
+#include "utils/sys_exit_hook.h"
 
 namespace dsn {
+class service_app;
+struct service_spec;
+
 namespace tools {
 
 class checker
@@ -48,6 +54,7 @@ public:
     virtual void initialize(const std::string &name, const std::vector<service_app *> &apps) = 0;
     virtual void check() = 0;
     const std::string &name() const { return _name; }
+
 protected:
     std::vector<service_app *> _apps;
     std::string _name;
@@ -66,5 +73,5 @@ private:
 };
 
 // ---- inline implementation ------
-}
-} // end namespace dsn::tools
+} // namespace tools
+} // namespace dsn

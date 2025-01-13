@@ -15,9 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "utils/endians.h"
+#include <stdint.h>
+#include <limits>
+#include <string>
 
-#include <gtest/gtest.h>
+#include "gtest/gtest.h"
+#include "utils/endians.h"
+#include "utils/enum_helper.h"
 
 using namespace dsn;
 

@@ -24,15 +24,26 @@
  * THE SOFTWARE.
  */
 
-#include "utils/fmt_logging.h"
-#include "aio/aio_task.h"
-#include "utils/flags.h"
-
 #include "disk_engine.h"
-#include "runtime/service_engine.h"
-#include "native_linux_aio_provider.h"
 
-using namespace dsn::utils;
+#include <list>
+// IWYU pragma: no_include <string>
+#include <utility>
+#include <vector>
+
+#include "aio/aio_provider.h"
+#include "aio/aio_task.h"
+#include "native_linux_aio_provider.h"
+#include "task/task.h"
+#include "task/task_code.h"
+#include "task/task_spec.h"
+#include "runtime/tool_api.h"
+#include "utils/error_code.h"
+#include "utils/factory_store.h"
+#include "utils/fmt_logging.h"
+#include "utils/join_point.h"
+#include "utils/link.h"
+#include "utils/threadpool_code.h"
 
 namespace dsn {
 DEFINE_TASK_CODE_AIO(LPC_AIO_BATCH_WRITE, TASK_PRIORITY_COMMON, THREAD_POOL_DEFAULT)
@@ -91,22 +102,26 @@ aio_task *disk_write_queue::unlink_next_workload(void *plength)
     return first;
 }
 
-disk_file::disk_file(linux_fd_t fd) : _fd(fd) {}
+disk_file::disk_file(std::unique_ptr<rocksdb::RandomAccessFile> rf) : _read_file(std::move(rf)) {}
+disk_file::disk_file(std::unique_ptr<rocksdb::RandomRWFile> wf) : _write_file(std::move(wf)) {}
 
 aio_task *disk_file::read(aio_task *tsk)
 {
+    CHECK(_read_file, "");
     tsk->add_ref(); // release on completion, see `on_read_completed`.
     return _read_queue.add_work(tsk, nullptr);
 }
 
 aio_task *disk_file::write(aio_task *tsk, void *ctx)
 {
+    CHECK(_write_file, "");
     tsk->add_ref(); // release on completion
     return _write_queue.add_work(tsk, ctx);
 }
 
 aio_task *disk_file::on_read_completed(aio_task *wk, error_code err, size_t size)
 {
+    CHECK(_read_file, "");
     CHECK(wk->next == nullptr, "");
     auto ret = _read_queue.on_work_completed(wk, nullptr);
     wk->enqueue(err, size);
@@ -117,6 +132,7 @@ aio_task *disk_file::on_read_completed(aio_task *wk, error_code err, size_t size
 
 aio_task *disk_file::on_write_completed(aio_task *wk, void *ctx, error_code err, size_t size)
 {
+    CHECK(_write_file, "");
     auto ret = _write_queue.on_work_completed(wk, ctx);
 
     while (wk) {
@@ -236,9 +252,9 @@ void disk_engine::process_write(aio_task *aio, uint64_t sz)
 void disk_engine::complete_io(aio_task *aio, error_code err, uint64_t bytes)
 {
     if (err != ERR_OK) {
-        LOG_DEBUG("disk operation failure with code %s, err = %s, aio_task_id = %016" PRIx64,
-                  aio->spec().name.c_str(),
-                  err.to_string(),
+        LOG_DEBUG("disk operation failure with code {}, err = {}, aio_task_id = {:#018x}",
+                  aio->spec().name,
+                  err,
                   aio->id());
     }
 

@@ -26,15 +26,23 @@
 
 #pragma once
 
-#include "aio/aio_task.h"
+#include <stdint.h>
+#include <memory>
+#include <string>
+
+#include "utils/error_code.h"
 #include "utils/factory_store.h"
+
+namespace rocksdb {
+class RandomAccessFile;
+class RandomRWFile;
+} // namespace rocksdb
 
 namespace dsn {
 
+class aio_context;
+class aio_task;
 class disk_engine;
-class service_node;
-class task_worker_pool;
-class task_queue;
 
 #define DSN_INVALID_FILE_HANDLE -1
 struct linux_fd_t
@@ -42,7 +50,6 @@ struct linux_fd_t
     int fd;
 
     explicit linux_fd_t(int f) : fd(f) {}
-    inline bool is_invalid() const { return fd == DSN_INVALID_FILE_HANDLE; }
 };
 
 class aio_provider
@@ -59,12 +66,13 @@ public:
     explicit aio_provider(disk_engine *disk);
     virtual ~aio_provider() = default;
 
-    virtual linux_fd_t open(const char *file_name, int flag, int pmode) = 0;
-
-    virtual error_code close(linux_fd_t fd) = 0;
-    virtual error_code flush(linux_fd_t fd) = 0;
-    virtual error_code write(const aio_context &aio_ctx, /*out*/ uint64_t *processed_bytes) = 0;
+    virtual std::unique_ptr<rocksdb::RandomAccessFile> open_read_file(const std::string &fname) = 0;
     virtual error_code read(const aio_context &aio_ctx, /*out*/ uint64_t *processed_bytes) = 0;
+
+    virtual std::unique_ptr<rocksdb::RandomRWFile> open_write_file(const std::string &fname) = 0;
+    virtual error_code write(const aio_context &aio_ctx, /*out*/ uint64_t *processed_bytes) = 0;
+    virtual error_code flush(rocksdb::RandomRWFile *rwf) = 0;
+    virtual error_code close(rocksdb::RandomRWFile *rwf) = 0;
 
     // Submits the aio_task to the underlying disk-io executor.
     // This task may not be executed immediately, call `aio_task::wait`

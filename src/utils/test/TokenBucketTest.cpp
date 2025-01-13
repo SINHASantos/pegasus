@@ -15,7 +15,14 @@
  */
 
 #include "TokenBucketTest.h"
-#include <gtest/gtest.h>
+
+#include <boost/optional/optional.hpp>
+#include <stddef.h>
+#include <algorithm>
+#include <string>
+#include <vector>
+
+#include "gtest/gtest.h"
 #include "utils/TokenBucket.h"
 
 using namespace folly;
@@ -65,10 +72,13 @@ TEST_P(TokenBucketTest, sanity)
 }
 
 static std::vector<std::pair<double, double>> rateToConsumeSize = {
-    {100, 1}, {1000, 1}, {10000, 1}, {10000, 5},
+    {100, 1},
+    {1000, 1},
+    {10000, 1},
+    {10000, 5},
 };
 
-INSTANTIATE_TEST_CASE_P(TokenBucket, TokenBucketTest, ::testing::ValuesIn(rateToConsumeSize));
+INSTANTIATE_TEST_SUITE_P(TokenBucket, TokenBucketTest, ::testing::ValuesIn(rateToConsumeSize));
 
 TEST(TokenBucket, drainOnFail)
 {

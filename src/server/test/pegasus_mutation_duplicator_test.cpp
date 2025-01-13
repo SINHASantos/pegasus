@@ -18,14 +18,33 @@
  */
 
 #include "server/pegasus_mutation_duplicator.h"
-#include "base/pegasus_rpc_types.h"
-#include "base/value_schema_manager.h"
-#include "pegasus_server_test_base.h"
 
-#include <gtest/gtest.h>
-#include "runtime/message_utils.h"
+#include <fmt/core.h>
+#include <pegasus/error.h>
+#include <sys/types.h>
+#include <memory>
+#include <string_view>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "backup_types.h"
+#include "base/pegasus_rpc_types.h"
+#include "common/duplication_common.h"
+#include "common/gpid.h"
+#include "common/replication.codes.h"
+#include "duplication_internal_types.h"
+#include "gtest/gtest.h"
+#include "pegasus_key_schema.h"
+#include "pegasus_server_test_base.h"
 #include "replica/replica_base.h"
-#include <condition_variable>
+#include "rpc/rpc_holder.h"
+#include "rpc/rpc_message.h"
+#include "rrdb/rrdb.code.definition.h"
+#include "rrdb/rrdb_types.h"
+#include "runtime/message_utils.h"
+#include "utils/blob.h"
+#include "utils/error_code.h"
 
 namespace pegasus {
 namespace server {
@@ -96,12 +115,13 @@ public:
 
                 total_shipped_size +=
                     rpc.dsn_request()->body_size() + rpc.dsn_request()->header->hdr_length;
-                duplicator_impl->on_duplicate_reply(get_hash(rpc),
-                                                    [total_shipped_size](size_t final_size) {
-                                                        ASSERT_EQ(total_shipped_size, final_size);
-                                                    },
-                                                    rpc,
-                                                    dsn::ERR_OK);
+                duplicator_impl->on_duplicate_reply(
+                    get_hash(rpc),
+                    [total_shipped_size](size_t final_size) {
+                        ASSERT_EQ(total_shipped_size, final_size);
+                    },
+                    rpc,
+                    dsn::ERR_OK);
 
                 // schedule next round
                 _tracker.wait_outstanding_tasks();
@@ -170,7 +190,8 @@ public:
 
             // with other error
             rpc.response().error = PERR_INVALID_ARGUMENT;
-            duplicator_impl->on_duplicate_reply(get_hash(rpc), [](size_t) {}, rpc, dsn::ERR_OK);
+            duplicator_impl->on_duplicate_reply(
+                get_hash(rpc), [](size_t) {}, rpc, dsn::ERR_OK);
             _tracker.wait_outstanding_tasks();
             ASSERT_EQ(duplicator_impl->_inflights.size(), 1);
             ASSERT_EQ(duplicate_rpc::mail_box().size(), 1);
@@ -240,7 +261,8 @@ public:
             auto rpc_list = std::move(duplicate_rpc::mail_box());
             for (const auto &rpc : rpc_list) {
                 rpc.response().error = dsn::ERR_OK;
-                duplicator_impl->on_duplicate_reply(get_hash(rpc), [](size_t) {}, rpc, dsn::ERR_OK);
+                duplicator_impl->on_duplicate_reply(
+                    get_hash(rpc), [](size_t) {}, rpc, dsn::ERR_OK);
             }
             _tracker.wait_outstanding_tasks();
             ASSERT_EQ(duplicate_rpc::mail_box().size(), 0);
@@ -254,9 +276,9 @@ public:
         auto duplicator = new_mutation_duplicator(&replica, "onebox2", "temp");
         duplicator->set_task_environment(&_env);
         auto duplicator_impl = dynamic_cast<pegasus_mutation_duplicator *>(duplicator.get());
-        ASSERT_EQ(duplicator_impl->_remote_cluster_id, 2);
-        ASSERT_EQ(duplicator_impl->_remote_cluster, "onebox2");
-        ASSERT_EQ(get_current_cluster_id(), 1);
+        ASSERT_EQ(2, duplicator_impl->_remote_cluster_id);
+        ASSERT_STREQ("onebox2", duplicator_impl->_remote_cluster.c_str());
+        ASSERT_EQ(1, get_current_dup_cluster_id());
     }
 
 private:
@@ -268,7 +290,9 @@ private:
     }
 };
 
-TEST_F(pegasus_mutation_duplicator_test, get_hash_from_request)
+INSTANTIATE_TEST_SUITE_P(, pegasus_mutation_duplicator_test, ::testing::Values(false, true));
+
+TEST_P(pegasus_mutation_duplicator_test, get_hash_from_request)
 {
     std::string hash_key("hash");
     std::string sort_key("sort");
@@ -316,7 +340,7 @@ TEST_F(pegasus_mutation_duplicator_test, get_hash_from_request)
 // Verifies that calls on `get_hash_key_from_request` won't make
 // message unable to read. (if `get_hash_key_from_request` doesn't
 // copy the message internally, it will.)
-TEST_F(pegasus_mutation_duplicator_test, read_after_get_hash_key)
+TEST_P(pegasus_mutation_duplicator_test, read_after_get_hash_key)
 {
     std::string hash_key("hash");
     std::string sort_key("sort");
@@ -338,18 +362,18 @@ TEST_F(pegasus_mutation_duplicator_test, read_after_get_hash_key)
     ASSERT_EQ(rpc.request().key.to_string(), raw_key.to_string());
 }
 
-TEST_F(pegasus_mutation_duplicator_test, duplicate) { test_duplicate(); }
+TEST_P(pegasus_mutation_duplicator_test, duplicate) { test_duplicate(); }
 
-TEST_F(pegasus_mutation_duplicator_test, duplicate_failed) { test_duplicate_failed(); }
+TEST_P(pegasus_mutation_duplicator_test, duplicate_failed) { test_duplicate_failed(); }
 
-TEST_F(pegasus_mutation_duplicator_test, duplicate_isolated_hashkeys)
+TEST_P(pegasus_mutation_duplicator_test, duplicate_isolated_hashkeys)
 {
     test_duplicate_isolated_hashkeys();
 }
 
-TEST_F(pegasus_mutation_duplicator_test, create_duplicator) { test_create_duplicator(); }
+TEST_P(pegasus_mutation_duplicator_test, create_duplicator) { test_create_duplicator(); }
 
-TEST_F(pegasus_mutation_duplicator_test, duplicate_duplicate)
+TEST_P(pegasus_mutation_duplicator_test, duplicate_duplicate)
 {
     replica_base replica(dsn::gpid(1, 1), "fake_replica", "temp");
     auto duplicator = new_mutation_duplicator(&replica, "onebox2", "temp");

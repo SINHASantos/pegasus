@@ -19,7 +19,9 @@
 
 #include "base/pegasus_value_schema.h"
 
-#include <gtest/gtest.h>
+#include <limits>
+
+#include "gtest/gtest.h"
 
 using namespace pegasus;
 

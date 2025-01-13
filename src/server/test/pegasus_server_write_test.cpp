@@ -17,14 +17,32 @@
  * under the License.
  */
 
-#include "pegasus_server_test_base.h"
-#include "message_utils.h"
-#include "server/pegasus_server_write.h"
-#include "server/pegasus_write_service_impl.h"
-#include "base/pegasus_key_schema.h"
+#include <fmt/core.h>
+#include <rocksdb/write_batch.h>
+#include <stdint.h>
+#include <memory>
+#include <string>
+#include <vector>
 
+#include "base/pegasus_key_schema.h"
+#include "common/gpid.h"
+#include "gtest/gtest.h"
+#include "message_utils.h"
+#include "pegasus_rpc_types.h"
+#include "pegasus_server_test_base.h"
+#include "rrdb/rrdb_types.h"
+#include "rpc/rpc_holder.h"
+#include "server/pegasus_server_write.h"
+#include "server/pegasus_write_service.h"
+#include "server/pegasus_write_service_impl.h"
+#include "server/rocksdb_wrapper.h"
+#include "utils/blob.h"
 #include "utils/fail_point.h"
-#include "utils/defer.h"
+#include "utils/rand.h"
+
+namespace dsn {
+class message_ex;
+} // namespace dsn
 
 namespace pegasus {
 namespace server {
@@ -37,7 +55,7 @@ public:
     pegasus_server_write_test() : pegasus_server_test_base()
     {
         start();
-        _server_write = dsn::make_unique<pegasus_server_write>(_server.get(), true);
+        _server_write = std::make_unique<pegasus_server_write>(_server.get());
     }
 
     void test_batch_writes()
@@ -88,8 +106,8 @@ public:
                 // make sure everything is cleanup after batch write.
                 ASSERT_TRUE(_server_write->_put_rpc_batch.empty());
                 ASSERT_TRUE(_server_write->_remove_rpc_batch.empty());
-                ASSERT_TRUE(_server_write->_write_svc->_batch_qps_perfcounters.empty());
-                ASSERT_TRUE(_server_write->_write_svc->_batch_latency_perfcounters.empty());
+                ASSERT_EQ(_server_write->_write_svc->_put_batch_size, 0);
+                ASSERT_EQ(_server_write->_write_svc->_remove_batch_size, 0);
                 ASSERT_EQ(_server_write->_write_svc->_batch_start_time, 0);
                 ASSERT_EQ(_server_write->_write_svc->_impl->_rocksdb_wrapper->_write_batch->Count(),
                           0);
@@ -115,11 +133,13 @@ public:
         ASSERT_EQ(response.app_id, _gpid.get_app_id());
         ASSERT_EQ(response.partition_index, _gpid.get_partition_index());
         ASSERT_EQ(response.decree, decree);
-        ASSERT_EQ(response.server, _server_write->_write_svc->_impl->_primary_address);
+        ASSERT_EQ(response.server, _server_write->_write_svc->_impl->_primary_host_port);
     }
 };
 
-TEST_F(pegasus_server_write_test, batch_writes) { test_batch_writes(); }
+INSTANTIATE_TEST_SUITE_P(, pegasus_server_write_test, ::testing::Values(false, true));
+
+TEST_P(pegasus_server_write_test, batch_writes) { test_batch_writes(); }
 
 } // namespace server
 } // namespace pegasus

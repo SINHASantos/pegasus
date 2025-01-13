@@ -30,10 +30,11 @@
 
 #pragma once
 
-#include "runtime/api_task.h"
 #include "common/gpid.h"
-#include "runtime/rpc/rpc_address.h"
-#include "runtime/task/task_tracker.h"
+#include "rpc/rpc_address.h"
+#include "rpc/rpc_host_port.h"
+#include "runtime/api_task.h"
+#include "task/task_tracker.h"
 
 /*!
  @defgroup service-api-c Core Service API
@@ -214,6 +215,8 @@ replace the underneath implementation of the network (e.g., RDMA, simulated netw
 */
 
 extern dsn::rpc_address dsn_primary_address();
+
+extern dsn::host_port dsn_primary_host_port();
 
 /*!
 @defgroup rpc-server Server-Side RPC Primitives

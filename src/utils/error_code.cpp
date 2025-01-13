@@ -23,7 +23,10 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #include "utils/error_code.h"
+
+#include "utils/customizable_id.h"
 
 namespace dsn {
 /*static*/
@@ -62,4 +65,4 @@ const char *error_code::to_string() const
 {
     return dsn::utils::customized_id_mgr<dsn::error_code>::instance().get_name(_internal_code);
 }
-}
+} // namespace dsn

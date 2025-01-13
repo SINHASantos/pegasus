@@ -17,16 +17,12 @@
 
 #pragma once
 
-#include "runtime/serverlet.h"
-#include "http_server.h"
-#include "utils/errors.h"
-
 namespace dsn {
+struct http_request;
+struct http_response;
 
 // Register basic services for the HTTP server.
 extern void register_builtin_http_calls();
-
-extern void get_perf_counter_handler(const http_request &req, http_response &resp);
 
 extern void get_help_handler(const http_request &req, http_response &resp);
 

@@ -24,18 +24,16 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     Unit-test for priority_queue.
- *
- * Revision history:
- *     Nov., 2015, @qinzuoyan (Zuoyan Qin), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #include "utils/priority_queue.h"
-#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <chrono>
+#include <memory>
 #include <thread>
+#include <vector>
+
+#include "gtest/gtest.h"
+#include "utils/utils.h"
 
 using namespace ::dsn::utils;
 

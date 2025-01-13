@@ -17,24 +17,20 @@
 
 #pragma once
 
+#include <stdint.h>
+#include <atomic>
+#include <memory>
+#include <string>
+
 #include "common//duplication_common.h"
-#include "runtime/pipeline.h"
-#include "replica/replica_base.h"
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
-#include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
-#include "runtime/serverlet.h"
-#include "runtime/service_app.h"
-#include "runtime/rpc/rpc_address.h"
+#include "common/json_helper.h"
 #include "common/replication_other_types.h"
-#include "common/replication.codes.h"
+#include "duplication_types.h"
+#include "replica/replica_base.h"
+#include "runtime/pipeline.h"
+#include "task/task_tracker.h"
+#include "utils/errors.h"
+#include "utils/metrics.h"
 #include "utils/zlocks.h"
 
 namespace dsn {
@@ -43,12 +39,13 @@ namespace replication {
 class duplication_progress
 {
 public:
-    // check if checkpoint has catch up with `_start_point_decree`
+    // Check if checkpoint has covered `_min_checkpoint_decree`.
     bool checkpoint_has_prepared{false};
-    // the maximum decree that's been persisted in meta server
+
+    // The max decree that has been persisted in the meta server.
     decree confirmed_decree{invalid_decree};
 
-    // the maximum decree that's been duplicated to remote.
+    // The max decree that has been duplicated to the remote cluster.
     decree last_decree{invalid_decree};
 
     duplication_progress &set_last_decree(decree d)
@@ -64,11 +61,11 @@ public:
     }
 };
 
-class load_mutation;
-class ship_mutation;
 class load_from_private_log;
+class load_mutation;
 class replica;
 class replica_stub;
+class ship_mutation;
 
 // Each replica_duplicator is responsible for one duplication.
 // It works in THREAD_POOL_REPLICATION (LPC_DUPLICATE_MUTATIONS),
@@ -107,6 +104,8 @@ public:
 
     const std::string &remote_cluster_name() const { return _remote_cluster_name; }
 
+    const std::string &remote_app_name() const { return _remote_app_name; }
+
     // Thread-safe
     duplication_progress progress() const
     {
@@ -131,8 +130,6 @@ public:
     // won't be effected when this duplication is removed.
     dsn::task_tracker *tracker() { return &_tracker; }
 
-    std::string to_string() const;
-
     // To ensure mutation logs after start_decree is available
     // for duplication. If not, it means the eventual consistency
     // of duplication is no longer guaranteed due to the missing logs.
@@ -144,7 +141,28 @@ public:
     // For metric "dup.pending_mutations_count"
     uint64_t get_pending_mutations_count() const;
 
-    duplication_status::type status() const { return _status; };
+    duplication_status::type status() const { return _status; }
+
+    void set_duplication_plog_checking(bool checking);
+
+    // Encode current progress of this duplication into json.
+    template <typename TWriter>
+    void encode_progress(TWriter &writer) const
+    {
+        writer.StartObject();
+
+        JSON_ENCODE_OBJ(writer, dupid, _id);
+        JSON_ENCODE_OBJ(writer, remote_cluster_name, _remote_cluster_name);
+        JSON_ENCODE_OBJ(writer, remote_app_name, _remote_app_name);
+
+        {
+            zauto_read_lock l(_lock);
+            JSON_ENCODE_OBJ(writer, replica_confirmed_decree, _progress.last_decree);
+            JSON_ENCODE_OBJ(writer, meta_persisted_decree, _progress.confirmed_decree);
+        }
+
+        writer.EndObject();
+    }
 
 private:
     friend class duplication_test_base;
@@ -153,17 +171,24 @@ private:
     friend class load_from_private_log_test;
     friend class ship_mutation_test;
 
+    friend class mutation_batch;
     friend class load_mutation;
     friend class ship_mutation;
 
+    std::string to_string() const;
+
     const dupid_t _id;
     const std::string _remote_cluster_name;
+    const std::string _remote_app_name;
 
     replica *_replica;
     replica_stub *_stub;
     dsn::task_tracker _tracker;
 
-    decree _start_point_decree = invalid_decree;
+    // The min decree that should be covered by the checkpoint which is triggered by the
+    // newly added duplication.
+    decree _min_checkpoint_decree{invalid_decree};
+
     duplication_status::type _status{duplication_status::DS_INIT};
     std::atomic<duplication_fail_mode::type> _fail_mode{duplication_fail_mode::FAIL_SLOW};
 
@@ -175,6 +200,11 @@ private:
     std::unique_ptr<load_mutation> _load;
     std::unique_ptr<ship_mutation> _ship;
     std::unique_ptr<load_from_private_log> _load_private;
+
+    // <- Duplication Metrics ->
+    // TODO(wutao1): calculate the counters independently for each remote cluster
+    //               if we need to duplicate to multiple clusters someday.
+    METRIC_VAR_DECLARE_counter(dup_confirmed_mutations);
 };
 
 typedef std::unique_ptr<replica_duplicator> replica_duplicator_u_ptr;

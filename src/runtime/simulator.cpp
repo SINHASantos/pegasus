@@ -24,22 +24,25 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #include "runtime/simulator.h"
-#include "scheduler.h"
-#include "service_engine.h"
+
+#include <map>
 
 #include "env.sim.h"
-#include "runtime/task/task_engine.sim.h"
+#include "runtime/global_config.h"
+#include "task/task_engine.sim.h"
+#include "task/task_spec.h"
+#include "scheduler.h"
+#include "service_engine.h"
 #include "sim_clock.h"
+#include "utils/clock.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/join_point.h"
+#include "utils/threadpool_spec.h"
+#include "utils/zlock_provider.h"
+
+DSN_DECLARE_int32(random_seed);
 
 namespace dsn {
 namespace tools {
@@ -121,8 +124,7 @@ void simulator::install(service_spec &spec)
 
 void simulator::on_system_exit(sys_exit_type st)
 {
-    LOG_ERROR("system exits, you can replay this process using random seed %d",
-              sim_env_provider::seed());
+    LOG_INFO("system exits, you can replay this process using random seed {}", FLAGS_random_seed);
 }
 
 void simulator::run()

@@ -23,12 +23,17 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #pragma once
 
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "runtime/service_app.h"
+#include "utils/error_code.h"
 
 namespace dsn {
-class version_http_service;
 namespace replication {
 
 class meta_service;

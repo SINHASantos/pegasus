@@ -24,14 +24,6 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
 #pragma once
 
 namespace dsn {
@@ -48,5 +40,5 @@ DEFINE_TASK_CODE(LPC_NFS_FILE_CLOSE_TIMER, TASK_PRIORITY_COMMON, THREAD_POOL_DEF
 DEFINE_TASK_CODE_AIO(LPC_NFS_WRITE, TASK_PRIORITY_COMMON, THREAD_POOL_DEFAULT)
 
 DEFINE_TASK_CODE_AIO(LPC_NFS_COPY_FILE, TASK_PRIORITY_COMMON, THREAD_POOL_DEFAULT)
-}
-}
+} // namespace service
+} // namespace dsn

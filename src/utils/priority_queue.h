@@ -24,19 +24,13 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 
-#include <queue>
+#include <stdint.h>
 #include <cassert>
+#include <queue>
+#include <string>
+
 #include "utils/synchronize.h"
 
 namespace dsn {
@@ -144,5 +138,5 @@ public:
 private:
     semaphore _sema;
 };
-}
-} // end namespace
+} // namespace utils
+} // namespace dsn

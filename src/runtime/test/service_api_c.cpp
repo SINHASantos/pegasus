@@ -24,32 +24,31 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     Unit-test for c service api.
- *
- * Revision history:
- *     Nov., 2015, @qinzuoyan (Zuoyan Qin), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "runtime/tool_api.h"
-#include "aio/file_io.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
-#include "common/gpid.h"
-#include "utils/zlocks.h"
-#include "utils/utils.h"
-#include "utils/filesystem.h"
-#include <gtest/gtest.h>
+#include <stdint.h>
+#include <chrono>
+#include <map>
+#include <string>
 #include <thread>
-#include "utils/rand.h"
+#include <vector>
+
+#include "common/gpid.h"
+#include "gtest/gtest.h"
+#include "runtime/api_layer1.h"
+#include "runtime/global_config.h"
+#include "runtime/service_app.h"
 #include "runtime/service_engine.h"
+#include "runtime/tool_api.h"
+#include "task/task_code.h"
+#include "task/task_spec.h"
+#include "utils/config_api.h"
+#include "utils/error_code.h"
+#include "utils/flags.h"
+#include "utils/process_utils.h"
+#include "utils/rand.h"
+#include "utils/threadpool_code.h"
+#include "utils/zlocks.h"
+
+DSN_DECLARE_string(tool);
 
 using namespace dsn;
 
@@ -145,11 +144,11 @@ TEST(core, dsn_config)
     ASSERT_EQ(1.0, dsn_config_get_value_double("apps.client", "count", 100.0, "client count"));
     ASSERT_EQ(1.0, dsn_config_get_value_double("apps.client", "count", 100.0, "client count"));
 
-    std::vector<const char *> buffers;
+    std::vector<std::string> buffers;
     dsn_config_get_all_keys("core.test", buffers);
     ASSERT_EQ(2, buffers.size());
-    ASSERT_STREQ("count", buffers[0]);
-    ASSERT_STREQ("run", buffers[1]);
+    ASSERT_EQ("count", buffers[0]);
+    ASSERT_EQ("run", buffers[1]);
 }
 
 TEST(core, dsn_exlock)
@@ -204,8 +203,11 @@ TEST(core, dsn_semaphore)
 
 TEST(core, dsn_env)
 {
-    if (dsn::service_engine::instance().spec().tool == "simulator")
-        return;
+    if (dsn::service_engine::instance().spec().tool == "simulator") {
+        GTEST_SKIP() << "Skip the test in simulator mode, set 'tool = nativerun' in '[core]' "
+                        "section in config file to enable it.";
+    }
+    ASSERT_EQ("nativerun", dsn::service_engine::instance().spec().tool);
     uint64_t now1 = dsn_now_ns();
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     uint64_t now2 = dsn_now_ns();
@@ -219,7 +221,7 @@ TEST(core, dsn_system)
 {
     ASSERT_TRUE(tools::is_engine_ready());
     tools::tool_app *tool = tools::get_current_tool();
-    ASSERT_EQ(tool->name(), dsn_config_get_value_string("core", "tool", "", ""));
+    ASSERT_EQ(tool->name(), FLAGS_tool);
 
     int app_count = 5;
     int type_count = 1;

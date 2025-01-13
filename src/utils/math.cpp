@@ -20,7 +20,6 @@
 #include <algorithm>
 #include <numeric>
 
-#include "utils/api_utilities.h"
 #include "utils/fmt_logging.h"
 #include "utils/math.h"
 

@@ -16,8 +16,8 @@
 // under the License.
 
 #include <gtest/gtest.h>
+#include <memory>
 
-#include "utils/api_utilities.h"
 #include "utils/flags.h"
 #include "utils/logging_provider.h"
 
@@ -25,7 +25,7 @@ GTEST_API_ int main(int argc, char **argv)
 {
     testing::InitGoogleTest(&argc, argv);
 
-    dsn_log_init("dsn::tools::simple_logger", "./", nullptr);
+    dsn_log_init("dsn::tools::simple_logger", "./", "test", nullptr);
 
     dsn::flags_initialize();
 

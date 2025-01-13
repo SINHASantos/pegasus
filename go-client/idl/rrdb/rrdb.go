@@ -22,8 +22,8 @@ var _ = context.Background
 var _ = reflect.DeepEqual
 var _ = bytes.Equal
 
-var _ = base.GoUnusedProtection__
 var _ = replication.GoUnusedProtection__
+var _ = base.GoUnusedProtection__
 
 type FilterType int64
 
@@ -290,9 +290,9 @@ func (p *MutateOperation) Value() (driver.Value, error) {
 }
 
 // Attributes:
-//  - Key
-//  - Value
-//  - ExpireTsSeconds
+//   - Key
+//   - Value
+//   - ExpireTsSeconds
 type UpdateRequest struct {
 	Key             *base.Blob `thrift:"key,1" db:"key" json:"key"`
 	Value           *base.Blob `thrift:"value,2" db:"value" json:"value"`
@@ -487,11 +487,11 @@ func (p *UpdateRequest) String() string {
 }
 
 // Attributes:
-//  - Error
-//  - AppID
-//  - PartitionIndex
-//  - Decree
-//  - Server
+//   - Error
+//   - AppID
+//   - PartitionIndex
+//   - Decree
+//   - Server
 type UpdateResponse struct {
 	Error          int32  `thrift:"error,1" db:"error" json:"error"`
 	AppID          int32  `thrift:"app_id,2" db:"app_id" json:"app_id"`
@@ -750,11 +750,11 @@ func (p *UpdateResponse) String() string {
 }
 
 // Attributes:
-//  - Error
-//  - Value
-//  - AppID
-//  - PartitionIndex
-//  - Server
+//   - Error
+//   - Value
+//   - AppID
+//   - PartitionIndex
+//   - Server
 type ReadResponse struct {
 	Error          int32      `thrift:"error,1" db:"error" json:"error"`
 	Value          *base.Blob `thrift:"value,2" db:"value" json:"value"`
@@ -1022,11 +1022,11 @@ func (p *ReadResponse) String() string {
 }
 
 // Attributes:
-//  - Error
-//  - TTLSeconds
-//  - AppID
-//  - PartitionIndex
-//  - Server
+//   - Error
+//   - TTLSeconds
+//   - AppID
+//   - PartitionIndex
+//   - Server
 type TTLResponse struct {
 	Error          int32 `thrift:"error,1" db:"error" json:"error"`
 	TTLSeconds     int32 `thrift:"ttl_seconds,2" db:"ttl_seconds" json:"ttl_seconds"`
@@ -1286,11 +1286,11 @@ func (p *TTLResponse) String() string {
 }
 
 // Attributes:
-//  - Error
-//  - Count
-//  - AppID
-//  - PartitionIndex
-//  - Server
+//   - Error
+//   - Count
+//   - AppID
+//   - PartitionIndex
+//   - Server
 type CountResponse struct {
 	Error          int32 `thrift:"error,1" db:"error" json:"error"`
 	Count          int64 `thrift:"count,2" db:"count" json:"count"`
@@ -1550,11 +1550,13 @@ func (p *CountResponse) String() string {
 }
 
 // Attributes:
-//  - Key
-//  - Value
+//   - Key
+//   - Value
+//   - ExpireTsSeconds
 type KeyValue struct {
-	Key   *base.Blob `thrift:"key,1" db:"key" json:"key"`
-	Value *base.Blob `thrift:"value,2" db:"value" json:"value"`
+	Key             *base.Blob `thrift:"key,1" db:"key" json:"key"`
+	Value           *base.Blob `thrift:"value,2" db:"value" json:"value"`
+	ExpireTsSeconds *int32     `thrift:"expire_ts_seconds,3" db:"expire_ts_seconds" json:"expire_ts_seconds,omitempty"`
 }
 
 func NewKeyValue() *KeyValue {
@@ -1578,12 +1580,25 @@ func (p *KeyValue) GetValue() *base.Blob {
 	}
 	return p.Value
 }
+
+var KeyValue_ExpireTsSeconds_DEFAULT int32
+
+func (p *KeyValue) GetExpireTsSeconds() int32 {
+	if !p.IsSetExpireTsSeconds() {
+		return KeyValue_ExpireTsSeconds_DEFAULT
+	}
+	return *p.ExpireTsSeconds
+}
 func (p *KeyValue) IsSetKey() bool {
 	return p.Key != nil
 }
 
 func (p *KeyValue) IsSetValue() bool {
 	return p.Value != nil
+}
+
+func (p *KeyValue) IsSetExpireTsSeconds() bool {
+	return p.ExpireTsSeconds != nil
 }
 
 func (p *KeyValue) Read(iprot thrift.TProtocol) error {
@@ -1613,6 +1628,16 @@ func (p *KeyValue) Read(iprot thrift.TProtocol) error {
 		case 2:
 			if fieldTypeId == thrift.STRUCT {
 				if err := p.ReadField2(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		case 3:
+			if fieldTypeId == thrift.I32 {
+				if err := p.ReadField3(iprot); err != nil {
 					return err
 				}
 			} else {
@@ -1651,6 +1676,15 @@ func (p *KeyValue) ReadField2(iprot thrift.TProtocol) error {
 	return nil
 }
 
+func (p *KeyValue) ReadField3(iprot thrift.TProtocol) error {
+	if v, err := iprot.ReadI32(); err != nil {
+		return thrift.PrependError("error reading field 3: ", err)
+	} else {
+		p.ExpireTsSeconds = &v
+	}
+	return nil
+}
+
 func (p *KeyValue) Write(oprot thrift.TProtocol) error {
 	if err := oprot.WriteStructBegin("key_value"); err != nil {
 		return thrift.PrependError(fmt.Sprintf("%T write struct begin error: ", p), err)
@@ -1660,6 +1694,9 @@ func (p *KeyValue) Write(oprot thrift.TProtocol) error {
 			return err
 		}
 		if err := p.writeField2(oprot); err != nil {
+			return err
+		}
+		if err := p.writeField3(oprot); err != nil {
 			return err
 		}
 	}
@@ -1698,6 +1735,21 @@ func (p *KeyValue) writeField2(oprot thrift.TProtocol) (err error) {
 	return err
 }
 
+func (p *KeyValue) writeField3(oprot thrift.TProtocol) (err error) {
+	if p.IsSetExpireTsSeconds() {
+		if err := oprot.WriteFieldBegin("expire_ts_seconds", thrift.I32, 3); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:expire_ts_seconds: ", p), err)
+		}
+		if err := oprot.WriteI32(int32(*p.ExpireTsSeconds)); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T.expire_ts_seconds (3) field write error: ", p), err)
+		}
+		if err := oprot.WriteFieldEnd(); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field end error 3:expire_ts_seconds: ", p), err)
+		}
+	}
+	return err
+}
+
 func (p *KeyValue) String() string {
 	if p == nil {
 		return "<nil>"
@@ -1706,9 +1758,9 @@ func (p *KeyValue) String() string {
 }
 
 // Attributes:
-//  - HashKey
-//  - Kvs
-//  - ExpireTsSeconds
+//   - HashKey
+//   - Kvs
+//   - ExpireTsSeconds
 type MultiPutRequest struct {
 	HashKey         *base.Blob  `thrift:"hash_key,1" db:"hash_key" json:"hash_key"`
 	Kvs             []*KeyValue `thrift:"kvs,2" db:"kvs" json:"kvs"`
@@ -1914,12 +1966,12 @@ func (p *MultiPutRequest) String() string {
 }
 
 // Attributes:
-//  - HashKey
-//  - SorkKeys
-//  - MaxCount
+//   - HashKey
+//   - SortKeys
+//   - MaxCount
 type MultiRemoveRequest struct {
 	HashKey  *base.Blob   `thrift:"hash_key,1" db:"hash_key" json:"hash_key"`
-	SorkKeys []*base.Blob `thrift:"sork_keys,2" db:"sork_keys" json:"sork_keys"`
+	SortKeys []*base.Blob `thrift:"sort_keys,2" db:"sort_keys" json:"sort_keys"`
 	MaxCount int64        `thrift:"max_count,3" db:"max_count" json:"max_count"`
 }
 
@@ -1936,8 +1988,8 @@ func (p *MultiRemoveRequest) GetHashKey() *base.Blob {
 	return p.HashKey
 }
 
-func (p *MultiRemoveRequest) GetSorkKeys() []*base.Blob {
-	return p.SorkKeys
+func (p *MultiRemoveRequest) GetSortKeys() []*base.Blob {
+	return p.SortKeys
 }
 
 func (p *MultiRemoveRequest) GetMaxCount() int64 {
@@ -2020,13 +2072,13 @@ func (p *MultiRemoveRequest) ReadField2(iprot thrift.TProtocol) error {
 		return thrift.PrependError("error reading list begin: ", err)
 	}
 	tSlice := make([]*base.Blob, 0, size)
-	p.SorkKeys = tSlice
+	p.SortKeys = tSlice
 	for i := 0; i < size; i++ {
 		_elem1 := &base.Blob{}
 		if err := _elem1.Read(iprot); err != nil {
 			return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", _elem1), err)
 		}
-		p.SorkKeys = append(p.SorkKeys, _elem1)
+		p.SortKeys = append(p.SortKeys, _elem1)
 	}
 	if err := iprot.ReadListEnd(); err != nil {
 		return thrift.PrependError("error reading list end: ", err)
@@ -2081,13 +2133,13 @@ func (p *MultiRemoveRequest) writeField1(oprot thrift.TProtocol) (err error) {
 }
 
 func (p *MultiRemoveRequest) writeField2(oprot thrift.TProtocol) (err error) {
-	if err := oprot.WriteFieldBegin("sork_keys", thrift.LIST, 2); err != nil {
-		return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:sork_keys: ", p), err)
+	if err := oprot.WriteFieldBegin("sort_keys", thrift.LIST, 2); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:sort_keys: ", p), err)
 	}
-	if err := oprot.WriteListBegin(thrift.STRUCT, len(p.SorkKeys)); err != nil {
+	if err := oprot.WriteListBegin(thrift.STRUCT, len(p.SortKeys)); err != nil {
 		return thrift.PrependError("error writing list begin: ", err)
 	}
-	for _, v := range p.SorkKeys {
+	for _, v := range p.SortKeys {
 		if err := v.Write(oprot); err != nil {
 			return thrift.PrependError(fmt.Sprintf("%T error writing struct: ", v), err)
 		}
@@ -2096,7 +2148,7 @@ func (p *MultiRemoveRequest) writeField2(oprot thrift.TProtocol) (err error) {
 		return thrift.PrependError("error writing list end: ", err)
 	}
 	if err := oprot.WriteFieldEnd(); err != nil {
-		return thrift.PrependError(fmt.Sprintf("%T write field end error 2:sork_keys: ", p), err)
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 2:sort_keys: ", p), err)
 	}
 	return err
 }
@@ -2122,12 +2174,12 @@ func (p *MultiRemoveRequest) String() string {
 }
 
 // Attributes:
-//  - Error
-//  - Count
-//  - AppID
-//  - PartitionIndex
-//  - Decree
-//  - Server
+//   - Error
+//   - Count
+//   - AppID
+//   - PartitionIndex
+//   - Decree
+//   - Server
 type MultiRemoveResponse struct {
 	Error          int32  `thrift:"error,1" db:"error" json:"error"`
 	Count          int64  `thrift:"count,2" db:"count" json:"count"`
@@ -2426,21 +2478,21 @@ func (p *MultiRemoveResponse) String() string {
 }
 
 // Attributes:
-//  - HashKey
-//  - SorkKeys
-//  - MaxKvCount
-//  - MaxKvSize
-//  - NoValue
-//  - StartSortkey
-//  - StopSortkey
-//  - StartInclusive
-//  - StopInclusive
-//  - SortKeyFilterType
-//  - SortKeyFilterPattern
-//  - Reverse
+//   - HashKey
+//   - SortKeys
+//   - MaxKvCount
+//   - MaxKvSize
+//   - NoValue
+//   - StartSortkey
+//   - StopSortkey
+//   - StartInclusive
+//   - StopInclusive
+//   - SortKeyFilterType
+//   - SortKeyFilterPattern
+//   - Reverse
 type MultiGetRequest struct {
 	HashKey              *base.Blob   `thrift:"hash_key,1" db:"hash_key" json:"hash_key"`
-	SorkKeys             []*base.Blob `thrift:"sork_keys,2" db:"sork_keys" json:"sork_keys"`
+	SortKeys             []*base.Blob `thrift:"sort_keys,2" db:"sort_keys" json:"sort_keys"`
 	MaxKvCount           int32        `thrift:"max_kv_count,3" db:"max_kv_count" json:"max_kv_count"`
 	MaxKvSize            int32        `thrift:"max_kv_size,4" db:"max_kv_size" json:"max_kv_size"`
 	NoValue              bool         `thrift:"no_value,5" db:"no_value" json:"no_value"`
@@ -2466,8 +2518,8 @@ func (p *MultiGetRequest) GetHashKey() *base.Blob {
 	return p.HashKey
 }
 
-func (p *MultiGetRequest) GetSorkKeys() []*base.Blob {
-	return p.SorkKeys
+func (p *MultiGetRequest) GetSortKeys() []*base.Blob {
+	return p.SortKeys
 }
 
 func (p *MultiGetRequest) GetMaxKvCount() int32 {
@@ -2703,13 +2755,13 @@ func (p *MultiGetRequest) ReadField2(iprot thrift.TProtocol) error {
 		return thrift.PrependError("error reading list begin: ", err)
 	}
 	tSlice := make([]*base.Blob, 0, size)
-	p.SorkKeys = tSlice
+	p.SortKeys = tSlice
 	for i := 0; i < size; i++ {
 		_elem2 := &base.Blob{}
 		if err := _elem2.Read(iprot); err != nil {
 			return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", _elem2), err)
 		}
-		p.SorkKeys = append(p.SorkKeys, _elem2)
+		p.SortKeys = append(p.SortKeys, _elem2)
 	}
 	if err := iprot.ReadListEnd(); err != nil {
 		return thrift.PrependError("error reading list end: ", err)
@@ -2870,13 +2922,13 @@ func (p *MultiGetRequest) writeField1(oprot thrift.TProtocol) (err error) {
 }
 
 func (p *MultiGetRequest) writeField2(oprot thrift.TProtocol) (err error) {
-	if err := oprot.WriteFieldBegin("sork_keys", thrift.LIST, 2); err != nil {
-		return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:sork_keys: ", p), err)
+	if err := oprot.WriteFieldBegin("sort_keys", thrift.LIST, 2); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:sort_keys: ", p), err)
 	}
-	if err := oprot.WriteListBegin(thrift.STRUCT, len(p.SorkKeys)); err != nil {
+	if err := oprot.WriteListBegin(thrift.STRUCT, len(p.SortKeys)); err != nil {
 		return thrift.PrependError("error writing list begin: ", err)
 	}
-	for _, v := range p.SorkKeys {
+	for _, v := range p.SortKeys {
 		if err := v.Write(oprot); err != nil {
 			return thrift.PrependError(fmt.Sprintf("%T error writing struct: ", v), err)
 		}
@@ -2885,7 +2937,7 @@ func (p *MultiGetRequest) writeField2(oprot thrift.TProtocol) (err error) {
 		return thrift.PrependError("error writing list end: ", err)
 	}
 	if err := oprot.WriteFieldEnd(); err != nil {
-		return thrift.PrependError(fmt.Sprintf("%T write field end error 2:sork_keys: ", p), err)
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 2:sort_keys: ", p), err)
 	}
 	return err
 }
@@ -3028,11 +3080,11 @@ func (p *MultiGetRequest) String() string {
 }
 
 // Attributes:
-//  - Error
-//  - Kvs
-//  - AppID
-//  - PartitionIndex
-//  - Server
+//   - Error
+//   - Kvs
+//   - AppID
+//   - PartitionIndex
+//   - Server
 type MultiGetResponse struct {
 	Error          int32       `thrift:"error,1" db:"error" json:"error"`
 	Kvs            []*KeyValue `thrift:"kvs,2" db:"kvs" json:"kvs"`
@@ -3311,9 +3363,771 @@ func (p *MultiGetResponse) String() string {
 }
 
 // Attributes:
-//  - Key
-//  - Increment
-//  - ExpireTsSeconds
+//   - HashKey
+//   - SortKey
+type FullKey struct {
+	HashKey *base.Blob `thrift:"hash_key,1" db:"hash_key" json:"hash_key"`
+	SortKey *base.Blob `thrift:"sort_key,2" db:"sort_key" json:"sort_key"`
+}
+
+func NewFullKey() *FullKey {
+	return &FullKey{}
+}
+
+var FullKey_HashKey_DEFAULT *base.Blob
+
+func (p *FullKey) GetHashKey() *base.Blob {
+	if !p.IsSetHashKey() {
+		return FullKey_HashKey_DEFAULT
+	}
+	return p.HashKey
+}
+
+var FullKey_SortKey_DEFAULT *base.Blob
+
+func (p *FullKey) GetSortKey() *base.Blob {
+	if !p.IsSetSortKey() {
+		return FullKey_SortKey_DEFAULT
+	}
+	return p.SortKey
+}
+func (p *FullKey) IsSetHashKey() bool {
+	return p.HashKey != nil
+}
+
+func (p *FullKey) IsSetSortKey() bool {
+	return p.SortKey != nil
+}
+
+func (p *FullKey) Read(iprot thrift.TProtocol) error {
+	if _, err := iprot.ReadStructBegin(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T read error: ", p), err)
+	}
+
+	for {
+		_, fieldTypeId, fieldId, err := iprot.ReadFieldBegin()
+		if err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T field %d read error: ", p, fieldId), err)
+		}
+		if fieldTypeId == thrift.STOP {
+			break
+		}
+		switch fieldId {
+		case 1:
+			if fieldTypeId == thrift.STRUCT {
+				if err := p.ReadField1(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		case 2:
+			if fieldTypeId == thrift.STRUCT {
+				if err := p.ReadField2(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		default:
+			if err := iprot.Skip(fieldTypeId); err != nil {
+				return err
+			}
+		}
+		if err := iprot.ReadFieldEnd(); err != nil {
+			return err
+		}
+	}
+	if err := iprot.ReadStructEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T read struct end error: ", p), err)
+	}
+	return nil
+}
+
+func (p *FullKey) ReadField1(iprot thrift.TProtocol) error {
+	p.HashKey = &base.Blob{}
+	if err := p.HashKey.Read(iprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", p.HashKey), err)
+	}
+	return nil
+}
+
+func (p *FullKey) ReadField2(iprot thrift.TProtocol) error {
+	p.SortKey = &base.Blob{}
+	if err := p.SortKey.Read(iprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", p.SortKey), err)
+	}
+	return nil
+}
+
+func (p *FullKey) Write(oprot thrift.TProtocol) error {
+	if err := oprot.WriteStructBegin("full_key"); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write struct begin error: ", p), err)
+	}
+	if p != nil {
+		if err := p.writeField1(oprot); err != nil {
+			return err
+		}
+		if err := p.writeField2(oprot); err != nil {
+			return err
+		}
+	}
+	if err := oprot.WriteFieldStop(); err != nil {
+		return thrift.PrependError("write field stop error: ", err)
+	}
+	if err := oprot.WriteStructEnd(); err != nil {
+		return thrift.PrependError("write struct stop error: ", err)
+	}
+	return nil
+}
+
+func (p *FullKey) writeField1(oprot thrift.TProtocol) (err error) {
+	if err := oprot.WriteFieldBegin("hash_key", thrift.STRUCT, 1); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:hash_key: ", p), err)
+	}
+	if err := p.HashKey.Write(oprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error writing struct: ", p.HashKey), err)
+	}
+	if err := oprot.WriteFieldEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 1:hash_key: ", p), err)
+	}
+	return err
+}
+
+func (p *FullKey) writeField2(oprot thrift.TProtocol) (err error) {
+	if err := oprot.WriteFieldBegin("sort_key", thrift.STRUCT, 2); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:sort_key: ", p), err)
+	}
+	if err := p.SortKey.Write(oprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error writing struct: ", p.SortKey), err)
+	}
+	if err := oprot.WriteFieldEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 2:sort_key: ", p), err)
+	}
+	return err
+}
+
+func (p *FullKey) String() string {
+	if p == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("FullKey(%+v)", *p)
+}
+
+// Attributes:
+//   - Keys
+type BatchGetRequest struct {
+	Keys []*FullKey `thrift:"keys,1" db:"keys" json:"keys"`
+}
+
+func NewBatchGetRequest() *BatchGetRequest {
+	return &BatchGetRequest{}
+}
+
+func (p *BatchGetRequest) GetKeys() []*FullKey {
+	return p.Keys
+}
+func (p *BatchGetRequest) Read(iprot thrift.TProtocol) error {
+	if _, err := iprot.ReadStructBegin(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T read error: ", p), err)
+	}
+
+	for {
+		_, fieldTypeId, fieldId, err := iprot.ReadFieldBegin()
+		if err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T field %d read error: ", p, fieldId), err)
+		}
+		if fieldTypeId == thrift.STOP {
+			break
+		}
+		switch fieldId {
+		case 1:
+			if fieldTypeId == thrift.LIST {
+				if err := p.ReadField1(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		default:
+			if err := iprot.Skip(fieldTypeId); err != nil {
+				return err
+			}
+		}
+		if err := iprot.ReadFieldEnd(); err != nil {
+			return err
+		}
+	}
+	if err := iprot.ReadStructEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T read struct end error: ", p), err)
+	}
+	return nil
+}
+
+func (p *BatchGetRequest) ReadField1(iprot thrift.TProtocol) error {
+	_, size, err := iprot.ReadListBegin()
+	if err != nil {
+		return thrift.PrependError("error reading list begin: ", err)
+	}
+	tSlice := make([]*FullKey, 0, size)
+	p.Keys = tSlice
+	for i := 0; i < size; i++ {
+		_elem4 := &FullKey{}
+		if err := _elem4.Read(iprot); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", _elem4), err)
+		}
+		p.Keys = append(p.Keys, _elem4)
+	}
+	if err := iprot.ReadListEnd(); err != nil {
+		return thrift.PrependError("error reading list end: ", err)
+	}
+	return nil
+}
+
+func (p *BatchGetRequest) Write(oprot thrift.TProtocol) error {
+	if err := oprot.WriteStructBegin("batch_get_request"); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write struct begin error: ", p), err)
+	}
+	if p != nil {
+		if err := p.writeField1(oprot); err != nil {
+			return err
+		}
+	}
+	if err := oprot.WriteFieldStop(); err != nil {
+		return thrift.PrependError("write field stop error: ", err)
+	}
+	if err := oprot.WriteStructEnd(); err != nil {
+		return thrift.PrependError("write struct stop error: ", err)
+	}
+	return nil
+}
+
+func (p *BatchGetRequest) writeField1(oprot thrift.TProtocol) (err error) {
+	if err := oprot.WriteFieldBegin("keys", thrift.LIST, 1); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:keys: ", p), err)
+	}
+	if err := oprot.WriteListBegin(thrift.STRUCT, len(p.Keys)); err != nil {
+		return thrift.PrependError("error writing list begin: ", err)
+	}
+	for _, v := range p.Keys {
+		if err := v.Write(oprot); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T error writing struct: ", v), err)
+		}
+	}
+	if err := oprot.WriteListEnd(); err != nil {
+		return thrift.PrependError("error writing list end: ", err)
+	}
+	if err := oprot.WriteFieldEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 1:keys: ", p), err)
+	}
+	return err
+}
+
+func (p *BatchGetRequest) String() string {
+	if p == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("BatchGetRequest(%+v)", *p)
+}
+
+// Attributes:
+//   - HashKey
+//   - SortKey
+//   - Value
+type FullData struct {
+	HashKey *base.Blob `thrift:"hash_key,1" db:"hash_key" json:"hash_key"`
+	SortKey *base.Blob `thrift:"sort_key,2" db:"sort_key" json:"sort_key"`
+	Value   *base.Blob `thrift:"value,3" db:"value" json:"value"`
+}
+
+func NewFullData() *FullData {
+	return &FullData{}
+}
+
+var FullData_HashKey_DEFAULT *base.Blob
+
+func (p *FullData) GetHashKey() *base.Blob {
+	if !p.IsSetHashKey() {
+		return FullData_HashKey_DEFAULT
+	}
+	return p.HashKey
+}
+
+var FullData_SortKey_DEFAULT *base.Blob
+
+func (p *FullData) GetSortKey() *base.Blob {
+	if !p.IsSetSortKey() {
+		return FullData_SortKey_DEFAULT
+	}
+	return p.SortKey
+}
+
+var FullData_Value_DEFAULT *base.Blob
+
+func (p *FullData) GetValue() *base.Blob {
+	if !p.IsSetValue() {
+		return FullData_Value_DEFAULT
+	}
+	return p.Value
+}
+func (p *FullData) IsSetHashKey() bool {
+	return p.HashKey != nil
+}
+
+func (p *FullData) IsSetSortKey() bool {
+	return p.SortKey != nil
+}
+
+func (p *FullData) IsSetValue() bool {
+	return p.Value != nil
+}
+
+func (p *FullData) Read(iprot thrift.TProtocol) error {
+	if _, err := iprot.ReadStructBegin(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T read error: ", p), err)
+	}
+
+	for {
+		_, fieldTypeId, fieldId, err := iprot.ReadFieldBegin()
+		if err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T field %d read error: ", p, fieldId), err)
+		}
+		if fieldTypeId == thrift.STOP {
+			break
+		}
+		switch fieldId {
+		case 1:
+			if fieldTypeId == thrift.STRUCT {
+				if err := p.ReadField1(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		case 2:
+			if fieldTypeId == thrift.STRUCT {
+				if err := p.ReadField2(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		case 3:
+			if fieldTypeId == thrift.STRUCT {
+				if err := p.ReadField3(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		default:
+			if err := iprot.Skip(fieldTypeId); err != nil {
+				return err
+			}
+		}
+		if err := iprot.ReadFieldEnd(); err != nil {
+			return err
+		}
+	}
+	if err := iprot.ReadStructEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T read struct end error: ", p), err)
+	}
+	return nil
+}
+
+func (p *FullData) ReadField1(iprot thrift.TProtocol) error {
+	p.HashKey = &base.Blob{}
+	if err := p.HashKey.Read(iprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", p.HashKey), err)
+	}
+	return nil
+}
+
+func (p *FullData) ReadField2(iprot thrift.TProtocol) error {
+	p.SortKey = &base.Blob{}
+	if err := p.SortKey.Read(iprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", p.SortKey), err)
+	}
+	return nil
+}
+
+func (p *FullData) ReadField3(iprot thrift.TProtocol) error {
+	p.Value = &base.Blob{}
+	if err := p.Value.Read(iprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", p.Value), err)
+	}
+	return nil
+}
+
+func (p *FullData) Write(oprot thrift.TProtocol) error {
+	if err := oprot.WriteStructBegin("full_data"); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write struct begin error: ", p), err)
+	}
+	if p != nil {
+		if err := p.writeField1(oprot); err != nil {
+			return err
+		}
+		if err := p.writeField2(oprot); err != nil {
+			return err
+		}
+		if err := p.writeField3(oprot); err != nil {
+			return err
+		}
+	}
+	if err := oprot.WriteFieldStop(); err != nil {
+		return thrift.PrependError("write field stop error: ", err)
+	}
+	if err := oprot.WriteStructEnd(); err != nil {
+		return thrift.PrependError("write struct stop error: ", err)
+	}
+	return nil
+}
+
+func (p *FullData) writeField1(oprot thrift.TProtocol) (err error) {
+	if err := oprot.WriteFieldBegin("hash_key", thrift.STRUCT, 1); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:hash_key: ", p), err)
+	}
+	if err := p.HashKey.Write(oprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error writing struct: ", p.HashKey), err)
+	}
+	if err := oprot.WriteFieldEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 1:hash_key: ", p), err)
+	}
+	return err
+}
+
+func (p *FullData) writeField2(oprot thrift.TProtocol) (err error) {
+	if err := oprot.WriteFieldBegin("sort_key", thrift.STRUCT, 2); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:sort_key: ", p), err)
+	}
+	if err := p.SortKey.Write(oprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error writing struct: ", p.SortKey), err)
+	}
+	if err := oprot.WriteFieldEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 2:sort_key: ", p), err)
+	}
+	return err
+}
+
+func (p *FullData) writeField3(oprot thrift.TProtocol) (err error) {
+	if err := oprot.WriteFieldBegin("value", thrift.STRUCT, 3); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:value: ", p), err)
+	}
+	if err := p.Value.Write(oprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error writing struct: ", p.Value), err)
+	}
+	if err := oprot.WriteFieldEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 3:value: ", p), err)
+	}
+	return err
+}
+
+func (p *FullData) String() string {
+	if p == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("FullData(%+v)", *p)
+}
+
+// Attributes:
+//   - Error
+//   - Data
+//   - AppID
+//   - PartitionIndex
+//   - Server
+type BatchGetResponse struct {
+	Error          int32       `thrift:"error,1" db:"error" json:"error"`
+	Data           []*FullData `thrift:"data,2" db:"data" json:"data"`
+	AppID          int32       `thrift:"app_id,3" db:"app_id" json:"app_id"`
+	PartitionIndex int32       `thrift:"partition_index,4" db:"partition_index" json:"partition_index"`
+	// unused field # 5
+	Server string `thrift:"server,6" db:"server" json:"server"`
+}
+
+func NewBatchGetResponse() *BatchGetResponse {
+	return &BatchGetResponse{}
+}
+
+func (p *BatchGetResponse) GetError() int32 {
+	return p.Error
+}
+
+func (p *BatchGetResponse) GetData() []*FullData {
+	return p.Data
+}
+
+func (p *BatchGetResponse) GetAppID() int32 {
+	return p.AppID
+}
+
+func (p *BatchGetResponse) GetPartitionIndex() int32 {
+	return p.PartitionIndex
+}
+
+func (p *BatchGetResponse) GetServer() string {
+	return p.Server
+}
+func (p *BatchGetResponse) Read(iprot thrift.TProtocol) error {
+	if _, err := iprot.ReadStructBegin(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T read error: ", p), err)
+	}
+
+	for {
+		_, fieldTypeId, fieldId, err := iprot.ReadFieldBegin()
+		if err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T field %d read error: ", p, fieldId), err)
+		}
+		if fieldTypeId == thrift.STOP {
+			break
+		}
+		switch fieldId {
+		case 1:
+			if fieldTypeId == thrift.I32 {
+				if err := p.ReadField1(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		case 2:
+			if fieldTypeId == thrift.LIST {
+				if err := p.ReadField2(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		case 3:
+			if fieldTypeId == thrift.I32 {
+				if err := p.ReadField3(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		case 4:
+			if fieldTypeId == thrift.I32 {
+				if err := p.ReadField4(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		case 6:
+			if fieldTypeId == thrift.STRING {
+				if err := p.ReadField6(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		default:
+			if err := iprot.Skip(fieldTypeId); err != nil {
+				return err
+			}
+		}
+		if err := iprot.ReadFieldEnd(); err != nil {
+			return err
+		}
+	}
+	if err := iprot.ReadStructEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T read struct end error: ", p), err)
+	}
+	return nil
+}
+
+func (p *BatchGetResponse) ReadField1(iprot thrift.TProtocol) error {
+	if v, err := iprot.ReadI32(); err != nil {
+		return thrift.PrependError("error reading field 1: ", err)
+	} else {
+		p.Error = v
+	}
+	return nil
+}
+
+func (p *BatchGetResponse) ReadField2(iprot thrift.TProtocol) error {
+	_, size, err := iprot.ReadListBegin()
+	if err != nil {
+		return thrift.PrependError("error reading list begin: ", err)
+	}
+	tSlice := make([]*FullData, 0, size)
+	p.Data = tSlice
+	for i := 0; i < size; i++ {
+		_elem5 := &FullData{}
+		if err := _elem5.Read(iprot); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", _elem5), err)
+		}
+		p.Data = append(p.Data, _elem5)
+	}
+	if err := iprot.ReadListEnd(); err != nil {
+		return thrift.PrependError("error reading list end: ", err)
+	}
+	return nil
+}
+
+func (p *BatchGetResponse) ReadField3(iprot thrift.TProtocol) error {
+	if v, err := iprot.ReadI32(); err != nil {
+		return thrift.PrependError("error reading field 3: ", err)
+	} else {
+		p.AppID = v
+	}
+	return nil
+}
+
+func (p *BatchGetResponse) ReadField4(iprot thrift.TProtocol) error {
+	if v, err := iprot.ReadI32(); err != nil {
+		return thrift.PrependError("error reading field 4: ", err)
+	} else {
+		p.PartitionIndex = v
+	}
+	return nil
+}
+
+func (p *BatchGetResponse) ReadField6(iprot thrift.TProtocol) error {
+	if v, err := iprot.ReadString(); err != nil {
+		return thrift.PrependError("error reading field 6: ", err)
+	} else {
+		p.Server = v
+	}
+	return nil
+}
+
+func (p *BatchGetResponse) Write(oprot thrift.TProtocol) error {
+	if err := oprot.WriteStructBegin("batch_get_response"); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write struct begin error: ", p), err)
+	}
+	if p != nil {
+		if err := p.writeField1(oprot); err != nil {
+			return err
+		}
+		if err := p.writeField2(oprot); err != nil {
+			return err
+		}
+		if err := p.writeField3(oprot); err != nil {
+			return err
+		}
+		if err := p.writeField4(oprot); err != nil {
+			return err
+		}
+		if err := p.writeField6(oprot); err != nil {
+			return err
+		}
+	}
+	if err := oprot.WriteFieldStop(); err != nil {
+		return thrift.PrependError("write field stop error: ", err)
+	}
+	if err := oprot.WriteStructEnd(); err != nil {
+		return thrift.PrependError("write struct stop error: ", err)
+	}
+	return nil
+}
+
+func (p *BatchGetResponse) writeField1(oprot thrift.TProtocol) (err error) {
+	if err := oprot.WriteFieldBegin("error", thrift.I32, 1); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:error: ", p), err)
+	}
+	if err := oprot.WriteI32(int32(p.Error)); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T.error (1) field write error: ", p), err)
+	}
+	if err := oprot.WriteFieldEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 1:error: ", p), err)
+	}
+	return err
+}
+
+func (p *BatchGetResponse) writeField2(oprot thrift.TProtocol) (err error) {
+	if err := oprot.WriteFieldBegin("data", thrift.LIST, 2); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 2:data: ", p), err)
+	}
+	if err := oprot.WriteListBegin(thrift.STRUCT, len(p.Data)); err != nil {
+		return thrift.PrependError("error writing list begin: ", err)
+	}
+	for _, v := range p.Data {
+		if err := v.Write(oprot); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T error writing struct: ", v), err)
+		}
+	}
+	if err := oprot.WriteListEnd(); err != nil {
+		return thrift.PrependError("error writing list end: ", err)
+	}
+	if err := oprot.WriteFieldEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 2:data: ", p), err)
+	}
+	return err
+}
+
+func (p *BatchGetResponse) writeField3(oprot thrift.TProtocol) (err error) {
+	if err := oprot.WriteFieldBegin("app_id", thrift.I32, 3); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 3:app_id: ", p), err)
+	}
+	if err := oprot.WriteI32(int32(p.AppID)); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T.app_id (3) field write error: ", p), err)
+	}
+	if err := oprot.WriteFieldEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 3:app_id: ", p), err)
+	}
+	return err
+}
+
+func (p *BatchGetResponse) writeField4(oprot thrift.TProtocol) (err error) {
+	if err := oprot.WriteFieldBegin("partition_index", thrift.I32, 4); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 4:partition_index: ", p), err)
+	}
+	if err := oprot.WriteI32(int32(p.PartitionIndex)); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T.partition_index (4) field write error: ", p), err)
+	}
+	if err := oprot.WriteFieldEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 4:partition_index: ", p), err)
+	}
+	return err
+}
+
+func (p *BatchGetResponse) writeField6(oprot thrift.TProtocol) (err error) {
+	if err := oprot.WriteFieldBegin("server", thrift.STRING, 6); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 6:server: ", p), err)
+	}
+	if err := oprot.WriteString(string(p.Server)); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T.server (6) field write error: ", p), err)
+	}
+	if err := oprot.WriteFieldEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 6:server: ", p), err)
+	}
+	return err
+}
+
+func (p *BatchGetResponse) String() string {
+	if p == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("BatchGetResponse(%+v)", *p)
+}
+
+// Attributes:
+//   - Key
+//   - Increment
+//   - ExpireTsSeconds
 type IncrRequest struct {
 	Key             *base.Blob `thrift:"key,1" db:"key" json:"key"`
 	Increment       int64      `thrift:"increment,2" db:"increment" json:"increment"`
@@ -3500,12 +4314,12 @@ func (p *IncrRequest) String() string {
 }
 
 // Attributes:
-//  - Error
-//  - NewValue_
-//  - AppID
-//  - PartitionIndex
-//  - Decree
-//  - Server
+//   - Error
+//   - NewValue_
+//   - AppID
+//   - PartitionIndex
+//   - Decree
+//   - Server
 type IncrResponse struct {
 	Error          int32  `thrift:"error,1" db:"error" json:"error"`
 	NewValue_      int64  `thrift:"new_value,2" db:"new_value" json:"new_value"`
@@ -3804,15 +4618,15 @@ func (p *IncrResponse) String() string {
 }
 
 // Attributes:
-//  - HashKey
-//  - CheckSortKey
-//  - CheckType
-//  - CheckOperand
-//  - SetDiffSortKey
-//  - SetSortKey
-//  - SetValue
-//  - SetExpireTsSeconds
-//  - ReturnCheckValue
+//   - HashKey
+//   - CheckSortKey
+//   - CheckType
+//   - CheckOperand
+//   - SetDiffSortKey
+//   - SetSortKey
+//   - SetValue
+//   - SetExpireTsSeconds
+//   - ReturnCheckValue
 type CheckAndSetRequest struct {
 	HashKey            *base.Blob   `thrift:"hash_key,1" db:"hash_key" json:"hash_key"`
 	CheckSortKey       *base.Blob   `thrift:"check_sort_key,2" db:"check_sort_key" json:"check_sort_key"`
@@ -4272,14 +5086,14 @@ func (p *CheckAndSetRequest) String() string {
 }
 
 // Attributes:
-//  - Error
-//  - CheckValueReturned
-//  - CheckValueExist
-//  - CheckValue
-//  - AppID
-//  - PartitionIndex
-//  - Decree
-//  - Server
+//   - Error
+//   - CheckValueReturned
+//   - CheckValueExist
+//   - CheckValue
+//   - AppID
+//   - PartitionIndex
+//   - Decree
+//   - Server
 type CheckAndSetResponse struct {
 	Error              int32      `thrift:"error,1" db:"error" json:"error"`
 	CheckValueReturned bool       `thrift:"check_value_returned,2" db:"check_value_returned" json:"check_value_returned"`
@@ -4666,10 +5480,10 @@ func (p *CheckAndSetResponse) String() string {
 }
 
 // Attributes:
-//  - Operation
-//  - SortKey
-//  - Value
-//  - SetExpireTsSeconds
+//   - Operation
+//   - SortKey
+//   - Value
+//   - SetExpireTsSeconds
 type Mutate struct {
 	Operation          MutateOperation `thrift:"operation,1" db:"operation" json:"operation"`
 	SortKey            *base.Blob      `thrift:"sort_key,2" db:"sort_key" json:"sort_key"`
@@ -4905,12 +5719,12 @@ func (p *Mutate) String() string {
 }
 
 // Attributes:
-//  - HashKey
-//  - CheckSortKey
-//  - CheckType
-//  - CheckOperand
-//  - MutateList
-//  - ReturnCheckValue
+//   - HashKey
+//   - CheckSortKey
+//   - CheckType
+//   - CheckOperand
+//   - MutateList
+//   - ReturnCheckValue
 type CheckAndMutateRequest struct {
 	HashKey          *base.Blob   `thrift:"hash_key,1" db:"hash_key" json:"hash_key"`
 	CheckSortKey     *base.Blob   `thrift:"check_sort_key,2" db:"check_sort_key" json:"check_sort_key"`
@@ -5105,11 +5919,11 @@ func (p *CheckAndMutateRequest) ReadField5(iprot thrift.TProtocol) error {
 	tSlice := make([]*Mutate, 0, size)
 	p.MutateList = tSlice
 	for i := 0; i < size; i++ {
-		_elem4 := &Mutate{}
-		if err := _elem4.Read(iprot); err != nil {
-			return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", _elem4), err)
+		_elem6 := &Mutate{}
+		if err := _elem6.Read(iprot); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", _elem6), err)
 		}
-		p.MutateList = append(p.MutateList, _elem4)
+		p.MutateList = append(p.MutateList, _elem6)
 	}
 	if err := iprot.ReadListEnd(); err != nil {
 		return thrift.PrependError("error reading list end: ", err)
@@ -5253,14 +6067,14 @@ func (p *CheckAndMutateRequest) String() string {
 }
 
 // Attributes:
-//  - Error
-//  - CheckValueReturned
-//  - CheckValueExist
-//  - CheckValue
-//  - AppID
-//  - PartitionIndex
-//  - Decree
-//  - Server
+//   - Error
+//   - CheckValueReturned
+//   - CheckValueExist
+//   - CheckValue
+//   - AppID
+//   - PartitionIndex
+//   - Decree
+//   - Server
 type CheckAndMutateResponse struct {
 	Error              int32      `thrift:"error,1" db:"error" json:"error"`
 	CheckValueReturned bool       `thrift:"check_value_returned,2" db:"check_value_returned" json:"check_value_returned"`
@@ -5647,29 +6461,35 @@ func (p *CheckAndMutateResponse) String() string {
 }
 
 // Attributes:
-//  - StartKey
-//  - StopKey
-//  - StartInclusive
-//  - StopInclusive
-//  - BatchSize
-//  - NoValue
-//  - HashKeyFilterType
-//  - HashKeyFilterPattern
-//  - SortKeyFilterType
-//  - SortKeyFilterPattern
-//  - NeedCheckHash
+//   - StartKey
+//   - StopKey
+//   - StartInclusive
+//   - StopInclusive
+//   - BatchSize
+//   - NoValue
+//   - HashKeyFilterType
+//   - HashKeyFilterPattern
+//   - SortKeyFilterType
+//   - SortKeyFilterPattern
+//   - ValidatePartitionHash
+//   - ReturnExpireTs
+//   - FullScan
+//   - OnlyReturnCount
 type GetScannerRequest struct {
-	StartKey             *base.Blob `thrift:"start_key,1" db:"start_key" json:"start_key"`
-	StopKey              *base.Blob `thrift:"stop_key,2" db:"stop_key" json:"stop_key"`
-	StartInclusive       bool       `thrift:"start_inclusive,3" db:"start_inclusive" json:"start_inclusive"`
-	StopInclusive        bool       `thrift:"stop_inclusive,4" db:"stop_inclusive" json:"stop_inclusive"`
-	BatchSize            int32      `thrift:"batch_size,5" db:"batch_size" json:"batch_size"`
-	NoValue              bool       `thrift:"no_value,6" db:"no_value" json:"no_value"`
-	HashKeyFilterType    FilterType `thrift:"hash_key_filter_type,7" db:"hash_key_filter_type" json:"hash_key_filter_type"`
-	HashKeyFilterPattern *base.Blob `thrift:"hash_key_filter_pattern,8" db:"hash_key_filter_pattern" json:"hash_key_filter_pattern"`
-	SortKeyFilterType    FilterType `thrift:"sort_key_filter_type,9" db:"sort_key_filter_type" json:"sort_key_filter_type"`
-	SortKeyFilterPattern *base.Blob `thrift:"sort_key_filter_pattern,10" db:"sort_key_filter_pattern" json:"sort_key_filter_pattern"`
-	NeedCheckHash        *bool      `thrift:"need_check_hash,11" db:"need_check_hash" json:"need_check_hash,omitempty"`
+	StartKey              *base.Blob `thrift:"start_key,1" db:"start_key" json:"start_key"`
+	StopKey               *base.Blob `thrift:"stop_key,2" db:"stop_key" json:"stop_key"`
+	StartInclusive        bool       `thrift:"start_inclusive,3" db:"start_inclusive" json:"start_inclusive"`
+	StopInclusive         bool       `thrift:"stop_inclusive,4" db:"stop_inclusive" json:"stop_inclusive"`
+	BatchSize             int32      `thrift:"batch_size,5" db:"batch_size" json:"batch_size"`
+	NoValue               bool       `thrift:"no_value,6" db:"no_value" json:"no_value"`
+	HashKeyFilterType     FilterType `thrift:"hash_key_filter_type,7" db:"hash_key_filter_type" json:"hash_key_filter_type"`
+	HashKeyFilterPattern  *base.Blob `thrift:"hash_key_filter_pattern,8" db:"hash_key_filter_pattern" json:"hash_key_filter_pattern"`
+	SortKeyFilterType     FilterType `thrift:"sort_key_filter_type,9" db:"sort_key_filter_type" json:"sort_key_filter_type"`
+	SortKeyFilterPattern  *base.Blob `thrift:"sort_key_filter_pattern,10" db:"sort_key_filter_pattern" json:"sort_key_filter_pattern"`
+	ValidatePartitionHash *bool      `thrift:"validate_partition_hash,11" db:"validate_partition_hash" json:"validate_partition_hash,omitempty"`
+	ReturnExpireTs        *bool      `thrift:"return_expire_ts,12" db:"return_expire_ts" json:"return_expire_ts,omitempty"`
+	FullScan              *bool      `thrift:"full_scan,13" db:"full_scan" json:"full_scan,omitempty"`
+	OnlyReturnCount       bool       `thrift:"only_return_count,14" db:"only_return_count" json:"only_return_count"`
 }
 
 func NewGetScannerRequest() *GetScannerRequest {
@@ -5736,13 +6556,37 @@ func (p *GetScannerRequest) GetSortKeyFilterPattern() *base.Blob {
 	return p.SortKeyFilterPattern
 }
 
-var GetScannerRequest_NeedCheckHash_DEFAULT bool
+var GetScannerRequest_ValidatePartitionHash_DEFAULT bool
 
-func (p *GetScannerRequest) GetNeedCheckHash() bool {
-	if !p.IsSetNeedCheckHash() {
-		return GetScannerRequest_NeedCheckHash_DEFAULT
+func (p *GetScannerRequest) GetValidatePartitionHash() bool {
+	if !p.IsSetValidatePartitionHash() {
+		return GetScannerRequest_ValidatePartitionHash_DEFAULT
 	}
-	return *p.NeedCheckHash
+	return *p.ValidatePartitionHash
+}
+
+var GetScannerRequest_ReturnExpireTs_DEFAULT bool
+
+func (p *GetScannerRequest) GetReturnExpireTs() bool {
+	if !p.IsSetReturnExpireTs() {
+		return GetScannerRequest_ReturnExpireTs_DEFAULT
+	}
+	return *p.ReturnExpireTs
+}
+
+var GetScannerRequest_FullScan_DEFAULT bool
+
+func (p *GetScannerRequest) GetFullScan() bool {
+	if !p.IsSetFullScan() {
+		return GetScannerRequest_FullScan_DEFAULT
+	}
+	return *p.FullScan
+}
+
+var GetScannerRequest_OnlyReturnCount_DEFAULT bool = false
+
+func (p *GetScannerRequest) GetOnlyReturnCount() bool {
+	return p.OnlyReturnCount
 }
 func (p *GetScannerRequest) IsSetStartKey() bool {
 	return p.StartKey != nil
@@ -5760,8 +6604,20 @@ func (p *GetScannerRequest) IsSetSortKeyFilterPattern() bool {
 	return p.SortKeyFilterPattern != nil
 }
 
-func (p *GetScannerRequest) IsSetNeedCheckHash() bool {
-	return p.NeedCheckHash != nil
+func (p *GetScannerRequest) IsSetValidatePartitionHash() bool {
+	return p.ValidatePartitionHash != nil
+}
+
+func (p *GetScannerRequest) IsSetReturnExpireTs() bool {
+	return p.ReturnExpireTs != nil
+}
+
+func (p *GetScannerRequest) IsSetFullScan() bool {
+	return p.FullScan != nil
+}
+
+func (p *GetScannerRequest) IsSetOnlyReturnCount() bool {
+	return p.OnlyReturnCount != GetScannerRequest_OnlyReturnCount_DEFAULT
 }
 
 func (p *GetScannerRequest) Read(iprot thrift.TProtocol) error {
@@ -5888,6 +6744,36 @@ func (p *GetScannerRequest) Read(iprot thrift.TProtocol) error {
 					return err
 				}
 			}
+		case 12:
+			if fieldTypeId == thrift.BOOL {
+				if err := p.ReadField12(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		case 13:
+			if fieldTypeId == thrift.BOOL {
+				if err := p.ReadField13(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		case 14:
+			if fieldTypeId == thrift.BOOL {
+				if err := p.ReadField14(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
 		default:
 			if err := iprot.Skip(fieldTypeId); err != nil {
 				return err
@@ -5995,7 +6881,34 @@ func (p *GetScannerRequest) ReadField11(iprot thrift.TProtocol) error {
 	if v, err := iprot.ReadBool(); err != nil {
 		return thrift.PrependError("error reading field 11: ", err)
 	} else {
-		p.NeedCheckHash = &v
+		p.ValidatePartitionHash = &v
+	}
+	return nil
+}
+
+func (p *GetScannerRequest) ReadField12(iprot thrift.TProtocol) error {
+	if v, err := iprot.ReadBool(); err != nil {
+		return thrift.PrependError("error reading field 12: ", err)
+	} else {
+		p.ReturnExpireTs = &v
+	}
+	return nil
+}
+
+func (p *GetScannerRequest) ReadField13(iprot thrift.TProtocol) error {
+	if v, err := iprot.ReadBool(); err != nil {
+		return thrift.PrependError("error reading field 13: ", err)
+	} else {
+		p.FullScan = &v
+	}
+	return nil
+}
+
+func (p *GetScannerRequest) ReadField14(iprot thrift.TProtocol) error {
+	if v, err := iprot.ReadBool(); err != nil {
+		return thrift.PrependError("error reading field 14: ", err)
+	} else {
+		p.OnlyReturnCount = v
 	}
 	return nil
 }
@@ -6036,6 +6949,15 @@ func (p *GetScannerRequest) Write(oprot thrift.TProtocol) error {
 			return err
 		}
 		if err := p.writeField11(oprot); err != nil {
+			return err
+		}
+		if err := p.writeField12(oprot); err != nil {
+			return err
+		}
+		if err := p.writeField13(oprot); err != nil {
+			return err
+		}
+		if err := p.writeField14(oprot); err != nil {
 			return err
 		}
 	}
@@ -6179,15 +7101,60 @@ func (p *GetScannerRequest) writeField10(oprot thrift.TProtocol) (err error) {
 }
 
 func (p *GetScannerRequest) writeField11(oprot thrift.TProtocol) (err error) {
-	if p.IsSetNeedCheckHash() {
-		if err := oprot.WriteFieldBegin("need_check_hash", thrift.BOOL, 11); err != nil {
-			return thrift.PrependError(fmt.Sprintf("%T write field begin error 11:need_check_hash: ", p), err)
+	if p.IsSetValidatePartitionHash() {
+		if err := oprot.WriteFieldBegin("validate_partition_hash", thrift.BOOL, 11); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field begin error 11:validate_partition_hash: ", p), err)
 		}
-		if err := oprot.WriteBool(bool(*p.NeedCheckHash)); err != nil {
-			return thrift.PrependError(fmt.Sprintf("%T.need_check_hash (11) field write error: ", p), err)
+		if err := oprot.WriteBool(bool(*p.ValidatePartitionHash)); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T.validate_partition_hash (11) field write error: ", p), err)
 		}
 		if err := oprot.WriteFieldEnd(); err != nil {
-			return thrift.PrependError(fmt.Sprintf("%T write field end error 11:need_check_hash: ", p), err)
+			return thrift.PrependError(fmt.Sprintf("%T write field end error 11:validate_partition_hash: ", p), err)
+		}
+	}
+	return err
+}
+
+func (p *GetScannerRequest) writeField12(oprot thrift.TProtocol) (err error) {
+	if p.IsSetReturnExpireTs() {
+		if err := oprot.WriteFieldBegin("return_expire_ts", thrift.BOOL, 12); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field begin error 12:return_expire_ts: ", p), err)
+		}
+		if err := oprot.WriteBool(bool(*p.ReturnExpireTs)); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T.return_expire_ts (12) field write error: ", p), err)
+		}
+		if err := oprot.WriteFieldEnd(); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field end error 12:return_expire_ts: ", p), err)
+		}
+	}
+	return err
+}
+
+func (p *GetScannerRequest) writeField13(oprot thrift.TProtocol) (err error) {
+	if p.IsSetFullScan() {
+		if err := oprot.WriteFieldBegin("full_scan", thrift.BOOL, 13); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field begin error 13:full_scan: ", p), err)
+		}
+		if err := oprot.WriteBool(bool(*p.FullScan)); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T.full_scan (13) field write error: ", p), err)
+		}
+		if err := oprot.WriteFieldEnd(); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field end error 13:full_scan: ", p), err)
+		}
+	}
+	return err
+}
+
+func (p *GetScannerRequest) writeField14(oprot thrift.TProtocol) (err error) {
+	if p.IsSetOnlyReturnCount() {
+		if err := oprot.WriteFieldBegin("only_return_count", thrift.BOOL, 14); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field begin error 14:only_return_count: ", p), err)
+		}
+		if err := oprot.WriteBool(bool(p.OnlyReturnCount)); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T.only_return_count (14) field write error: ", p), err)
+		}
+		if err := oprot.WriteFieldEnd(); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field end error 14:only_return_count: ", p), err)
 		}
 	}
 	return err
@@ -6201,7 +7168,7 @@ func (p *GetScannerRequest) String() string {
 }
 
 // Attributes:
-//  - ContextID
+//   - ContextID
 type ScanRequest struct {
 	ContextID int64 `thrift:"context_id,1" db:"context_id" json:"context_id"`
 }
@@ -6300,12 +7267,13 @@ func (p *ScanRequest) String() string {
 }
 
 // Attributes:
-//  - Error
-//  - Kvs
-//  - ContextID
-//  - AppID
-//  - PartitionIndex
-//  - Server
+//   - Error
+//   - Kvs
+//   - ContextID
+//   - AppID
+//   - PartitionIndex
+//   - Server
+//   - KvCount
 type ScanResponse struct {
 	Error          int32       `thrift:"error,1" db:"error" json:"error"`
 	Kvs            []*KeyValue `thrift:"kvs,2" db:"kvs" json:"kvs"`
@@ -6313,6 +7281,7 @@ type ScanResponse struct {
 	AppID          int32       `thrift:"app_id,4" db:"app_id" json:"app_id"`
 	PartitionIndex int32       `thrift:"partition_index,5" db:"partition_index" json:"partition_index"`
 	Server         string      `thrift:"server,6" db:"server" json:"server"`
+	KvCount        *int32      `thrift:"kv_count,7" db:"kv_count" json:"kv_count,omitempty"`
 }
 
 func NewScanResponse() *ScanResponse {
@@ -6342,6 +7311,19 @@ func (p *ScanResponse) GetPartitionIndex() int32 {
 func (p *ScanResponse) GetServer() string {
 	return p.Server
 }
+
+var ScanResponse_KvCount_DEFAULT int32
+
+func (p *ScanResponse) GetKvCount() int32 {
+	if !p.IsSetKvCount() {
+		return ScanResponse_KvCount_DEFAULT
+	}
+	return *p.KvCount
+}
+func (p *ScanResponse) IsSetKvCount() bool {
+	return p.KvCount != nil
+}
+
 func (p *ScanResponse) Read(iprot thrift.TProtocol) error {
 	if _, err := iprot.ReadStructBegin(); err != nil {
 		return thrift.PrependError(fmt.Sprintf("%T read error: ", p), err)
@@ -6416,6 +7398,16 @@ func (p *ScanResponse) Read(iprot thrift.TProtocol) error {
 					return err
 				}
 			}
+		case 7:
+			if fieldTypeId == thrift.I32 {
+				if err := p.ReadField7(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
 		default:
 			if err := iprot.Skip(fieldTypeId); err != nil {
 				return err
@@ -6448,11 +7440,11 @@ func (p *ScanResponse) ReadField2(iprot thrift.TProtocol) error {
 	tSlice := make([]*KeyValue, 0, size)
 	p.Kvs = tSlice
 	for i := 0; i < size; i++ {
-		_elem5 := &KeyValue{}
-		if err := _elem5.Read(iprot); err != nil {
-			return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", _elem5), err)
+		_elem7 := &KeyValue{}
+		if err := _elem7.Read(iprot); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", _elem7), err)
 		}
-		p.Kvs = append(p.Kvs, _elem5)
+		p.Kvs = append(p.Kvs, _elem7)
 	}
 	if err := iprot.ReadListEnd(); err != nil {
 		return thrift.PrependError("error reading list end: ", err)
@@ -6496,6 +7488,15 @@ func (p *ScanResponse) ReadField6(iprot thrift.TProtocol) error {
 	return nil
 }
 
+func (p *ScanResponse) ReadField7(iprot thrift.TProtocol) error {
+	if v, err := iprot.ReadI32(); err != nil {
+		return thrift.PrependError("error reading field 7: ", err)
+	} else {
+		p.KvCount = &v
+	}
+	return nil
+}
+
 func (p *ScanResponse) Write(oprot thrift.TProtocol) error {
 	if err := oprot.WriteStructBegin("scan_response"); err != nil {
 		return thrift.PrependError(fmt.Sprintf("%T write struct begin error: ", p), err)
@@ -6517,6 +7518,9 @@ func (p *ScanResponse) Write(oprot thrift.TProtocol) error {
 			return err
 		}
 		if err := p.writeField6(oprot); err != nil {
+			return err
+		}
+		if err := p.writeField7(oprot); err != nil {
 			return err
 		}
 	}
@@ -6615,6 +7619,21 @@ func (p *ScanResponse) writeField6(oprot thrift.TProtocol) (err error) {
 	return err
 }
 
+func (p *ScanResponse) writeField7(oprot thrift.TProtocol) (err error) {
+	if p.IsSetKvCount() {
+		if err := oprot.WriteFieldBegin("kv_count", thrift.I32, 7); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field begin error 7:kv_count: ", p), err)
+		}
+		if err := oprot.WriteI32(int32(*p.KvCount)); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T.kv_count (7) field write error: ", p), err)
+		}
+		if err := oprot.WriteFieldEnd(); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field end error 7:kv_count: ", p), err)
+		}
+	}
+	return err
+}
+
 func (p *ScanResponse) String() string {
 	if p == nil {
 		return "<nil>"
@@ -6650,6 +7669,9 @@ type Rrdb interface {
 	// Parameters:
 	//  - Request
 	MultiGet(ctx context.Context, request *MultiGetRequest) (r *MultiGetResponse, err error)
+	// Parameters:
+	//  - Request
+	BatchGet(ctx context.Context, request *BatchGetRequest) (r *BatchGetResponse, err error)
 	// Parameters:
 	//  - HashKey
 	SortkeyCount(ctx context.Context, hash_key *base.Blob) (r *CountResponse, err error)
@@ -6694,167 +7716,179 @@ func (p *RrdbClient) Client_() thrift.TClient {
 }
 
 // Parameters:
-//  - Update
+//   - Update
 func (p *RrdbClient) Put(ctx context.Context, update *UpdateRequest) (r *UpdateResponse, err error) {
-	var _args6 RrdbPutArgs
-	_args6.Update = update
-	var _result7 RrdbPutResult
-	if err = p.Client_().Call(ctx, "put", &_args6, &_result7); err != nil {
-		return
-	}
-	return _result7.GetSuccess(), nil
-}
-
-// Parameters:
-//  - Request
-func (p *RrdbClient) MultiPut(ctx context.Context, request *MultiPutRequest) (r *UpdateResponse, err error) {
-	var _args8 RrdbMultiPutArgs
-	_args8.Request = request
-	var _result9 RrdbMultiPutResult
-	if err = p.Client_().Call(ctx, "multi_put", &_args8, &_result9); err != nil {
+	var _args8 RrdbPutArgs
+	_args8.Update = update
+	var _result9 RrdbPutResult
+	if err = p.Client_().Call(ctx, "put", &_args8, &_result9); err != nil {
 		return
 	}
 	return _result9.GetSuccess(), nil
 }
 
 // Parameters:
-//  - Key
-func (p *RrdbClient) Remove(ctx context.Context, key *base.Blob) (r *UpdateResponse, err error) {
-	var _args10 RrdbRemoveArgs
-	_args10.Key = key
-	var _result11 RrdbRemoveResult
-	if err = p.Client_().Call(ctx, "remove", &_args10, &_result11); err != nil {
+//   - Request
+func (p *RrdbClient) MultiPut(ctx context.Context, request *MultiPutRequest) (r *UpdateResponse, err error) {
+	var _args10 RrdbMultiPutArgs
+	_args10.Request = request
+	var _result11 RrdbMultiPutResult
+	if err = p.Client_().Call(ctx, "multi_put", &_args10, &_result11); err != nil {
 		return
 	}
 	return _result11.GetSuccess(), nil
 }
 
 // Parameters:
-//  - Request
-func (p *RrdbClient) MultiRemove(ctx context.Context, request *MultiRemoveRequest) (r *MultiRemoveResponse, err error) {
-	var _args12 RrdbMultiRemoveArgs
-	_args12.Request = request
-	var _result13 RrdbMultiRemoveResult
-	if err = p.Client_().Call(ctx, "multi_remove", &_args12, &_result13); err != nil {
+//   - Key
+func (p *RrdbClient) Remove(ctx context.Context, key *base.Blob) (r *UpdateResponse, err error) {
+	var _args12 RrdbRemoveArgs
+	_args12.Key = key
+	var _result13 RrdbRemoveResult
+	if err = p.Client_().Call(ctx, "remove", &_args12, &_result13); err != nil {
 		return
 	}
 	return _result13.GetSuccess(), nil
 }
 
 // Parameters:
-//  - Request
-func (p *RrdbClient) Incr(ctx context.Context, request *IncrRequest) (r *IncrResponse, err error) {
-	var _args14 RrdbIncrArgs
+//   - Request
+func (p *RrdbClient) MultiRemove(ctx context.Context, request *MultiRemoveRequest) (r *MultiRemoveResponse, err error) {
+	var _args14 RrdbMultiRemoveArgs
 	_args14.Request = request
-	var _result15 RrdbIncrResult
-	if err = p.Client_().Call(ctx, "incr", &_args14, &_result15); err != nil {
+	var _result15 RrdbMultiRemoveResult
+	if err = p.Client_().Call(ctx, "multi_remove", &_args14, &_result15); err != nil {
 		return
 	}
 	return _result15.GetSuccess(), nil
 }
 
 // Parameters:
-//  - Request
-func (p *RrdbClient) CheckAndSet(ctx context.Context, request *CheckAndSetRequest) (r *CheckAndSetResponse, err error) {
-	var _args16 RrdbCheckAndSetArgs
+//   - Request
+func (p *RrdbClient) Incr(ctx context.Context, request *IncrRequest) (r *IncrResponse, err error) {
+	var _args16 RrdbIncrArgs
 	_args16.Request = request
-	var _result17 RrdbCheckAndSetResult
-	if err = p.Client_().Call(ctx, "check_and_set", &_args16, &_result17); err != nil {
+	var _result17 RrdbIncrResult
+	if err = p.Client_().Call(ctx, "incr", &_args16, &_result17); err != nil {
 		return
 	}
 	return _result17.GetSuccess(), nil
 }
 
 // Parameters:
-//  - Request
-func (p *RrdbClient) CheckAndMutate(ctx context.Context, request *CheckAndMutateRequest) (r *CheckAndMutateResponse, err error) {
-	var _args18 RrdbCheckAndMutateArgs
+//   - Request
+func (p *RrdbClient) CheckAndSet(ctx context.Context, request *CheckAndSetRequest) (r *CheckAndSetResponse, err error) {
+	var _args18 RrdbCheckAndSetArgs
 	_args18.Request = request
-	var _result19 RrdbCheckAndMutateResult
-	if err = p.Client_().Call(ctx, "check_and_mutate", &_args18, &_result19); err != nil {
+	var _result19 RrdbCheckAndSetResult
+	if err = p.Client_().Call(ctx, "check_and_set", &_args18, &_result19); err != nil {
 		return
 	}
 	return _result19.GetSuccess(), nil
 }
 
 // Parameters:
-//  - Key
-func (p *RrdbClient) Get(ctx context.Context, key *base.Blob) (r *ReadResponse, err error) {
-	var _args20 RrdbGetArgs
-	_args20.Key = key
-	var _result21 RrdbGetResult
-	if err = p.Client_().Call(ctx, "get", &_args20, &_result21); err != nil {
+//   - Request
+func (p *RrdbClient) CheckAndMutate(ctx context.Context, request *CheckAndMutateRequest) (r *CheckAndMutateResponse, err error) {
+	var _args20 RrdbCheckAndMutateArgs
+	_args20.Request = request
+	var _result21 RrdbCheckAndMutateResult
+	if err = p.Client_().Call(ctx, "check_and_mutate", &_args20, &_result21); err != nil {
 		return
 	}
 	return _result21.GetSuccess(), nil
 }
 
 // Parameters:
-//  - Request
-func (p *RrdbClient) MultiGet(ctx context.Context, request *MultiGetRequest) (r *MultiGetResponse, err error) {
-	var _args22 RrdbMultiGetArgs
-	_args22.Request = request
-	var _result23 RrdbMultiGetResult
-	if err = p.Client_().Call(ctx, "multi_get", &_args22, &_result23); err != nil {
+//   - Key
+func (p *RrdbClient) Get(ctx context.Context, key *base.Blob) (r *ReadResponse, err error) {
+	var _args22 RrdbGetArgs
+	_args22.Key = key
+	var _result23 RrdbGetResult
+	if err = p.Client_().Call(ctx, "get", &_args22, &_result23); err != nil {
 		return
 	}
 	return _result23.GetSuccess(), nil
 }
 
 // Parameters:
-//  - HashKey
-func (p *RrdbClient) SortkeyCount(ctx context.Context, hash_key *base.Blob) (r *CountResponse, err error) {
-	var _args24 RrdbSortkeyCountArgs
-	_args24.HashKey = hash_key
-	var _result25 RrdbSortkeyCountResult
-	if err = p.Client_().Call(ctx, "sortkey_count", &_args24, &_result25); err != nil {
+//   - Request
+func (p *RrdbClient) MultiGet(ctx context.Context, request *MultiGetRequest) (r *MultiGetResponse, err error) {
+	var _args24 RrdbMultiGetArgs
+	_args24.Request = request
+	var _result25 RrdbMultiGetResult
+	if err = p.Client_().Call(ctx, "multi_get", &_args24, &_result25); err != nil {
 		return
 	}
 	return _result25.GetSuccess(), nil
 }
 
 // Parameters:
-//  - Key
-func (p *RrdbClient) TTL(ctx context.Context, key *base.Blob) (r *TTLResponse, err error) {
-	var _args26 RrdbTTLArgs
-	_args26.Key = key
-	var _result27 RrdbTTLResult
-	if err = p.Client_().Call(ctx, "ttl", &_args26, &_result27); err != nil {
+//   - Request
+func (p *RrdbClient) BatchGet(ctx context.Context, request *BatchGetRequest) (r *BatchGetResponse, err error) {
+	var _args26 RrdbBatchGetArgs
+	_args26.Request = request
+	var _result27 RrdbBatchGetResult
+	if err = p.Client_().Call(ctx, "batch_get", &_args26, &_result27); err != nil {
 		return
 	}
 	return _result27.GetSuccess(), nil
 }
 
 // Parameters:
-//  - Request
-func (p *RrdbClient) GetScanner(ctx context.Context, request *GetScannerRequest) (r *ScanResponse, err error) {
-	var _args28 RrdbGetScannerArgs
-	_args28.Request = request
-	var _result29 RrdbGetScannerResult
-	if err = p.Client_().Call(ctx, "get_scanner", &_args28, &_result29); err != nil {
+//   - HashKey
+func (p *RrdbClient) SortkeyCount(ctx context.Context, hash_key *base.Blob) (r *CountResponse, err error) {
+	var _args28 RrdbSortkeyCountArgs
+	_args28.HashKey = hash_key
+	var _result29 RrdbSortkeyCountResult
+	if err = p.Client_().Call(ctx, "sortkey_count", &_args28, &_result29); err != nil {
 		return
 	}
 	return _result29.GetSuccess(), nil
 }
 
 // Parameters:
-//  - Request
-func (p *RrdbClient) Scan(ctx context.Context, request *ScanRequest) (r *ScanResponse, err error) {
-	var _args30 RrdbScanArgs
-	_args30.Request = request
-	var _result31 RrdbScanResult
-	if err = p.Client_().Call(ctx, "scan", &_args30, &_result31); err != nil {
+//   - Key
+func (p *RrdbClient) TTL(ctx context.Context, key *base.Blob) (r *TTLResponse, err error) {
+	var _args30 RrdbTTLArgs
+	_args30.Key = key
+	var _result31 RrdbTTLResult
+	if err = p.Client_().Call(ctx, "ttl", &_args30, &_result31); err != nil {
 		return
 	}
 	return _result31.GetSuccess(), nil
 }
 
 // Parameters:
-//  - ContextID
+//   - Request
+func (p *RrdbClient) GetScanner(ctx context.Context, request *GetScannerRequest) (r *ScanResponse, err error) {
+	var _args32 RrdbGetScannerArgs
+	_args32.Request = request
+	var _result33 RrdbGetScannerResult
+	if err = p.Client_().Call(ctx, "get_scanner", &_args32, &_result33); err != nil {
+		return
+	}
+	return _result33.GetSuccess(), nil
+}
+
+// Parameters:
+//   - Request
+func (p *RrdbClient) Scan(ctx context.Context, request *ScanRequest) (r *ScanResponse, err error) {
+	var _args34 RrdbScanArgs
+	_args34.Request = request
+	var _result35 RrdbScanResult
+	if err = p.Client_().Call(ctx, "scan", &_args34, &_result35); err != nil {
+		return
+	}
+	return _result35.GetSuccess(), nil
+}
+
+// Parameters:
+//   - ContextID
 func (p *RrdbClient) ClearScanner(ctx context.Context, context_id int64) (err error) {
-	var _args32 RrdbClearScannerArgs
-	_args32.ContextID = context_id
-	if err := p.Client_().Call(ctx, "clear_scanner", &_args32, nil); err != nil {
+	var _args36 RrdbClearScannerArgs
+	_args36.ContextID = context_id
+	if err := p.Client_().Call(ctx, "clear_scanner", &_args36, nil); err != nil {
 		return err
 	}
 	return nil
@@ -6880,22 +7914,23 @@ func (p *RrdbProcessor) ProcessorMap() map[string]thrift.TProcessorFunction {
 
 func NewRrdbProcessor(handler Rrdb) *RrdbProcessor {
 
-	self33 := &RrdbProcessor{handler: handler, processorMap: make(map[string]thrift.TProcessorFunction)}
-	self33.processorMap["put"] = &rrdbProcessorPut{handler: handler}
-	self33.processorMap["multi_put"] = &rrdbProcessorMultiPut{handler: handler}
-	self33.processorMap["remove"] = &rrdbProcessorRemove{handler: handler}
-	self33.processorMap["multi_remove"] = &rrdbProcessorMultiRemove{handler: handler}
-	self33.processorMap["incr"] = &rrdbProcessorIncr{handler: handler}
-	self33.processorMap["check_and_set"] = &rrdbProcessorCheckAndSet{handler: handler}
-	self33.processorMap["check_and_mutate"] = &rrdbProcessorCheckAndMutate{handler: handler}
-	self33.processorMap["get"] = &rrdbProcessorGet{handler: handler}
-	self33.processorMap["multi_get"] = &rrdbProcessorMultiGet{handler: handler}
-	self33.processorMap["sortkey_count"] = &rrdbProcessorSortkeyCount{handler: handler}
-	self33.processorMap["ttl"] = &rrdbProcessorTTL{handler: handler}
-	self33.processorMap["get_scanner"] = &rrdbProcessorGetScanner{handler: handler}
-	self33.processorMap["scan"] = &rrdbProcessorScan{handler: handler}
-	self33.processorMap["clear_scanner"] = &rrdbProcessorClearScanner{handler: handler}
-	return self33
+	self37 := &RrdbProcessor{handler: handler, processorMap: make(map[string]thrift.TProcessorFunction)}
+	self37.processorMap["put"] = &rrdbProcessorPut{handler: handler}
+	self37.processorMap["multi_put"] = &rrdbProcessorMultiPut{handler: handler}
+	self37.processorMap["remove"] = &rrdbProcessorRemove{handler: handler}
+	self37.processorMap["multi_remove"] = &rrdbProcessorMultiRemove{handler: handler}
+	self37.processorMap["incr"] = &rrdbProcessorIncr{handler: handler}
+	self37.processorMap["check_and_set"] = &rrdbProcessorCheckAndSet{handler: handler}
+	self37.processorMap["check_and_mutate"] = &rrdbProcessorCheckAndMutate{handler: handler}
+	self37.processorMap["get"] = &rrdbProcessorGet{handler: handler}
+	self37.processorMap["multi_get"] = &rrdbProcessorMultiGet{handler: handler}
+	self37.processorMap["batch_get"] = &rrdbProcessorBatchGet{handler: handler}
+	self37.processorMap["sortkey_count"] = &rrdbProcessorSortkeyCount{handler: handler}
+	self37.processorMap["ttl"] = &rrdbProcessorTTL{handler: handler}
+	self37.processorMap["get_scanner"] = &rrdbProcessorGetScanner{handler: handler}
+	self37.processorMap["scan"] = &rrdbProcessorScan{handler: handler}
+	self37.processorMap["clear_scanner"] = &rrdbProcessorClearScanner{handler: handler}
+	return self37
 }
 
 func (p *RrdbProcessor) Process(ctx context.Context, iprot, oprot thrift.TProtocol) (success bool, err thrift.TException) {
@@ -6908,12 +7943,12 @@ func (p *RrdbProcessor) Process(ctx context.Context, iprot, oprot thrift.TProtoc
 	}
 	iprot.Skip(thrift.STRUCT)
 	iprot.ReadMessageEnd()
-	x34 := thrift.NewTApplicationException(thrift.UNKNOWN_METHOD, "Unknown function "+name)
+	x38 := thrift.NewTApplicationException(thrift.UNKNOWN_METHOD, "Unknown function "+name)
 	oprot.WriteMessageBegin(name, thrift.EXCEPTION, seqId)
-	x34.Write(oprot)
+	x38.Write(oprot)
 	oprot.WriteMessageEnd()
 	oprot.Flush(ctx)
-	return false, x34
+	return false, x38
 
 }
 
@@ -7349,6 +8384,54 @@ func (p *rrdbProcessorMultiGet) Process(ctx context.Context, seqId int32, iprot,
 	return true, err
 }
 
+type rrdbProcessorBatchGet struct {
+	handler Rrdb
+}
+
+func (p *rrdbProcessorBatchGet) Process(ctx context.Context, seqId int32, iprot, oprot thrift.TProtocol) (success bool, err thrift.TException) {
+	args := RrdbBatchGetArgs{}
+	if err = args.Read(iprot); err != nil {
+		iprot.ReadMessageEnd()
+		x := thrift.NewTApplicationException(thrift.PROTOCOL_ERROR, err.Error())
+		oprot.WriteMessageBegin("batch_get", thrift.EXCEPTION, seqId)
+		x.Write(oprot)
+		oprot.WriteMessageEnd()
+		oprot.Flush(ctx)
+		return false, err
+	}
+
+	iprot.ReadMessageEnd()
+	result := RrdbBatchGetResult{}
+	var retval *BatchGetResponse
+	var err2 error
+	if retval, err2 = p.handler.BatchGet(ctx, args.Request); err2 != nil {
+		x := thrift.NewTApplicationException(thrift.INTERNAL_ERROR, "Internal error processing batch_get: "+err2.Error())
+		oprot.WriteMessageBegin("batch_get", thrift.EXCEPTION, seqId)
+		x.Write(oprot)
+		oprot.WriteMessageEnd()
+		oprot.Flush(ctx)
+		return true, err2
+	} else {
+		result.Success = retval
+	}
+	if err2 = oprot.WriteMessageBegin("batch_get", thrift.REPLY, seqId); err2 != nil {
+		err = err2
+	}
+	if err2 = result.Write(oprot); err == nil && err2 != nil {
+		err = err2
+	}
+	if err2 = oprot.WriteMessageEnd(); err == nil && err2 != nil {
+		err = err2
+	}
+	if err2 = oprot.Flush(ctx); err == nil && err2 != nil {
+		err = err2
+	}
+	if err != nil {
+		return
+	}
+	return true, err
+}
+
 type rrdbProcessorSortkeyCount struct {
 	handler Rrdb
 }
@@ -7563,7 +8646,7 @@ func (p *rrdbProcessorClearScanner) Process(ctx context.Context, seqId int32, ip
 // HELPER FUNCTIONS AND STRUCTURES
 
 // Attributes:
-//  - Update
+//   - Update
 type RrdbPutArgs struct {
 	Update *UpdateRequest `thrift:"update,1" db:"update" json:"update"`
 }
@@ -7670,7 +8753,7 @@ func (p *RrdbPutArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbPutResult struct {
 	Success *UpdateResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -7779,7 +8862,7 @@ func (p *RrdbPutResult) String() string {
 }
 
 // Attributes:
-//  - Request
+//   - Request
 type RrdbMultiPutArgs struct {
 	Request *MultiPutRequest `thrift:"request,1" db:"request" json:"request"`
 }
@@ -7886,7 +8969,7 @@ func (p *RrdbMultiPutArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbMultiPutResult struct {
 	Success *UpdateResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -7995,7 +9078,7 @@ func (p *RrdbMultiPutResult) String() string {
 }
 
 // Attributes:
-//  - Key
+//   - Key
 type RrdbRemoveArgs struct {
 	Key *base.Blob `thrift:"key,1" db:"key" json:"key"`
 }
@@ -8102,7 +9185,7 @@ func (p *RrdbRemoveArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbRemoveResult struct {
 	Success *UpdateResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -8211,7 +9294,7 @@ func (p *RrdbRemoveResult) String() string {
 }
 
 // Attributes:
-//  - Request
+//   - Request
 type RrdbMultiRemoveArgs struct {
 	Request *MultiRemoveRequest `thrift:"request,1" db:"request" json:"request"`
 }
@@ -8318,7 +9401,7 @@ func (p *RrdbMultiRemoveArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbMultiRemoveResult struct {
 	Success *MultiRemoveResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -8427,7 +9510,7 @@ func (p *RrdbMultiRemoveResult) String() string {
 }
 
 // Attributes:
-//  - Request
+//   - Request
 type RrdbIncrArgs struct {
 	Request *IncrRequest `thrift:"request,1" db:"request" json:"request"`
 }
@@ -8534,7 +9617,7 @@ func (p *RrdbIncrArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbIncrResult struct {
 	Success *IncrResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -8643,7 +9726,7 @@ func (p *RrdbIncrResult) String() string {
 }
 
 // Attributes:
-//  - Request
+//   - Request
 type RrdbCheckAndSetArgs struct {
 	Request *CheckAndSetRequest `thrift:"request,1" db:"request" json:"request"`
 }
@@ -8750,7 +9833,7 @@ func (p *RrdbCheckAndSetArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbCheckAndSetResult struct {
 	Success *CheckAndSetResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -8859,7 +9942,7 @@ func (p *RrdbCheckAndSetResult) String() string {
 }
 
 // Attributes:
-//  - Request
+//   - Request
 type RrdbCheckAndMutateArgs struct {
 	Request *CheckAndMutateRequest `thrift:"request,1" db:"request" json:"request"`
 }
@@ -8966,7 +10049,7 @@ func (p *RrdbCheckAndMutateArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbCheckAndMutateResult struct {
 	Success *CheckAndMutateResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -9075,7 +10158,7 @@ func (p *RrdbCheckAndMutateResult) String() string {
 }
 
 // Attributes:
-//  - Key
+//   - Key
 type RrdbGetArgs struct {
 	Key *base.Blob `thrift:"key,1" db:"key" json:"key"`
 }
@@ -9182,7 +10265,7 @@ func (p *RrdbGetArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbGetResult struct {
 	Success *ReadResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -9291,7 +10374,7 @@ func (p *RrdbGetResult) String() string {
 }
 
 // Attributes:
-//  - Request
+//   - Request
 type RrdbMultiGetArgs struct {
 	Request *MultiGetRequest `thrift:"request,1" db:"request" json:"request"`
 }
@@ -9398,7 +10481,7 @@ func (p *RrdbMultiGetArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbMultiGetResult struct {
 	Success *MultiGetResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -9507,7 +10590,223 @@ func (p *RrdbMultiGetResult) String() string {
 }
 
 // Attributes:
-//  - HashKey
+//   - Request
+type RrdbBatchGetArgs struct {
+	Request *BatchGetRequest `thrift:"request,1" db:"request" json:"request"`
+}
+
+func NewRrdbBatchGetArgs() *RrdbBatchGetArgs {
+	return &RrdbBatchGetArgs{}
+}
+
+var RrdbBatchGetArgs_Request_DEFAULT *BatchGetRequest
+
+func (p *RrdbBatchGetArgs) GetRequest() *BatchGetRequest {
+	if !p.IsSetRequest() {
+		return RrdbBatchGetArgs_Request_DEFAULT
+	}
+	return p.Request
+}
+func (p *RrdbBatchGetArgs) IsSetRequest() bool {
+	return p.Request != nil
+}
+
+func (p *RrdbBatchGetArgs) Read(iprot thrift.TProtocol) error {
+	if _, err := iprot.ReadStructBegin(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T read error: ", p), err)
+	}
+
+	for {
+		_, fieldTypeId, fieldId, err := iprot.ReadFieldBegin()
+		if err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T field %d read error: ", p, fieldId), err)
+		}
+		if fieldTypeId == thrift.STOP {
+			break
+		}
+		switch fieldId {
+		case 1:
+			if fieldTypeId == thrift.STRUCT {
+				if err := p.ReadField1(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		default:
+			if err := iprot.Skip(fieldTypeId); err != nil {
+				return err
+			}
+		}
+		if err := iprot.ReadFieldEnd(); err != nil {
+			return err
+		}
+	}
+	if err := iprot.ReadStructEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T read struct end error: ", p), err)
+	}
+	return nil
+}
+
+func (p *RrdbBatchGetArgs) ReadField1(iprot thrift.TProtocol) error {
+	p.Request = &BatchGetRequest{}
+	if err := p.Request.Read(iprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", p.Request), err)
+	}
+	return nil
+}
+
+func (p *RrdbBatchGetArgs) Write(oprot thrift.TProtocol) error {
+	if err := oprot.WriteStructBegin("batch_get_args"); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write struct begin error: ", p), err)
+	}
+	if p != nil {
+		if err := p.writeField1(oprot); err != nil {
+			return err
+		}
+	}
+	if err := oprot.WriteFieldStop(); err != nil {
+		return thrift.PrependError("write field stop error: ", err)
+	}
+	if err := oprot.WriteStructEnd(); err != nil {
+		return thrift.PrependError("write struct stop error: ", err)
+	}
+	return nil
+}
+
+func (p *RrdbBatchGetArgs) writeField1(oprot thrift.TProtocol) (err error) {
+	if err := oprot.WriteFieldBegin("request", thrift.STRUCT, 1); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field begin error 1:request: ", p), err)
+	}
+	if err := p.Request.Write(oprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error writing struct: ", p.Request), err)
+	}
+	if err := oprot.WriteFieldEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write field end error 1:request: ", p), err)
+	}
+	return err
+}
+
+func (p *RrdbBatchGetArgs) String() string {
+	if p == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("RrdbBatchGetArgs(%+v)", *p)
+}
+
+// Attributes:
+//   - Success
+type RrdbBatchGetResult struct {
+	Success *BatchGetResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
+}
+
+func NewRrdbBatchGetResult() *RrdbBatchGetResult {
+	return &RrdbBatchGetResult{}
+}
+
+var RrdbBatchGetResult_Success_DEFAULT *BatchGetResponse
+
+func (p *RrdbBatchGetResult) GetSuccess() *BatchGetResponse {
+	if !p.IsSetSuccess() {
+		return RrdbBatchGetResult_Success_DEFAULT
+	}
+	return p.Success
+}
+func (p *RrdbBatchGetResult) IsSetSuccess() bool {
+	return p.Success != nil
+}
+
+func (p *RrdbBatchGetResult) Read(iprot thrift.TProtocol) error {
+	if _, err := iprot.ReadStructBegin(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T read error: ", p), err)
+	}
+
+	for {
+		_, fieldTypeId, fieldId, err := iprot.ReadFieldBegin()
+		if err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T field %d read error: ", p, fieldId), err)
+		}
+		if fieldTypeId == thrift.STOP {
+			break
+		}
+		switch fieldId {
+		case 0:
+			if fieldTypeId == thrift.STRUCT {
+				if err := p.ReadField0(iprot); err != nil {
+					return err
+				}
+			} else {
+				if err := iprot.Skip(fieldTypeId); err != nil {
+					return err
+				}
+			}
+		default:
+			if err := iprot.Skip(fieldTypeId); err != nil {
+				return err
+			}
+		}
+		if err := iprot.ReadFieldEnd(); err != nil {
+			return err
+		}
+	}
+	if err := iprot.ReadStructEnd(); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T read struct end error: ", p), err)
+	}
+	return nil
+}
+
+func (p *RrdbBatchGetResult) ReadField0(iprot thrift.TProtocol) error {
+	p.Success = &BatchGetResponse{}
+	if err := p.Success.Read(iprot); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T error reading struct: ", p.Success), err)
+	}
+	return nil
+}
+
+func (p *RrdbBatchGetResult) Write(oprot thrift.TProtocol) error {
+	if err := oprot.WriteStructBegin("batch_get_result"); err != nil {
+		return thrift.PrependError(fmt.Sprintf("%T write struct begin error: ", p), err)
+	}
+	if p != nil {
+		if err := p.writeField0(oprot); err != nil {
+			return err
+		}
+	}
+	if err := oprot.WriteFieldStop(); err != nil {
+		return thrift.PrependError("write field stop error: ", err)
+	}
+	if err := oprot.WriteStructEnd(); err != nil {
+		return thrift.PrependError("write struct stop error: ", err)
+	}
+	return nil
+}
+
+func (p *RrdbBatchGetResult) writeField0(oprot thrift.TProtocol) (err error) {
+	if p.IsSetSuccess() {
+		if err := oprot.WriteFieldBegin("success", thrift.STRUCT, 0); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field begin error 0:success: ", p), err)
+		}
+		if err := p.Success.Write(oprot); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T error writing struct: ", p.Success), err)
+		}
+		if err := oprot.WriteFieldEnd(); err != nil {
+			return thrift.PrependError(fmt.Sprintf("%T write field end error 0:success: ", p), err)
+		}
+	}
+	return err
+}
+
+func (p *RrdbBatchGetResult) String() string {
+	if p == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("RrdbBatchGetResult(%+v)", *p)
+}
+
+// Attributes:
+//   - HashKey
 type RrdbSortkeyCountArgs struct {
 	HashKey *base.Blob `thrift:"hash_key,1" db:"hash_key" json:"hash_key"`
 }
@@ -9614,7 +10913,7 @@ func (p *RrdbSortkeyCountArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbSortkeyCountResult struct {
 	Success *CountResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -9723,7 +11022,7 @@ func (p *RrdbSortkeyCountResult) String() string {
 }
 
 // Attributes:
-//  - Key
+//   - Key
 type RrdbTTLArgs struct {
 	Key *base.Blob `thrift:"key,1" db:"key" json:"key"`
 }
@@ -9830,7 +11129,7 @@ func (p *RrdbTTLArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbTTLResult struct {
 	Success *TTLResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -9939,7 +11238,7 @@ func (p *RrdbTTLResult) String() string {
 }
 
 // Attributes:
-//  - Request
+//   - Request
 type RrdbGetScannerArgs struct {
 	Request *GetScannerRequest `thrift:"request,1" db:"request" json:"request"`
 }
@@ -10046,7 +11345,7 @@ func (p *RrdbGetScannerArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbGetScannerResult struct {
 	Success *ScanResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -10155,7 +11454,7 @@ func (p *RrdbGetScannerResult) String() string {
 }
 
 // Attributes:
-//  - Request
+//   - Request
 type RrdbScanArgs struct {
 	Request *ScanRequest `thrift:"request,1" db:"request" json:"request"`
 }
@@ -10262,7 +11561,7 @@ func (p *RrdbScanArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type RrdbScanResult struct {
 	Success *ScanResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }
@@ -10371,7 +11670,7 @@ func (p *RrdbScanResult) String() string {
 }
 
 // Attributes:
-//  - ContextID
+//   - ContextID
 type RrdbClearScannerArgs struct {
 	ContextID int64 `thrift:"context_id,1" db:"context_id" json:"context_id"`
 }
@@ -10502,15 +11801,15 @@ func (p *MetaClient) Client_() thrift.TClient {
 }
 
 // Parameters:
-//  - Query
+//   - Query
 func (p *MetaClient) QueryCfg(ctx context.Context, query *replication.QueryCfgRequest) (r *replication.QueryCfgResponse, err error) {
-	var _args114 MetaQueryCfgArgs
-	_args114.Query = query
-	var _result115 MetaQueryCfgResult
-	if err = p.Client_().Call(ctx, "query_cfg", &_args114, &_result115); err != nil {
+	var _args124 MetaQueryCfgArgs
+	_args124.Query = query
+	var _result125 MetaQueryCfgResult
+	if err = p.Client_().Call(ctx, "query_cfg", &_args124, &_result125); err != nil {
 		return
 	}
-	return _result115.GetSuccess(), nil
+	return _result125.GetSuccess(), nil
 }
 
 type MetaProcessor struct {
@@ -10533,9 +11832,9 @@ func (p *MetaProcessor) ProcessorMap() map[string]thrift.TProcessorFunction {
 
 func NewMetaProcessor(handler Meta) *MetaProcessor {
 
-	self116 := &MetaProcessor{handler: handler, processorMap: make(map[string]thrift.TProcessorFunction)}
-	self116.processorMap["query_cfg"] = &metaProcessorQueryCfg{handler: handler}
-	return self116
+	self126 := &MetaProcessor{handler: handler, processorMap: make(map[string]thrift.TProcessorFunction)}
+	self126.processorMap["query_cfg"] = &metaProcessorQueryCfg{handler: handler}
+	return self126
 }
 
 func (p *MetaProcessor) Process(ctx context.Context, iprot, oprot thrift.TProtocol) (success bool, err thrift.TException) {
@@ -10548,12 +11847,12 @@ func (p *MetaProcessor) Process(ctx context.Context, iprot, oprot thrift.TProtoc
 	}
 	iprot.Skip(thrift.STRUCT)
 	iprot.ReadMessageEnd()
-	x117 := thrift.NewTApplicationException(thrift.UNKNOWN_METHOD, "Unknown function "+name)
+	x127 := thrift.NewTApplicationException(thrift.UNKNOWN_METHOD, "Unknown function "+name)
 	oprot.WriteMessageBegin(name, thrift.EXCEPTION, seqId)
-	x117.Write(oprot)
+	x127.Write(oprot)
 	oprot.WriteMessageEnd()
 	oprot.Flush(ctx)
-	return false, x117
+	return false, x127
 
 }
 
@@ -10608,7 +11907,7 @@ func (p *metaProcessorQueryCfg) Process(ctx context.Context, seqId int32, iprot,
 // HELPER FUNCTIONS AND STRUCTURES
 
 // Attributes:
-//  - Query
+//   - Query
 type MetaQueryCfgArgs struct {
 	Query *replication.QueryCfgRequest `thrift:"query,1" db:"query" json:"query"`
 }
@@ -10715,7 +12014,7 @@ func (p *MetaQueryCfgArgs) String() string {
 }
 
 // Attributes:
-//  - Success
+//   - Success
 type MetaQueryCfgResult struct {
 	Success *replication.QueryCfgResponse `thrift:"success,0" db:"success" json:"success,omitempty"`
 }

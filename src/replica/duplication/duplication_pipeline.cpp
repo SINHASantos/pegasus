@@ -17,13 +17,37 @@
 
 #include "duplication_pipeline.h"
 
-#include "replica/replication_app_base.h"
+#include <algorithm>
+#include <chrono>
+#include <cstddef>
+#include <functional>
+#include <string>
+#include <string_view>
+#include <utility>
+
+#include "load_from_private_log.h"
+#include "replica/duplication/replica_duplicator.h"
+#include "replica/mutation_log.h"
+#include "replica/replica.h"
+#include "utils/autoref_ptr.h"
+#include "utils/errors.h"
+#include "utils/flags.h"
 #include "utils/fmt_logging.h"
 
-#include "replica/replica_stub.h"
-#include "load_from_private_log.h"
+DSN_DEFINE_uint64(
+    replication,
+    dup_no_mutation_load_delay_ms,
+    100,
+    "The duration of the delay until the next execution if there is no mutation to be loaded.");
+DSN_TAG_VARIABLE(dup_no_mutation_load_delay_ms, FT_MUTABLE);
+
+METRIC_DEFINE_counter(replica,
+                      dup_shipped_bytes,
+                      dsn::metric_unit::kBytes,
+                      "The shipped size of private log for dup");
 
 namespace dsn {
+
 namespace replication {
 
 //                     //
@@ -31,7 +55,7 @@ namespace replication {
 //                     //
 
 /*static*/ std::function<std::unique_ptr<mutation_duplicator>(
-    replica_base *, string_view /*remote cluster*/, string_view /*app*/)>
+    replica_base *, std::string_view /*remote cluster*/, std::string_view /*app*/)>
     mutation_duplicator::creator;
 
 //               //
@@ -42,9 +66,13 @@ void load_mutation::run()
 {
     decree last_decree = _duplicator->progress().last_decree;
     _start_decree = last_decree + 1;
-    if (_replica->private_log()->max_commit_on_disk() < _start_decree) {
-        // wait 100ms for next try if no mutation was added.
-        repeat(100_ms);
+
+    // Load the mutations from plog that have been committed recently, if any.
+    const auto max_plog_committed_decree =
+        std::min(_replica->private_log()->max_decree_on_disk(), _replica->last_applied_decree());
+    if (_start_decree > max_plog_committed_decree) {
+        // Wait for a while if no mutation was added.
+        repeat(std::chrono::milliseconds(FLAGS_dup_no_mutation_load_delay_ms));
         return;
     }
 
@@ -69,7 +97,7 @@ void ship_mutation::ship(mutation_tuple_set &&in)
 {
     _mutation_duplicator->duplicate(std::move(in), [this](size_t total_shipped_size) mutable {
         update_progress();
-        _counter_dup_shipped_bytes_rate->add(total_shipped_size);
+        METRIC_VAR_INCREMENT_BY(dup_shipped_bytes, total_shipped_size);
         step_down_next_stage();
     });
 }
@@ -102,16 +130,12 @@ ship_mutation::ship_mutation(replica_duplicator *duplicator)
     : replica_base(duplicator),
       _duplicator(duplicator),
       _replica(duplicator->_replica),
-      _stub(duplicator->_replica->get_replica_stub())
+      _stub(duplicator->_replica->get_replica_stub()),
+      METRIC_VAR_INIT_replica(dup_shipped_bytes)
 {
     _mutation_duplicator = new_mutation_duplicator(
-        duplicator, _duplicator->remote_cluster_name(), _replica->get_app_info()->app_name);
+        duplicator, duplicator->remote_cluster_name(), duplicator->remote_app_name());
     _mutation_duplicator->set_task_environment(duplicator);
-
-    _counter_dup_shipped_bytes_rate.init_app_counter("eon.replica_stub",
-                                                     "dup.shipped_bytes_rate",
-                                                     COUNTER_TYPE_RATE,
-                                                     "shipping rate of private log in bytes");
 }
 
 } // namespace replication

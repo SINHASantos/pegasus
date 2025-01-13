@@ -28,6 +28,8 @@
 #include <functional>
 #include <memory>
 
+#include "utils/fmt_utils.h"
+
 namespace pegasus {
 
 class rrdb_client;
@@ -115,6 +117,7 @@ public:
         }
     };
 
+    // TODO(yingchun): duplicate with cas_check_type in idl/rrdb.thrift
     enum cas_check_type
     {
         CT_NO_CHECK = 0,
@@ -1215,4 +1218,6 @@ public:
     static pegasus_client *get_client(const char *cluster_name, const char *app_name);
 };
 
+USER_DEFINED_ENUM_FORMATTER(pegasus_client::filter_type)
+USER_DEFINED_ENUM_FORMATTER(pegasus_client::cas_check_type)
 } // namespace pegasus

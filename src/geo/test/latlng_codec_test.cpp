@@ -17,9 +17,12 @@
  * under the License.
  */
 
-#include <memory>
-#include <gtest/gtest.h>
-#include <geo/lib/latlng_codec.h>
+#include <s2/s1angle.h>
+#include <s2/s2latlng.h>
+#include <string>
+
+#include "geo/lib/latlng_codec.h"
+#include "gtest/gtest.h"
 #include "utils/errors.h"
 
 namespace pegasus {

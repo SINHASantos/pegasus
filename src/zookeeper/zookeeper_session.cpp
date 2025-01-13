@@ -24,31 +24,79 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     a C++ wrapper of zookeeper c async api, implementation
- *
- * Revision history:
- *     2015-12-04, @shengofsun (sunweijie@xiaomi.com)
- */
-
-#include <zookeeper/zookeeper.h>
 #include <sasl/sasl.h>
+#include <stdlib.h>
+#include <zookeeper/zookeeper.h>
+#include <algorithm>
+#include <utility>
 
-#include "zookeeper_session.h"
-#include "zookeeper_session_mgr.h"
-
+#include "runtime/app_model.h"
+#include "rpc/rpc_address.h"
+#include "utils/filesystem.h"
 #include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/strings.h"
+#include "zookeeper/proto.h"
+#include "zookeeper/zookeeper.jute.h"
+#include "zookeeper_session.h"
 
-namespace dsn {
-namespace security {
 DSN_DECLARE_bool(enable_zookeeper_kerberos);
-DSN_DEFINE_string("security",
+DSN_DEFINE_string(security,
                   zookeeper_kerberos_service_name,
-                  "zookeeper",
-                  "zookeeper kerberos service name");
-} // namespace security
-} // namespace dsn
+                  "",
+                  "[Deprecated] zookeeper kerberos service name");
+DSN_DEFINE_string(security,
+                  zookeeper_sasl_service_fqdn,
+                  "",
+                  "[Deprecated] The FQDN of a Zookeeper server, used in Kerberos Principal");
+// TODO(yingchun): to keep compatibility, the global name is FLAGS_timeout_ms. The name is not very
+//  suitable, maybe improve the macro to us another global name.
+DSN_DEFINE_int32(zookeeper,
+                 timeout_ms,
+                 30000,
+                 "The timeout of accessing ZooKeeper, in milliseconds");
+DSN_DEFINE_string(zookeeper, hosts_list, "", "Zookeeper hosts list");
+DSN_DEFINE_string(zookeeper, sasl_service_name, "zookeeper", "");
+DSN_DEFINE_string(zookeeper,
+                  sasl_service_fqdn,
+                  "",
+                  "SASL server name ('zk-sasl-md5' for DIGEST-MD5; default: reverse DNS lookup)");
+DSN_DEFINE_string(zookeeper,
+                  sasl_mechanisms_type,
+                  "",
+                  "SASL mechanisms (GSSAPI and/or DIGEST-MD5)");
+DSN_DEFINE_string(zookeeper, sasl_user_name, "", "");
+DSN_DEFINE_string(zookeeper, sasl_realm, "", "Realm (for SASL/GSSAPI)");
+DSN_DEFINE_string(zookeeper,
+                  sasl_password_file,
+                  "",
+                  "File containing the password (recommended for SASL/DIGEST-MD5)");
+DSN_DEFINE_group_validator(enable_zookeeper_kerberos, [](std::string &message) -> bool {
+    if (FLAGS_enable_zookeeper_kerberos &&
+        !dsn::utils::equals(FLAGS_sasl_mechanisms_type, "GSSAPI")) {
+        message = "Please set [zookeeper] sasl_mechanisms_type to GSSAPI if [security] "
+                  "enable_zookeeper_kerberos is true.";
+        return false;
+    }
+
+    return true;
+});
+DSN_DEFINE_group_validator(consistency_between_configurations, [](std::string &message) -> bool {
+    if (!dsn::utils::is_empty(FLAGS_zookeeper_kerberos_service_name) &&
+        !dsn::utils::equals(FLAGS_zookeeper_kerberos_service_name, FLAGS_sasl_service_name)) {
+        message = "zookeeper_kerberos_service_name deprecated, if set should be same as "
+                  "sasl_service_name.";
+        return false;
+    }
+    if (!dsn::utils::is_empty(FLAGS_zookeeper_sasl_service_fqdn) &&
+        !dsn::utils::equals(FLAGS_zookeeper_sasl_service_fqdn, FLAGS_sasl_service_fqdn)) {
+        message =
+            "zookeeper_sasl_service_fqdn deprecated, if set should be same as sasl_service_fqdn.";
+        return false;
+    }
+
+    return true;
+});
 
 namespace dsn {
 namespace dist {
@@ -153,29 +201,57 @@ zookeeper_session::zookeeper_session(const service_app_info &node) : _handle(nul
 int zookeeper_session::attach(void *callback_owner, const state_callback &cb)
 {
     utils::auto_write_lock l(_watcher_lock);
-    if (nullptr == _handle) {
-        if (dsn::security::FLAGS_enable_zookeeper_kerberos) {
-            zoo_sasl_params_t sasl_params = {0};
-            sasl_params.service = dsn::security::FLAGS_zookeeper_kerberos_service_name;
-            sasl_params.mechlist = "GSSAPI";
-            _handle = zookeeper_init_sasl(zookeeper_session_mgr::instance().zoo_hosts(),
-                                          global_watcher,
-                                          zookeeper_session_mgr::instance().timeout(),
-                                          nullptr,
-                                          this,
-                                          0,
-                                          NULL,
-                                          &sasl_params);
-        } else {
-            _handle = zookeeper_init(zookeeper_session_mgr::instance().zoo_hosts(),
-                                     global_watcher,
-                                     zookeeper_session_mgr::instance().timeout(),
-                                     nullptr,
-                                     this,
-                                     0);
+    do {
+        if (nullptr != _handle) {
+            break;
         }
-        CHECK_NOTNULL(_handle, "zookeeper session init failed");
-    }
+        if (utils::is_empty(FLAGS_sasl_mechanisms_type)) {
+            _handle = zookeeper_init(
+                FLAGS_hosts_list, global_watcher, FLAGS_timeout_ms, nullptr, this, 0);
+            break;
+        }
+        int err = sasl_client_init(nullptr);
+        CHECK_EQ_MSG(err,
+                     SASL_OK,
+                     "Unable to initialize SASL library {}",
+                     sasl_errstring(err, nullptr, nullptr));
+
+        if (!utils::is_empty(FLAGS_sasl_password_file)) {
+            CHECK(utils::filesystem::file_exists(FLAGS_sasl_password_file),
+                  "sasl_password_file {} not exist!",
+                  FLAGS_sasl_password_file);
+        }
+
+        auto param_host = "";
+        if (!utils::is_empty(FLAGS_sasl_service_fqdn)) {
+            CHECK(dsn::rpc_address::from_host_port(FLAGS_sasl_service_fqdn),
+                  "sasl_service_fqdn '{}' is invalid",
+                  FLAGS_sasl_service_fqdn);
+            param_host = FLAGS_sasl_service_fqdn;
+        }
+        // DIGEST-MD5 requires '--server-fqdn zk-sasl-md5' for historical reasons on zk c client
+        if (dsn::utils::equals(FLAGS_sasl_mechanisms_type, "DIGEST-MD5")) {
+            param_host = "zk-sasl-md5";
+        }
+
+        zoo_sasl_params_t sasl_params = {0};
+        sasl_params.service = FLAGS_sasl_service_name;
+        sasl_params.mechlist = FLAGS_sasl_mechanisms_type;
+        sasl_params.host = param_host;
+        sasl_params.callbacks = zoo_sasl_make_basic_callbacks(
+            FLAGS_sasl_user_name, FLAGS_sasl_realm, FLAGS_sasl_password_file);
+
+        _handle = zookeeper_init_sasl(FLAGS_hosts_list,
+                                      global_watcher,
+                                      FLAGS_timeout_ms,
+                                      nullptr,
+                                      this,
+                                      0,
+                                      nullptr,
+                                      &sasl_params);
+    } while (false);
+
+    CHECK_NOTNULL(_handle, "zookeeper session init failed");
 
     _watchers.push_back(watcher_object());
     _watchers.back().watcher_path = "";
@@ -318,9 +394,9 @@ void zookeeper_session::global_watcher(
     zookeeper_session *zoo_session = (zookeeper_session *)ctx;
     zoo_session->init_non_dsn_thread();
     LOG_INFO(
-        "global watcher, type(%s), state(%s)", string_zoo_event(type), string_zoo_state(state));
+        "global watcher, type({}), state({})", string_zoo_event(type), string_zoo_state(state));
     if (type != ZOO_SESSION_EVENT && path != nullptr)
-        LOG_INFO("watcher path: %s", path);
+        LOG_INFO("watcher path: {}", path);
 
     CHECK(zoo_session->_handle == handle, "");
     zoo_session->dispatch_event(type, state, type == ZOO_SESSION_EVENT ? "" : path);
@@ -335,9 +411,9 @@ void zookeeper_session::global_watcher(
 void zookeeper_session::global_string_completion(int rc, const char *name, const void *data)
 {
     COMPLETION_INIT(rc, data);
-    LOG_DEBUG("rc(%s), input path(%s)", zerror(rc), op_ctx->_input._path.c_str());
+    LOG_DEBUG("rc({}), input path({})", zerror(rc), op_ctx->_input._path);
     if (ZOK == rc && name != nullptr)
-        LOG_DEBUG("created path:%s", name);
+        LOG_DEBUG("created path: {}", name);
     output.create_op._created_path = name;
     op_ctx->_callback_function(op_ctx);
     release_ref(op_ctx);
@@ -347,7 +423,7 @@ void zookeeper_session::global_data_completion(
     int rc, const char *value, int value_length, const Stat *, const void *data)
 {
     COMPLETION_INIT(rc, data);
-    LOG_DEBUG("rc(%s), input path(%s)", zerror(rc), op_ctx->_input._path.c_str());
+    LOG_DEBUG("rc({}), input path({})", zerror(rc), op_ctx->_input._path);
     output.get_op.value_length = value_length;
     output.get_op.value = value;
     op_ctx->_callback_function(op_ctx);
@@ -357,7 +433,7 @@ void zookeeper_session::global_data_completion(
 void zookeeper_session::global_state_completion(int rc, const Stat *stat, const void *data)
 {
     COMPLETION_INIT(rc, data);
-    LOG_DEBUG("rc(%s), input path(%s)", zerror(rc), op_ctx->_input._path.c_str());
+    LOG_DEBUG("rc({}), input path({})", zerror(rc), op_ctx->_input._path);
     if (op_ctx->_optype == ZOO_EXISTS) {
         output.exists_op._node_stat = stat;
         op_ctx->_callback_function(op_ctx);
@@ -373,9 +449,9 @@ void zookeeper_session::global_strings_completion(int rc,
                                                   const void *data)
 {
     COMPLETION_INIT(rc, data);
-    LOG_DEBUG("rc(%s), input path(%s)", zerror(rc), op_ctx->_input._path.c_str());
+    LOG_DEBUG("rc({}), input path({})", zerror(rc), op_ctx->_input._path);
     if (rc == ZOK && strings != nullptr)
-        LOG_DEBUG("child count: %d", strings->count);
+        LOG_DEBUG("child count: {}", strings->count);
     output.getchildren_op.strings = strings;
     op_ctx->_callback_function(op_ctx);
     release_ref(op_ctx);
@@ -385,11 +461,11 @@ void zookeeper_session::global_void_completion(int rc, const void *data)
 {
     COMPLETION_INIT(rc, data);
     if (op_ctx->_optype == ZOO_DELETE)
-        LOG_DEBUG("rc(%s), input path( %s )", zerror(rc), op_ctx->_input._path.c_str());
+        LOG_DEBUG("rc({}), input path({})", zerror(rc), op_ctx->_input._path);
     else
-        LOG_DEBUG("rc(%s)", zerror(rc));
+        LOG_DEBUG("rc({})", zerror(rc));
     op_ctx->_callback_function(op_ctx);
     release_ref(op_ctx);
 }
-}
-}
+} // namespace dist
+} // namespace dsn

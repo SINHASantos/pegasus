@@ -17,69 +17,56 @@
  * under the License.
  */
 
-#include <list>
-
-#include "utils/api_utilities.h"
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
-#include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
-#include "runtime/serverlet.h"
-#include "runtime/service_app.h"
-#include "runtime/rpc/rpc_address.h"
-#include "client/replication_ddl_client.h"
+#include <fmt/core.h>
+#include <fmt/format.h>
 #include <pegasus/client.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+#include <algorithm>
+#include <unordered_set>
+#include <utility>
 
-#include "base/pegasus_const.h"
+#include "client/replication_ddl_client.h"
+#include "common/common.h"
+#include "common/gpid.h"
+#include "common/replication_other_types.h"
 #include "kill_testor.h"
-#include "killer_handler.h"
-#include "killer_handler_shell.h"
+#include "utils/error_code.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+
+DSN_DEFINE_uint32(pegasus.killtest, kill_interval_seconds, 30, "");
+DSN_DEFINE_uint32(pegasus.killtest, max_seconds_for_all_partitions_to_recover, 600, "");
+
+DSN_DECLARE_string(pegasus_cluster_name);
+DSN_DECLARE_string(verify_app_name);
 
 namespace pegasus {
 namespace test {
 
 kill_testor::kill_testor(const char *config_file)
 {
-    const char *section = "pegasus.killtest";
     // initialize the _client.
     if (!pegasus_client_factory::initialize(config_file)) {
         exit(-1);
     }
 
-    app_name = dsn_config_get_value_string(
-        section, "verify_app_name", "temp", "verify app name"); // default using temp
-    pegasus_cluster_name =
-        dsn_config_get_value_string(section, "pegasus_cluster_name", "", "pegasus cluster name");
-    if (pegasus_cluster_name.empty()) {
-        LOG_ERROR("Should config the cluster name for killer");
-        exit(-1);
-    }
-
     // load meta_list
-    meta_list.clear();
-    dsn::replication::replica_helper::load_meta_servers(
-        meta_list, PEGASUS_CLUSTER_SECTION_NAME.c_str(), pegasus_cluster_name.c_str());
+    dsn::replication::replica_helper::load_servers_from_config(
+        dsn::PEGASUS_CLUSTER_SECTION_NAME, FLAGS_pegasus_cluster_name, meta_list);
     if (meta_list.empty()) {
         LOG_ERROR("Should config the meta address for killer");
         exit(-1);
     }
 
     ddl_client.reset(new replication_ddl_client(meta_list));
-    if (ddl_client == nullptr) {
+    if (!ddl_client) {
         LOG_ERROR("Initialize the _ddl_client failed");
         exit(-1);
     }
 
-    kill_interval_seconds =
-        (uint32_t)dsn_config_get_value_uint64(section, "kill_interval_seconds", 30, "");
-    max_seconds_for_partitions_recover = (uint32_t)dsn_config_get_value_uint64(
-        section, "max_seconds_for_all_partitions_to_recover", 600, "");
     srand((unsigned)time(nullptr));
 }
 
@@ -117,37 +104,30 @@ dsn::error_code kill_testor::get_partition_info(bool debug_unhealthy,
     healthy_partition_cnt = 0, unhealthy_partition_cnt = 0;
     int32_t app_id;
     int32_t partition_count;
-    partitions.clear();
-    dsn::error_code err = ddl_client->list_app(app_name, app_id, partition_count, partitions);
+    pcs.clear();
+    dsn::error_code err = ddl_client->list_app(FLAGS_verify_app_name, app_id, partition_count, pcs);
 
     if (err == ::dsn::ERR_OK) {
         LOG_DEBUG("access meta and query partition status success");
-        for (int i = 0; i < partitions.size(); i++) {
-            const dsn::partition_configuration &p = partitions[i];
+        for (const auto &pc : pcs) {
             int replica_count = 0;
-            if (!p.primary.is_invalid()) {
+            if (pc.hp_primary) {
                 replica_count++;
             }
-            replica_count += p.secondaries.size();
-            if (replica_count == p.max_replica_count) {
+            replica_count += pc.hp_secondaries.size();
+            if (replica_count == pc.max_replica_count) {
                 healthy_partition_cnt++;
             } else {
-                std::stringstream info;
-                info << "gpid=" << p.pid.get_app_id() << "." << p.pid.get_partition_index() << ", ";
-                info << "primay=" << p.primary.to_std_string() << ", ";
-                info << "secondaries=[";
-                for (int idx = 0; idx < p.secondaries.size(); idx++) {
-                    if (idx != 0)
-                        info << "," << p.secondaries[idx].to_std_string();
-                    else
-                        info << p.secondaries[idx].to_std_string();
-                }
-                info << "], ";
-                info << "last_committed_decree=" << p.last_committed_decree;
+                const auto &info =
+                    fmt::format("gpid={}, primary={}, secondaries=[{}], last_committed_decree={}",
+                                pc.pid,
+                                pc.hp_primary,
+                                fmt::join(pc.hp_secondaries, ", "),
+                                pc.last_committed_decree);
                 if (debug_unhealthy) {
-                    LOG_INFO("found unhealthy partition, %s", info.str().c_str());
+                    LOG_INFO("found unhealthy partition, {}", info);
                 } else {
-                    LOG_DEBUG("found unhealthy partition, %s", info.str().c_str());
+                    LOG_DEBUG("found unhealthy partition, {}", info);
                 }
             }
         }
@@ -166,21 +146,22 @@ bool kill_testor::check_cluster_status()
     int healthy_partition_cnt = 0;
     int unhealthy_partition_cnt = 0;
     int try_count = 1;
-    while (try_count <= max_seconds_for_partitions_recover) {
-        dsn::error_code err = get_partition_info(try_count == max_seconds_for_partitions_recover,
-                                                 healthy_partition_cnt,
-                                                 unhealthy_partition_cnt);
+    while (try_count <= FLAGS_max_seconds_for_all_partitions_to_recover) {
+        dsn::error_code err =
+            get_partition_info(try_count == FLAGS_max_seconds_for_all_partitions_to_recover,
+                               healthy_partition_cnt,
+                               unhealthy_partition_cnt);
         if (err == dsn::ERR_OK) {
             if (unhealthy_partition_cnt > 0) {
                 LOG_DEBUG("query partition status success, but still have unhealthy partition, "
-                          "healthy_partition_count = %d, unhealthy_partition_count = %d",
+                          "healthy_partition_count = {}, unhealthy_partition_count = {}",
                           healthy_partition_cnt,
                           unhealthy_partition_cnt);
                 sleep(1);
             } else
                 return true;
         } else {
-            LOG_INFO("query partition status fail, try times = %d", try_count);
+            LOG_INFO("query partition status fail, try times = {}", try_count);
             sleep(1);
         }
         try_count += 1;

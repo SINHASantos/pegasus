@@ -16,12 +16,51 @@
 // under the License.
 
 #include "replica_backup_manager.h"
-#include "cold_backup_context.h"
-#include "replica/replica.h"
 
-#include "utils/fmt_logging.h"
-#include "utils/filesystem.h"
+#include <string_view>
+#include <stdint.h>
+#include <algorithm>
+#include <chrono>
+#include <map>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "backup_types.h"
+#include "cold_backup_context.h"
+#include "common/gpid.h"
+#include "common/replication.codes.h"
+#include "dsn.layer2_types.h"
+#include "metadata_types.h"
+#include "replica/replica.h"
+#include "replica/replica_context.h"
 #include "replica/replication_app_base.h"
+#include "runtime/api_layer1.h"
+#include "task/async_calls.h"
+#include "utils/autoref_ptr.h"
+#include "utils/filesystem.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/strings.h"
+#include "utils/thread_access_checker.h"
+
+METRIC_DEFINE_gauge_int64(replica,
+                          backup_running_count,
+                          dsn::metric_unit::kBackups,
+                          "The number of current running backups");
+
+METRIC_DEFINE_gauge_int64(replica,
+                          backup_max_duration_ms,
+                          dsn::metric_unit::kMilliSeconds,
+                          "The max backup duration among backups");
+
+METRIC_DEFINE_gauge_int64(replica,
+                          backup_file_upload_max_bytes,
+                          dsn::metric_unit::kBytes,
+                          "The max size of uploaded files among backups");
+
+DSN_DECLARE_int32(cold_backup_checkpoint_reserve_minutes);
+DSN_DECLARE_int32(gc_interval_ms);
 
 namespace dsn {
 namespace replication {
@@ -46,7 +85,7 @@ static bool get_policy_checkpoint_dirs(const std::string &dir,
     // list sub dirs
     std::vector<std::string> sub_dirs;
     if (!utils::filesystem::get_subdirectories(dir, sub_dirs, false)) {
-        LOG_ERROR_F("list sub dirs of dir {} failed", dir.c_str());
+        LOG_ERROR("list sub dirs of dir {} failed", dir.c_str());
         return false;
     }
 
@@ -59,7 +98,14 @@ static bool get_policy_checkpoint_dirs(const std::string &dir,
     return true;
 }
 
-replica_backup_manager::replica_backup_manager(replica *r) : replica_base(r), _replica(r) {}
+replica_backup_manager::replica_backup_manager(replica *r)
+    : replica_base(r),
+      _replica(r),
+      METRIC_VAR_INIT_replica(backup_running_count),
+      METRIC_VAR_INIT_replica(backup_max_duration_ms),
+      METRIC_VAR_INIT_replica(backup_file_upload_max_bytes)
+{
+}
 
 replica_backup_manager::~replica_backup_manager()
 {
@@ -80,11 +126,12 @@ void replica_backup_manager::on_clear_cold_backup(const backup_clear_request &re
                 "{}: delay clearing obsoleted cold backup context, cause backup_status == "
                 "ColdBackupCheckpointing",
                 backup_context->name);
-            tasking::enqueue(LPC_REPLICATION_COLD_BACKUP,
-                             &_replica->_tracker,
-                             [this, request]() { on_clear_cold_backup(request); },
-                             get_gpid().thread_hash(),
-                             std::chrono::seconds(100));
+            tasking::enqueue(
+                LPC_REPLICATION_COLD_BACKUP,
+                &_replica->_tracker,
+                [this, request]() { on_clear_cold_backup(request); },
+                get_gpid().thread_hash(),
+                std::chrono::seconds(100));
             return;
         }
 
@@ -97,12 +144,12 @@ void replica_backup_manager::on_clear_cold_backup(const backup_clear_request &re
 void replica_backup_manager::start_collect_backup_info()
 {
     if (_collect_info_timer == nullptr) {
-        _collect_info_timer =
-            tasking::enqueue_timer(LPC_PER_REPLICA_COLLECT_INFO_TIMER,
-                                   &_replica->_tracker,
-                                   [this]() { collect_backup_info(); },
-                                   std::chrono::milliseconds(_replica->options()->gc_interval_ms),
-                                   get_gpid().thread_hash());
+        _collect_info_timer = tasking::enqueue_timer(
+            LPC_PER_REPLICA_COLLECT_INFO_TIMER,
+            &_replica->_tracker,
+            [this]() { collect_backup_info(); },
+            std::chrono::milliseconds(FLAGS_gc_interval_ms),
+            get_gpid().thread_hash());
     }
 }
 
@@ -136,22 +183,22 @@ void replica_backup_manager::collect_backup_info()
         }
     }
 
-    _replica->_cold_backup_running_count.store(cold_backup_running_count);
-    _replica->_cold_backup_max_duration_time_ms.store(cold_backup_max_duration_time_ms);
-    _replica->_cold_backup_max_upload_file_size.store(cold_backup_max_upload_file_size);
+    METRIC_VAR_SET(backup_running_count, cold_backup_running_count);
+    METRIC_VAR_SET(backup_max_duration_ms, cold_backup_max_duration_time_ms);
+    METRIC_VAR_SET(backup_file_upload_max_bytes, cold_backup_max_upload_file_size);
 }
 
 void replica_backup_manager::background_clear_backup_checkpoint(const std::string &policy_name)
 {
     LOG_INFO_PREFIX("schedule to clear all checkpoint dirs of policy({}) after {} minutes",
                     policy_name,
-                    _replica->options()->cold_backup_checkpoint_reserve_minutes);
+                    FLAGS_cold_backup_checkpoint_reserve_minutes);
     tasking::enqueue(
         LPC_BACKGROUND_COLD_BACKUP,
         &_replica->_tracker,
         [this, policy_name]() { clear_backup_checkpoint(policy_name); },
         get_gpid().thread_hash(),
-        std::chrono::minutes(_replica->options()->cold_backup_checkpoint_reserve_minutes));
+        std::chrono::minutes(FLAGS_cold_backup_checkpoint_reserve_minutes));
 }
 
 // clear all checkpoint dirs of the policy
@@ -188,9 +235,9 @@ void replica_backup_manager::send_clear_request_to_secondaries(const gpid &pid,
     request.__set_pid(pid);
     request.__set_policy_name(policy_name);
 
-    for (const auto &target_address : _replica->_primary_states.membership.secondaries) {
+    for (const auto &secondary : _replica->_primary_states.pc.secondaries) {
         rpc::call_one_way_typed(
-            target_address, RPC_CLEAR_COLD_BACKUP, request, get_gpid().thread_hash());
+            secondary, RPC_CLEAR_COLD_BACKUP, request, get_gpid().thread_hash());
     }
 }
 

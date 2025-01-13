@@ -15,12 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
+#include <fmt/core.h>
+#include <stdint.h>
+#include <memory>
+#include <string>
+#include <unordered_map>
 
-#include "replica/replica.h"
-#include "mock_utils.h"
+#include "common/gpid.h"
+#include "common/replication_common.h"
+#include "common/replication_other_types.h"
+#include "dsn.layer2_types.h"
+#include "gtest/gtest.h"
 #include "meta/meta_data.h"
+#include "meta_admin_types.h"
+#include "mock_utils.h"
+#include "replica/replica_stub.h"
 #include "replica_test_base.h"
+#include "rpc/rpc_address.h"
+#include "rpc/rpc_host_port.h"
+#include "task/task.h"
+#include "utils/filesystem.h"
 
 namespace dsn {
 namespace replication {
@@ -30,68 +44,54 @@ class open_replica_test : public replica_test_base
 public:
     open_replica_test() = default;
     ~open_replica_test() { dsn::utils::filesystem::remove_path("./tmp_dir"); }
-
-    void test_open_replica()
-    {
-        app_info app_info;
-        app_info.app_type = "replica";
-        app_info.is_stateful = true;
-        app_info.max_replica_count = 3;
-        app_info.partition_count = 8;
-        app_info.app_id = 1;
-
-        struct test_data
-        {
-            ballot b;
-            decree last_committed_decree;
-            bool is_in_dir_nodes;
-            bool exec_failed;
-        } tests[] = {
-            {0, 0, true, true}, {0, 0, false, false}, {5, 5, true, true}, {5, 5, false, true},
-        };
-        int i = 0;
-        for (auto tt : tests) {
-            gpid gpid(app_info.app_id, i);
-            stub->_opening_replicas[gpid] = task_ptr(nullptr);
-
-            dsn::rpc_address node;
-            node.assign_ipv4("127.0.0.11", static_cast<uint16_t>(12321 + i + 1));
-
-            if (!tt.is_in_dir_nodes) {
-                dir_node *node_disk = new dir_node("tag_" + std::to_string(i), "tmp_dir");
-                stub->_fs_manager._dir_nodes.emplace_back(node_disk);
-                stub->_fs_manager._available_data_dirs.emplace_back("tmp_dir");
-            }
-
-            _replica->register_service();
-            mock_mutation_log_shared_ptr shared_log_mock =
-                new mock_mutation_log_shared("./tmp_dir");
-            stub->set_log(shared_log_mock);
-            partition_configuration config;
-            config.pid = gpid;
-            config.ballot = tt.b;
-            config.last_committed_decree = tt.last_committed_decree;
-            std::shared_ptr<app_state> _the_app = app_state::create(app_info);
-
-            configuration_update_request fake_request;
-            fake_request.info = *_the_app;
-            fake_request.config = config;
-            fake_request.type = config_type::CT_ASSIGN_PRIMARY;
-            fake_request.node = node;
-
-            std::shared_ptr<configuration_update_request> req2(new configuration_update_request);
-            *req2 = fake_request;
-            if (tt.exec_failed) {
-                ASSERT_DEATH(stub->open_replica(app_info, gpid, nullptr, req2), "");
-            } else {
-                stub->open_replica(app_info, gpid, nullptr, req2);
-            }
-            ++i;
-        }
-    }
 };
 
-TEST_F(open_replica_test, open_replica_add_decree_and_ballot_check) { test_open_replica(); }
+INSTANTIATE_TEST_SUITE_P(, open_replica_test, ::testing::Values(false, true));
 
+TEST_P(open_replica_test, open_replica_add_decree_and_ballot_check)
+{
+    app_info ai;
+    ai.app_type = replication_options::kReplicaAppType;
+    ai.is_stateful = true;
+    ai.max_replica_count = 3;
+    ai.partition_count = 8;
+    ai.app_id = 11;
+
+    struct test_data
+    {
+        ballot b;
+        decree last_committed_decree;
+        bool expect_crash;
+    } tests[] = {{0, 0, false}, {5, 5, true}};
+    uint16_t i = 0;
+    for (auto test : tests) {
+        gpid pid(ai.app_id, i);
+        stub->_opening_replicas[pid] = task_ptr(nullptr);
+
+        const auto node = host_port::from_string(fmt::format("127.0.0.11:{}", 12321 + i + 1));
+
+        _replica->register_service();
+
+        partition_configuration pc;
+        pc.pid = pid;
+        pc.ballot = test.b;
+        pc.last_committed_decree = test.last_committed_decree;
+        auto as = app_state::create(ai);
+
+        auto req = std::make_shared<configuration_update_request>();
+        req->info = *as;
+        req->config = pc;
+        req->type = config_type::CT_ASSIGN_PRIMARY;
+        SET_IP_AND_HOST_PORT_BY_DNS(*req, node, node);
+        if (test.expect_crash) {
+            ASSERT_DEATH(stub->open_replica(ai, pid, nullptr, req), "");
+        } else {
+            stub->open_replica(ai, pid, nullptr, req);
+        }
+        // Both of the tests will fail, the replica is not exist in the stub.
+        ASSERT_EQ(nullptr, stub->get_replica(pid));
+        ++i;
+    }
+}
 } // namespace replication
 } // namespace dsn

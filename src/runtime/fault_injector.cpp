@@ -24,25 +24,35 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     inject failure through join points to mimic all network/disk/slow execution etc. failures
- *
- * Revision history:
- *     Mar., 2015, @imzhenyu (Zhenyu Guo), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #include "runtime/fault_injector.h"
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/rand.h"
+
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <thread>
+#include <vector>
+
 #include "aio/aio_task.h"
+#include "fmt/core.h"
+#include "rpc/rpc_message.h"
+#include "task/task.h"
+#include "task/task_code.h"
+#include "task/task_spec.h"
+#include "utils/blob.h"
+#include "utils/config_api.h"
+#include "utils/config_helper.h"
+#include "utils/error_code.h"
+#include "utils/extensible_object.h"
+#include "utils/fmt_logging.h"
+#include "utils/join_point.h"
+#include "utils/rand.h"
 
 namespace dsn {
+struct service_spec;
+
 namespace tools {
+
+// Inject failure through join points to mimic all network/disk/slow execution etc. failures.
 
 struct fj_opt
 {
@@ -146,8 +156,7 @@ static void fault_on_task_begin(task *this_)
     fj_opt &opt = s_fj_opts[this_->spec().code];
     if (opt.execution_extra_delay_us_max > 0) {
         auto d = rand::next_u32(0, opt.execution_extra_delay_us_max);
-        LOG_INFO(
-            "fault inject %s at %s with delay %u us", this_->spec().name.c_str(), __FUNCTION__, d);
+        LOG_INFO("fault inject {} at {} with delay {} us", this_->spec().name, __FUNCTION__, d);
         std::this_thread::sleep_for(std::chrono::microseconds(d));
     }
 }
@@ -168,14 +177,14 @@ static bool fault_on_aio_call(task *caller, aio_task *callee)
     switch (callee->get_aio_context()->type) {
     case AIO_Read:
         if (rand::next_double01() < s_fj_opts[callee->spec().code].disk_read_fail_ratio) {
-            LOG_INFO("fault inject %s at %s", callee->spec().name.c_str(), __FUNCTION__);
+            LOG_INFO("fault inject {} at {}", callee->spec().name, __FUNCTION__);
             callee->set_error_code(ERR_FILE_OPERATION_FAILED);
             return false;
         }
         break;
     case AIO_Write:
         if (rand::next_double01() < s_fj_opts[callee->spec().code].disk_write_fail_ratio) {
-            LOG_INFO("fault inject %s at %s", callee->spec().name.c_str(), __FUNCTION__);
+            LOG_INFO("fault inject {} at {}", callee->spec().name, __FUNCTION__);
             callee->set_error_code(ERR_FILE_OPERATION_FAILED);
             return false;
         }
@@ -192,8 +201,8 @@ static void fault_on_aio_enqueue(aio_task *this_)
     fj_opt &opt = s_fj_opts[this_->spec().code];
     if (this_->delay_milliseconds() == 0 && task_ext_for_fj::get(this_) == 0) {
         this_->set_delay(rand::next_u32(opt.disk_io_delay_ms_min, opt.disk_io_delay_ms_max));
-        LOG_INFO("fault inject %s at %s with delay %u ms",
-                 this_->spec().name.c_str(),
+        LOG_INFO("fault inject {} at {} with delay {} ms",
+                 this_->spec().name,
                  __FUNCTION__,
                  this_->delay_milliseconds());
         task_ext_for_fj::get(this_) = 1; // ensure only fd once
@@ -222,7 +231,7 @@ static void corrupt_data(message_ex *request, const std::string &corrupt_type)
         replace_value(request->buffers,
                       rand::next_u32(0, request->body_size() + sizeof(message_header) - 1));
     else {
-        LOG_ERROR("try to inject an unknown data corrupt type: %s", corrupt_type.c_str());
+        LOG_ERROR("try to inject an unknown data corrupt type: {}", corrupt_type);
     }
 }
 
@@ -231,17 +240,17 @@ static bool fault_on_rpc_call(task *caller, message_ex *req, rpc_response_task *
 {
     fj_opt &opt = s_fj_opts[req->local_rpc_code];
     if (rand::next_double01() < opt.rpc_request_drop_ratio) {
-        LOG_INFO("fault inject %s at %s: %s => %s",
+        LOG_INFO("fault inject {} at {}: {} => {}",
                  req->header->rpc_name,
                  __FUNCTION__,
-                 req->header->from_address.to_string(),
-                 req->to_address.to_string());
+                 req->header->from_address,
+                 req->to_address);
         return false;
     } else {
         if (rand::next_double01() < opt.rpc_request_data_corrupted_ratio) {
-            LOG_INFO("corrupt the rpc call message from: %s, type: %s",
-                     req->header->from_address.to_string(),
-                     opt.rpc_message_data_corrupted_type.c_str());
+            LOG_INFO("corrupt the rpc call message from: {}, type: {}",
+                     req->header->from_address,
+                     opt.rpc_message_data_corrupted_type);
             corrupt_data(req, opt.rpc_message_data_corrupted_type);
         }
         return true;
@@ -255,8 +264,8 @@ static void fault_on_rpc_request_enqueue(rpc_request_task *callee)
         if (rand::next_double01() < opt.rpc_request_delay_ratio) {
             callee->set_delay(
                 rand::next_u32(opt.rpc_message_delay_ms_min, opt.rpc_message_delay_ms_max));
-            LOG_INFO("fault inject %s at %s with delay %u ms",
-                     callee->spec().name.c_str(),
+            LOG_INFO("fault inject {} at {} with delay {} ms",
+                     callee->spec().name,
                      __FUNCTION__,
                      callee->delay_milliseconds());
             task_ext_for_fj::get(callee) = 1; // ensure only fd once
@@ -269,17 +278,17 @@ static bool fault_on_rpc_reply(task *caller, message_ex *msg)
 {
     fj_opt &opt = s_fj_opts[msg->local_rpc_code];
     if (rand::next_double01() < opt.rpc_response_drop_ratio) {
-        LOG_INFO("fault inject %s at %s: %s => %s",
+        LOG_INFO("fault inject {} at {}: {} => {}",
                  msg->header->rpc_name,
                  __FUNCTION__,
-                 msg->header->from_address.to_string(),
-                 msg->to_address.to_string());
+                 msg->header->from_address,
+                 msg->to_address);
         return false;
     } else {
         if (rand::next_double01() < opt.rpc_response_data_corrupted_ratio) {
-            LOG_INFO("fault injector corrupt the rpc reply message from: %s, type: %s",
-                     msg->header->from_address.to_string(),
-                     opt.rpc_message_data_corrupted_type.c_str());
+            LOG_INFO("fault injector corrupt the rpc reply message from: {}, type: {}",
+                     msg->header->from_address,
+                     opt.rpc_message_data_corrupted_type);
             corrupt_data(msg, opt.rpc_message_data_corrupted_type);
         }
         return true;
@@ -293,8 +302,8 @@ static void fault_on_rpc_response_enqueue(rpc_response_task *resp)
         if (rand::next_double01() < opt.rpc_response_delay_ratio) {
             resp->set_delay(
                 rand::next_u32(opt.rpc_message_delay_ms_min, opt.rpc_message_delay_ms_max));
-            LOG_INFO("fault inject %s at %s with delay %u ms",
-                     resp->spec().name.c_str(),
+            LOG_INFO("fault inject {} at {} with delay {} ms",
+                     resp->spec().name,
                      __FUNCTION__,
                      resp->delay_milliseconds());
             task_ext_for_fj::get(resp) = 1; // ensure only fd once
@@ -314,8 +323,7 @@ void fault_injector::install(service_spec &spec)
         if (i == TASK_CODE_INVALID)
             continue;
 
-        std::string section_name =
-            std::string("task.") + std::string(dsn::task_code(i).to_string());
+        std::string section_name = fmt::format("task.{}", dsn::task_code(i));
         task_spec *spec = task_spec::get(i);
         CHECK_NOTNULL(spec, "");
 
@@ -346,5 +354,5 @@ void fault_injector::install(service_spec &spec)
 }
 
 fault_injector::fault_injector(const char *name) : toollet(name) {}
-}
-}
+} // namespace tools
+} // namespace dsn

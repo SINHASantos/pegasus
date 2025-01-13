@@ -24,71 +24,59 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     the meta server's date structure, impl file
- *
- * Revision history:
- *     2016-04-25, Weijie Sun(sunweijie at xiaomi.com), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
 #include <boost/lexical_cast.hpp>
+#include <algorithm>
+#include <cstdint>
+#include <ostream>
 
-#include "utils/fmt_logging.h"
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
 #include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
-#include "runtime/serverlet.h"
-#include "runtime/service_app.h"
-#include "runtime/rpc/rpc_address.h"
-#include "utils/flags.h"
-
+#include "common/replication_enums.h"
 #include "meta_data.h"
+#include "rpc/dns_resolver.h" // IWYU pragma: keep
+#include "rpc/rpc_address.h"
+#include "rpc/rpc_message.h"
+#include "runtime/api_layer1.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
 
-namespace dsn {
-namespace replication {
-
-// There is an option `max_replicas_in_group` which restricts the max replica count of the whole
+// There is an option FLAGS_max_replicas_in_group which restricts the max replica count of the whole
 // cluster. It's a cluster-level option. However, now that it's allowed to update the replication
 // factor of each table, this cluster-level option should be replaced.
 //
-// Conceptually `max_replicas_in_group` is the total number of alive and dropped replicas. Its
-// default value is 4. For a table that has replication factor 3, that `max_replicas_in_group`
+// Conceptually FLAGS_max_replicas_in_group is the total number of alive and dropped replicas. Its
+// default value is 4. For a table that has replication factor 3, that FLAGS_max_replicas_in_group
 // is set to 4 means 3 alive replicas plus a dropped replica.
 //
-// `max_replicas_in_group` can also be loaded from configuration file, which means its default
-// value will be overridden. The value of `max_replicas_in_group` will be assigned to another
+// FLAGS_max_replicas_in_group can also be loaded from configuration file, which means its default
+// value will be overridden. The value of FLAGS_max_replicas_in_group will be assigned to another
 // static variable `MAX_REPLICA_COUNT_IN_GRROUP`, whose default value is also 4.
 //
 // For unit tests, `MAX_REPLICA_COUNT_IN_GRROUP` is set to the default value 4; for production
-// environments, `MAX_REPLICA_COUNT_IN_GRROUP` is set to 3 since `max_replicas_in_group` is
+// environments, `MAX_REPLICA_COUNT_IN_GRROUP` is set to 3 since FLAGS_max_replicas_in_group is
 // configured as 3 in `.ini` file.
 //
-// Since the cluster-level option `max_replicas_in_group` contains the alive and dropped replicas,
-// we can use the replication factor of each table as the number of alive replicas, and introduce
-// another option `max_reserved_dropped_replicas` representing the max reserved number allowed for
-// dropped replicas.
+// Since the cluster-level option FLAGS_max_replicas_in_group contains the alive and dropped
+// replicas, we can use the replication factor of each table as the number of alive replicas, and
+// introduce another option FLAGS_max_reserved_dropped_replicas representing the max reserved number
+// allowed for dropped replicas.
 //
-// If `max_reserved_dropped_replicas` is set to 1, there is at most one dropped replicas reserved,
-// which means, once the number of alive replicas reaches max_replica_count, at most one dropped
-// replica can be reserved and others will be eliminated; If `max_reserved_dropped_replicas` is
-// set to 0, however, none of dropped replicas can be reserved.
+// If FLAGS_max_reserved_dropped_replicas is set to 1, there is at most one dropped replicas
+// reserved, which means, once the number of alive replicas reaches max_replica_count, at most one
+// dropped replica can be reserved and others will be eliminated; If
+// FLAGS_max_reserved_dropped_replicas is set to 0, however, none of dropped replicas can be
+// reserved.
 //
-// To be consistent with `max_replicas_in_group`, default value of `max_reserved_dropped_replicas`
-// is set to 1 so that the unit tests can be passed. For production environments, it should be set
-// to 0.
-DSN_DEFINE_uint32("meta_server",
+// To be consistent with FLAGS_max_replicas_in_group, default value of
+// FLAGS_max_reserved_dropped_replicas is set to 1 so that the unit tests can be passed. For
+// production environments, it should be set to 0.
+DSN_DEFINE_uint32(meta_server,
                   max_reserved_dropped_replicas,
                   1,
                   "max reserved number allowed for dropped replicas");
 DSN_TAG_VARIABLE(max_reserved_dropped_replicas, FT_MUTABLE);
+
+namespace dsn {
+namespace replication {
 
 void when_update_replicas(config_type::type t, const std::function<void(bool)> &func)
 {
@@ -108,26 +96,6 @@ void when_update_replicas(config_type::type t, const std::function<void(bool)> &
     }
 }
 
-void maintain_drops(std::vector<rpc_address> &drops, const rpc_address &node, config_type::type t)
-{
-    auto action = [&drops, &node](bool is_adding) {
-        auto it = std::find(drops.begin(), drops.end(), node);
-        if (is_adding) {
-            if (it != drops.end()) {
-                drops.erase(it);
-            }
-        } else {
-            CHECK(
-                it == drops.end(), "the node({}) cannot be in drops set before this update", node);
-            drops.push_back(node);
-            if (drops.size() > 3) {
-                drops.erase(drops.begin());
-            }
-        }
-    };
-    when_update_replicas(t, action);
-}
-
 bool construct_replica(meta_view view, const gpid &pid, int max_replica_count)
 {
     partition_configuration &pc = *get_config(*view.apps, pid);
@@ -138,9 +106,7 @@ bool construct_replica(meta_view view, const gpid &pid, int max_replica_count)
 
     std::vector<dropped_replica> &drop_list = cc.dropped;
     if (drop_list.empty()) {
-        LOG_WARNING("construct for (%d.%d) failed, coz no replicas collected",
-                    pid.get_app_id(),
-                    pid.get_partition_index());
+        LOG_WARNING("construct for ({}) failed, coz no replicas collected", pid);
         return false;
     }
 
@@ -150,16 +116,15 @@ bool construct_replica(meta_view view, const gpid &pid, int max_replica_count)
                  invalid_ballot,
                  "the ballot of server must not be invalid_ballot, node = {}",
                  server.node);
-    pc.primary = server.node;
+    SET_IP_AND_HOST_PORT_BY_DNS(pc, primary, server.node);
     pc.ballot = server.ballot;
     pc.partition_flags = 0;
     pc.max_replica_count = max_replica_count;
 
-    LOG_INFO("construct for (%d.%d), select %s as primary, ballot(%" PRId64
-             "), committed_decree(%" PRId64 "), prepare_decree(%" PRId64 ")",
-             pid.get_app_id(),
-             pid.get_partition_index(),
-             server.node.to_string(),
+    LOG_INFO("construct for ({}), select {} as primary, ballot({}), committed_decree({}), "
+             "prepare_decree({})",
+             pid,
+             server.node,
              server.ballot,
              server.last_committed_decree,
              server.last_prepared_decree);
@@ -169,20 +134,17 @@ bool construct_replica(meta_view view, const gpid &pid, int max_replica_count)
     // we put max_replica_count-1 recent replicas to last_drops, in case of the DDD-state when the
     // only primary dead
     // when add node to pc.last_drops, we don't remove it from our cc.drop_list
-    CHECK(pc.last_drops.empty(),
-          "last_drops of partition({}.{}) must be empty",
-          pid.get_app_id(),
-          pid.get_partition_index());
+    CHECK(pc.hp_last_drops.empty(), "last_drops of partition({}) must be empty", pid);
     for (auto iter = drop_list.rbegin(); iter != drop_list.rend(); ++iter) {
-        if (pc.last_drops.size() + 1 >= max_replica_count)
+        if (pc.hp_last_drops.size() + 1 >= max_replica_count) {
             break;
+        }
         // similar to cc.drop_list, pc.last_drop is also a stack structure
-        pc.last_drops.insert(pc.last_drops.begin(), iter->node);
-        LOG_INFO("construct for (%d.%d), select %s into last_drops, ballot(%" PRId64
-                 "), committed_decree(%" PRId64 "), prepare_decree(%" PRId64 ")",
-                 pid.get_app_id(),
-                 pid.get_partition_index(),
-                 iter->node.to_string(),
+        HEAD_INSERT_IP_AND_HOST_PORT_BY_DNS(pc, last_drops, iter->node);
+        LOG_INFO("construct for ({}), select {} into last_drops, ballot({}), "
+                 "committed_decree({}), prepare_decree({})",
+                 pid,
+                 iter->node,
                  iter->ballot,
                  iter->last_committed_decree,
                  iter->last_prepared_decree);
@@ -192,7 +154,7 @@ bool construct_replica(meta_view view, const gpid &pid, int max_replica_count)
     return true;
 }
 
-bool collect_replica(meta_view view, const rpc_address &node, const replica_info &info)
+bool collect_replica(meta_view view, const host_port &node, const replica_info &info)
 {
     partition_configuration &pc = *get_config(*view.apps, info.pid);
     // current partition is during partition split
@@ -226,13 +188,16 @@ void proposal_actions::reset_tracked_current_learner()
     current_learner.last_prepared_decree = invalid_decree;
 }
 
-void proposal_actions::track_current_learner(const dsn::rpc_address &node, const replica_info &info)
+void proposal_actions::track_current_learner(const dsn::host_port &node, const replica_info &info)
 {
-    if (empty())
+    if (empty()) {
         return;
-    configuration_proposal_action &act = acts.front();
-    if (act.node != node)
+    }
+    const auto &act = acts.front();
+    CHECK(act.hp_node, "");
+    if (act.hp_node != node) {
         return;
+    }
 
     // currently we only handle add secondary
     // TODO: adjust other proposals according to replica info collected
@@ -244,27 +209,23 @@ void proposal_actions::track_current_learner(const dsn::rpc_address &node, const
             // if we've collected inforamtions for the learner, then it claims it's down
             // we will treat the learning process failed
             if (current_learner.ballot != invalid_ballot) {
-                LOG_INFO("%d.%d: a learner's is down to status(%s), perhaps learn failed",
-                         info.pid.get_app_id(),
-                         info.pid.get_partition_index(),
+                LOG_INFO("{}: a learner's is down to status({}), perhaps learn failed",
+                         info.pid,
                          dsn::enum_to_string(info.status));
                 learning_progress_abnormal_detected = true;
             } else {
-                LOG_DEBUG("%d.%d: ignore abnormal status of %s, perhaps learn not start",
-                          info.pid.get_app_id(),
-                          info.pid.get_partition_index(),
-                          node.to_string());
+                LOG_DEBUG(
+                    "{}: ignore abnormal status of {}, perhaps learn not start", info.pid, node);
             }
         } else if (info.status == partition_status::PS_POTENTIAL_SECONDARY) {
             if (current_learner.ballot > info.ballot ||
                 current_learner.last_committed_decree > info.last_committed_decree ||
                 current_learner.last_prepared_decree > info.last_prepared_decree) {
 
-                // TODO: need to add a perf counter here
-                LOG_WARNING("%d.%d: learner(%s)'s progress step back, please trace this carefully",
-                            info.pid.get_app_id(),
-                            info.pid.get_partition_index(),
-                            node.to_string());
+                // TODO: need to add a metric here.
+                LOG_WARNING("{}: learner({})'s progress step back, please trace this carefully",
+                            info.pid,
+                            node);
             }
 
             // NOTICE: the flag may be abormal currently. it's balancer's duty to make use of the
@@ -345,15 +306,15 @@ void config_context::check_size()
 {
     // when add learner, it is possible that replica_count > max_replica_count, so we
     // need to remove things from dropped only when it's not empty.
-    while (replica_count(*config_owner) + dropped.size() >
-               config_owner->max_replica_count + FLAGS_max_reserved_dropped_replicas &&
+    while (replica_count(*pc) + dropped.size() >
+               pc->max_replica_count + FLAGS_max_reserved_dropped_replicas &&
            !dropped.empty()) {
         dropped.erase(dropped.begin());
         prefered_dropped = (int)dropped.size() - 1;
     }
 }
 
-std::vector<dropped_replica>::iterator config_context::find_from_dropped(const rpc_address &node)
+std::vector<dropped_replica>::iterator config_context::find_from_dropped(const host_port &node)
 {
     return std::find_if(dropped.begin(), dropped.end(), [&node](const dropped_replica &r) {
         return r.node == node;
@@ -361,14 +322,14 @@ std::vector<dropped_replica>::iterator config_context::find_from_dropped(const r
 }
 
 std::vector<dropped_replica>::const_iterator
-config_context::find_from_dropped(const rpc_address &node) const
+config_context::find_from_dropped(const host_port &node) const
 {
     return std::find_if(dropped.begin(), dropped.end(), [&node](const dropped_replica &r) {
         return r.node == node;
     });
 }
 
-bool config_context::remove_from_dropped(const rpc_address &node)
+bool config_context::remove_from_dropped(const host_port &node)
 {
     auto iter = find_from_dropped(node);
     if (iter != dropped.end()) {
@@ -379,7 +340,7 @@ bool config_context::remove_from_dropped(const rpc_address &node)
     return false;
 }
 
-bool config_context::record_drop_history(const rpc_address &node)
+bool config_context::record_drop_history(const host_port &node)
 {
     auto iter = find_from_dropped(node);
     if (iter != dropped.end())
@@ -391,7 +352,7 @@ bool config_context::record_drop_history(const rpc_address &node)
     return true;
 }
 
-int config_context::collect_drop_replica(const rpc_address &node, const replica_info &info)
+int config_context::collect_drop_replica(const host_port &node, const replica_info &info)
 {
     bool in_dropped = false;
     auto iter = find_from_dropped(node);
@@ -417,10 +378,9 @@ int config_context::collect_drop_replica(const rpc_address &node, const replica_
     iter = find_from_dropped(node);
     if (iter == dropped.end()) {
         CHECK(!in_dropped,
-              "adjust position of existing node({}) failed, this is a bug, partition({}.{})",
-              node.to_string(),
-              config_owner->pid.get_app_id(),
-              config_owner->pid.get_partition_index());
+              "adjust position of existing node({}) failed, this is a bug, partition({})",
+              node,
+              pc->pid);
         return -1;
     }
     return in_dropped ? 1 : 0;
@@ -432,21 +392,20 @@ bool config_context::check_order()
         return true;
     for (unsigned int i = 0; i < dropped.size() - 1; ++i) {
         if (dropped_cmp(dropped[i], dropped[i + 1]) > 0) {
-            LOG_ERROR("check dropped order for gpid(%d.%d) failed, [%s,%llu,%lld,%lld,%lld@%d] vs "
-                      "[%s,%llu,%lld,%lld,%lld@%d]",
-                      config_owner->pid.get_app_id(),
-                      config_owner->pid.get_partition_index(),
-                      dropped[i].node.to_string(),
+            LOG_ERROR("check dropped order for gpid({}) failed, [{},{},{},{},{}@{}] vs "
+                      "[{},{},{},{},{}@{}]",
+                      pc->pid,
+                      dropped[i].node,
                       dropped[i].time,
                       dropped[i].ballot,
                       dropped[i].last_committed_decree,
                       dropped[i].last_prepared_decree,
                       i,
-                      dropped[i].node.to_string(),
-                      dropped[i].time,
-                      dropped[i].ballot,
-                      dropped[i].last_committed_decree,
-                      dropped[i].last_prepared_decree,
+                      dropped[i + 1].node,
+                      dropped[i + 1].time,
+                      dropped[i + 1].ballot,
+                      dropped[i + 1].last_committed_decree,
+                      dropped[i + 1].last_prepared_decree,
                       i + 1);
             return false;
         }
@@ -454,7 +413,7 @@ bool config_context::check_order()
     return true;
 }
 
-std::vector<serving_replica>::iterator config_context::find_from_serving(const rpc_address &node)
+std::vector<serving_replica>::iterator config_context::find_from_serving(const host_port &node)
 {
     return std::find_if(serving.begin(), serving.end(), [&node](const serving_replica &r) {
         return r.node == node;
@@ -462,14 +421,14 @@ std::vector<serving_replica>::iterator config_context::find_from_serving(const r
 }
 
 std::vector<serving_replica>::const_iterator
-config_context::find_from_serving(const rpc_address &node) const
+config_context::find_from_serving(const host_port &node) const
 {
     return std::find_if(serving.begin(), serving.end(), [&node](const serving_replica &r) {
         return r.node == node;
     });
 }
 
-bool config_context::remove_from_serving(const rpc_address &node)
+bool config_context::remove_from_serving(const host_port &node)
 {
     auto iter = find_from_serving(node);
     if (iter != serving.end()) {
@@ -479,7 +438,7 @@ bool config_context::remove_from_serving(const rpc_address &node)
     return false;
 }
 
-void config_context::collect_serving_replica(const rpc_address &node, const replica_info &info)
+void config_context::collect_serving_replica(const host_port &node, const replica_info &info)
 {
     auto iter = find_from_serving(node);
     auto compact_status = info.__isset.manual_compact_status ? info.manual_compact_status
@@ -493,12 +452,12 @@ void config_context::collect_serving_replica(const rpc_address &node, const repl
     }
 }
 
-void config_context::adjust_proposal(const rpc_address &node, const replica_info &info)
+void config_context::adjust_proposal(const host_port &node, const replica_info &info)
 {
     lb_actions.track_current_learner(node, info);
 }
 
-bool config_context::get_disk_tag(const rpc_address &node, /*out*/ std::string &disk_tag) const
+bool config_context::get_disk_tag(const host_port &node, /*out*/ std::string &disk_tag) const
 {
     auto iter = find_from_serving(node);
     if (iter == serving.end()) {
@@ -518,9 +477,9 @@ void app_state_helper::on_init_partitions()
     context.prefered_dropped = -1;
     contexts.assign(owner->partition_count, context);
 
-    std::vector<partition_configuration> &partitions = owner->partitions;
+    auto &pcs = owner->pcs;
     for (unsigned int i = 0; i != owner->partition_count; ++i) {
-        contexts[i].config_owner = &(partitions[i]);
+        contexts[i].pc = &(pcs[i]);
     }
 
     partitions_in_progress.store(owner->partition_count);
@@ -569,17 +528,20 @@ app_state::app_state(const app_info &info) : app_info(info), helpers(new app_sta
     log_name = info.app_name + "(" + boost::lexical_cast<std::string>(info.app_id) + ")";
     helpers->owner = this;
 
-    partition_configuration config;
-    config.ballot = 0;
-    config.pid.set_app_id(app_id);
-    config.last_committed_decree = 0;
-    config.last_drops.clear();
-    config.max_replica_count = app_info::max_replica_count;
-    config.primary.set_invalid();
-    config.secondaries.clear();
-    partitions.assign(app_info::partition_count, config);
-    for (int i = 0; i != app_info::partition_count; ++i)
-        partitions[i].pid.set_partition_index(i);
+    partition_configuration pc;
+    pc.ballot = 0;
+    pc.pid.set_app_id(app_id);
+    pc.last_committed_decree = 0;
+    pc.max_replica_count = app_info::max_replica_count;
+
+    RESET_IP_AND_HOST_PORT(pc, primary);
+    CLEAR_IP_AND_HOST_PORT(pc, secondaries);
+    CLEAR_IP_AND_HOST_PORT(pc, last_drops);
+
+    pcs.assign(app_info::partition_count, pc);
+    for (int i = 0; i != app_info::partition_count; ++i) {
+        pcs[i].pid.set_partition_index(i);
+    }
 
     helpers->on_init_partitions();
 }

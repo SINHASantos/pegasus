@@ -24,39 +24,28 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 
-#include <sstream>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "utils/ports.h"
-#include "utils/singleton.h"
-#include "utils/synchronize.h"
+#include "nlohmann/json_fwd.hpp"
+#include "runtime/api_task.h"
 #include "runtime/global_config.h"
-#include "runtime/task/task.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
-#include "common/gpid.h"
 #include "runtime/service_app.h"
+#include "task/task_code.h"
+#include "utils/error_code.h"
+#include "utils/singleton.h"
 
 namespace dsn {
 
-class task_engine;
-class rpc_engine;
 class env_provider;
-class nfs_node;
-class task_queue;
-class task_worker_pool;
-class timer_service;
+class message_ex;
+class rpc_engine;
+class rpc_request_task;
+class task_engine;
 
 //
 //
@@ -71,10 +60,8 @@ public:
     rpc_engine *rpc() const { return _rpc.get(); }
     task_engine *computation() const { return _computation.get(); }
 
-    void get_runtime_info(const std::string &indent,
-                          const std::vector<std::string> &args,
-                          /*out*/ std::stringstream &ss);
-    void get_queue_info(/*out*/ std::stringstream &ss);
+    std::string get_runtime_info(const std::vector<std::string> &args) const;
+    nlohmann::json get_queue_info() const;
 
     dsn::error_code start();
     dsn::error_code start_app();
@@ -108,6 +95,7 @@ private:
 };
 
 class command_deregister;
+
 typedef std::map<int, std::shared_ptr<service_node>> service_nodes_by_app_id;
 class service_engine : public utils::singleton<service_engine>
 {

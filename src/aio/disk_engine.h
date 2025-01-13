@@ -26,13 +26,18 @@
 
 #pragma once
 
-#include "aio_provider.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <memory>
 
-#include "runtime/tool_api.h"
-#include "utils/synchronize.h"
+#include "aio/aio_task.h"
+#include "aio_provider.h"
+#include "rocksdb/env.h"
+#include "utils/singleton.h"
 #include "utils/work_queue.h"
 
 namespace dsn {
+class error_code;
 
 class disk_write_queue : public work_queue<aio_task>
 {
@@ -52,17 +57,21 @@ private:
 class disk_file
 {
 public:
-    explicit disk_file(linux_fd_t fd);
+    explicit disk_file(std::unique_ptr<rocksdb::RandomAccessFile> rf);
+    explicit disk_file(std::unique_ptr<rocksdb::RandomRWFile> wf);
     aio_task *read(aio_task *tsk);
     aio_task *write(aio_task *tsk, void *ctx);
 
     aio_task *on_read_completed(aio_task *wk, error_code err, size_t size);
     aio_task *on_write_completed(aio_task *wk, void *ctx, error_code err, size_t size);
 
-    linux_fd_t native_handle() const { return _fd; }
+    rocksdb::RandomAccessFile *rfile() const { return _read_file.get(); }
+    rocksdb::RandomRWFile *wfile() const { return _write_file.get(); }
 
 private:
-    linux_fd_t _fd;
+    // TODO(yingchun): unify to use a single RandomRWFile member variable.
+    std::unique_ptr<rocksdb::RandomAccessFile> _read_file;
+    std::unique_ptr<rocksdb::RandomRWFile> _write_file;
     disk_write_queue _write_queue;
     work_queue<aio_task> _read_queue;
 };

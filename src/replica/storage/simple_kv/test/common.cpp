@@ -24,22 +24,19 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     Replication testing framework.
- *
- * Revision history:
- *     Nov., 2015, @qinzuoyan (Zuoyan Qin), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #include "common.h"
-#include "checker.h"
 
-#include "utils/utils.h"
-
-#include <sstream>
+#include <boost/cstdint.hpp>
 #include <boost/lexical_cast.hpp>
+// IWYU pragma: no_include <ext/alloc_traits.h>
+#include <stddef.h>
+#include <sstream>
+
+#include "checker.h"
+#include "common/replication_enums.h"
+#include "dsn.layer2_types.h"
+#include "utils/fmt_logging.h"
+#include "utils/strings.h"
 
 namespace dsn {
 namespace replication {
@@ -89,27 +86,21 @@ partition_status::type partition_status_from_short_string(const std::string &str
     return partition_status::PS_INVALID;
 }
 
-std::string address_to_node(rpc_address addr)
+std::string address_to_node(host_port addr)
 {
-    if (addr.is_invalid())
+    if (!addr) {
         return "-";
+    }
     CHECK(test_checker::s_inited, "");
     return test_checker::instance().address_to_node_name(addr);
 }
 
-rpc_address node_to_address(const std::string &name)
+host_port node_to_address(const std::string &name)
 {
     if (name == "-")
-        return rpc_address();
+        return host_port();
     CHECK(test_checker::s_inited, "");
     return test_checker::instance().node_name_to_address(name);
-}
-
-std::string gpid_to_string(gpid gpid)
-{
-    std::stringstream oss;
-    oss << gpid.get_app_id() << "." << gpid.get_partition_index();
-    return oss.str();
 }
 
 bool gpid_from_string(const std::string &str, gpid &gpid)
@@ -126,7 +117,7 @@ std::string replica_id::to_string() const
 {
     std::stringstream oss;
 #ifdef ENABLE_GPID
-    oss << gpid_to_string(gpid) << "@" << node;
+    oss << gpid << "@" << node;
 #else
     oss << node;
 #endif
@@ -155,8 +146,8 @@ bool replica_id::from_string(const std::string &str)
 std::string replica_state::to_string() const
 {
     std::stringstream oss;
-    oss << "{" << id.to_string() << "," << partition_status_to_short_string(status) << "," << ballot
-        << "," << last_committed_decree;
+    oss << "{" << id << "," << partition_status_to_short_string(status) << "," << ballot << ","
+        << last_committed_decree;
     if (last_durable_decree != -1)
         oss << "," << last_durable_decree;
     oss << "}";
@@ -192,7 +183,7 @@ std::string state_snapshot::to_string() const
         const replica_state &s = kv.second;
         if (i != 0)
             oss << ",";
-        oss << s.to_string();
+        oss << s;
         i++;
     }
     oss << "}";
@@ -240,29 +231,28 @@ std::string state_snapshot::diff_string(const state_snapshot &other) const
     oss << "{" << std::endl;
     while (oth_it != oth.end() && cur_it != cur.end()) {
         if (oth_it->first < cur_it->first) {
-            oss << del_mark << oth_it->second.to_string() << std::endl;
+            oss << del_mark << oth_it->second << std::endl;
             ++oth_it;
         } else if (cur_it->first < oth_it->first) {
-            oss << add_mark << cur_it->second.to_string() << std::endl;
+            oss << add_mark << cur_it->second << std::endl;
             ++cur_it;
         } else {
             CHECK_EQ(oth_it->first, cur_it->first);
             if (oth_it->second != cur_it->second) {
-                oss << chg_mark << cur_it->second.to_string()
-                    << " <= " << oth_it->second.to_string() << std::endl;
+                oss << chg_mark << cur_it->second << " <= " << oth_it->second << std::endl;
             } else {
-                oss << unc_mark << cur_it->second.to_string() << std::endl;
+                oss << unc_mark << cur_it->second << std::endl;
             }
             ++oth_it;
             ++cur_it;
         }
     }
     while (oth_it != oth.end()) {
-        oss << del_mark << oth_it->second.to_string() << std::endl;
+        oss << del_mark << oth_it->second << std::endl;
         ++oth_it;
     }
     while (cur_it != cur.end()) {
-        oss << add_mark << cur_it->second.to_string() << std::endl;
+        oss << add_mark << cur_it->second << std::endl;
         ++cur_it;
     }
     oss << "}";
@@ -275,7 +265,7 @@ std::string parti_config::to_string() const
     std::stringstream oss;
     oss << "{"
 #ifdef ENABLE_GPID
-        << gpid_to_string(gpid) << ","
+        << gpid << ","
 #endif
         << ballot << "," << primary << ",[";
     for (size_t i = 0; i < secondaries.size(); ++i) {
@@ -325,15 +315,16 @@ bool parti_config::from_string(const std::string &str)
     return true;
 }
 
-void parti_config::convert_from(const partition_configuration &c)
+void parti_config::convert_from(const partition_configuration &pc)
 {
-    pid = c.pid;
-    ballot = c.ballot;
-    primary = address_to_node(c.primary);
-    for (auto &s : c.secondaries)
-        secondaries.push_back(address_to_node(s));
+    pid = pc.pid;
+    ballot = pc.ballot;
+    primary = address_to_node(pc.hp_primary);
+    for (const auto &secondary : pc.hp_secondaries) {
+        secondaries.push_back(address_to_node(secondary));
+    }
     std::sort(secondaries.begin(), secondaries.end());
 }
-}
-}
-}
+} // namespace test
+} // namespace replication
+} // namespace dsn

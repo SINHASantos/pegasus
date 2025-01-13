@@ -17,12 +17,32 @@
  * under the License.
  */
 
-#include "utils/fail_point.h"
+#include <fmt/core.h>
+#include <rocksdb/status.h>
+#include <rocksdb/write_batch.h>
+#include <stdint.h>
+#include <array>
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "base/pegasus_key_schema.h"
-#include "pegasus_server_test_base.h"
-#include "server/pegasus_server_write.h"
-#include "server/pegasus_write_service_impl.h"
+#include "common/gpid.h"
+#include "duplication_internal_types.h"
+#include "gtest/gtest.h"
 #include "message_utils.h"
+#include "pegasus_server_test_base.h"
+#include "rpc/rpc_message.h"
+#include "rrdb/rrdb.code.definition.h"
+#include "rrdb/rrdb_types.h"
+#include "runtime/message_utils.h"
+#include "server/pegasus_server_write.h"
+#include "server/pegasus_write_service.h"
+#include "server/pegasus_write_service_impl.h"
+#include "server/rocksdb_wrapper.h"
+#include "task/task_code.h"
+#include "utils/blob.h"
+#include "utils/fail_point.h"
 
 namespace pegasus {
 namespace server {
@@ -39,7 +59,7 @@ public:
     void SetUp() override
     {
         start();
-        _server_write = dsn::make_unique<pegasus_server_write>(_server.get(), true);
+        _server_write = std::make_unique<pegasus_server_write>(_server.get());
         _write_svc = _server_write->_write_svc.get();
     }
 
@@ -195,19 +215,21 @@ public:
         ASSERT_EQ(response.app_id, _gpid.get_app_id());
         ASSERT_EQ(response.partition_index, _gpid.get_partition_index());
         ASSERT_EQ(response.decree, decree);
-        ASSERT_EQ(response.server, _write_svc->_impl->_primary_address);
+        ASSERT_EQ(response.server, _write_svc->_impl->_primary_host_port);
         ASSERT_EQ(_write_svc->_impl->_rocksdb_wrapper->_write_batch->Count(), 0);
         ASSERT_EQ(_write_svc->_impl->_update_responses.size(), 0);
     }
 };
 
-TEST_F(pegasus_write_service_test, multi_put) { test_multi_put(); }
+INSTANTIATE_TEST_SUITE_P(, pegasus_write_service_test, ::testing::Values(false, true));
 
-TEST_F(pegasus_write_service_test, multi_remove) { test_multi_remove(); }
+TEST_P(pegasus_write_service_test, multi_put) { test_multi_put(); }
 
-TEST_F(pegasus_write_service_test, batched_writes) { test_batched_writes(); }
+TEST_P(pegasus_write_service_test, multi_remove) { test_multi_remove(); }
 
-TEST_F(pegasus_write_service_test, duplicate_not_batched)
+TEST_P(pegasus_write_service_test, batched_writes) { test_batched_writes(); }
+
+TEST_P(pegasus_write_service_test, duplicate_not_batched)
 {
     std::string hash_key = "hash_key";
     constexpr int kv_num = 100;
@@ -257,7 +279,7 @@ TEST_F(pegasus_write_service_test, duplicate_not_batched)
     }
 }
 
-TEST_F(pegasus_write_service_test, duplicate_batched)
+TEST_P(pegasus_write_service_test, duplicate_batched)
 {
     std::string hash_key = "hash_key";
     constexpr int kv_num = 100;
@@ -291,7 +313,7 @@ TEST_F(pegasus_write_service_test, duplicate_batched)
     }
 }
 
-TEST_F(pegasus_write_service_test, illegal_duplicate_request)
+TEST_P(pegasus_write_service_test, illegal_duplicate_request)
 {
     std::string hash_key = "hash_key";
     std::string sort_key = "sort_key";

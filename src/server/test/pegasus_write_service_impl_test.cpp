@@ -17,11 +17,24 @@
  * under the License.
  */
 
-#include "utils/fail_point.h"
+#include <fmt/core.h>
+#include <rocksdb/status.h>
+#include <stdint.h>
+#include <limits>
+#include <memory>
+#include <string>
+
+#include "gtest/gtest.h"
+#include "pegasus_key_schema.h"
 #include "pegasus_server_test_base.h"
+#include "rrdb/rrdb_types.h"
 #include "server/pegasus_server_write.h"
+#include "server/pegasus_write_service.h"
 #include "server/pegasus_write_service_impl.h"
-#include "message_utils.h"
+#include "server/rocksdb_wrapper.h"
+#include "utils/blob.h"
+#include "utils/fail_point.h"
+#include <string_view>
 
 namespace pegasus {
 namespace server {
@@ -37,12 +50,12 @@ public:
     void SetUp() override
     {
         start();
-        _server_write = dsn::make_unique<pegasus_server_write>(_server.get(), true);
+        _server_write = std::make_unique<pegasus_server_write>(_server.get());
         _write_impl = _server_write->_write_svc->_impl.get();
         _rocksdb_wrapper = _write_impl->_rocksdb_wrapper.get();
     }
 
-    int db_get(dsn::string_view raw_key, db_get_context *get_ctx)
+    int db_get(std::string_view raw_key, db_get_context *get_ctx)
     {
         return _rocksdb_wrapper->get(raw_key, get_ctx);
     }
@@ -66,29 +79,31 @@ public:
     {
         pegasus_write_service_impl_test::SetUp();
         pegasus::pegasus_generate_key(
-            req.key, dsn::string_view("hash_key"), dsn::string_view("sort_key"));
+            req.key, std::string_view("hash_key"), std::string_view("sort_key"));
     }
 
     dsn::apps::incr_request req;
     dsn::apps::incr_response resp;
 };
 
-TEST_F(incr_test, incr_on_absent_record)
+INSTANTIATE_TEST_SUITE_P(, incr_test, ::testing::Values(false, true));
+
+TEST_P(incr_test, incr_on_absent_record)
 {
     // ensure key is absent
     db_get_context get_ctx;
-    db_get(req.key, &get_ctx);
+    db_get(req.key.to_string_view(), &get_ctx);
     ASSERT_FALSE(get_ctx.found);
 
     req.increment = 100;
     _write_impl->incr(0, req, resp);
     ASSERT_EQ(resp.new_value, 100);
 
-    db_get(req.key, &get_ctx);
+    db_get(req.key.to_string_view(), &get_ctx);
     ASSERT_TRUE(get_ctx.found);
 }
 
-TEST_F(incr_test, negative_incr_and_zero_incr)
+TEST_P(incr_test, negative_incr_and_zero_incr)
 {
     req.increment = -100;
     ASSERT_EQ(0, _write_impl->incr(0, req, resp));
@@ -103,7 +118,7 @@ TEST_F(incr_test, negative_incr_and_zero_incr)
     ASSERT_EQ(resp.new_value, -101);
 }
 
-TEST_F(incr_test, invalid_incr)
+TEST_P(incr_test, invalid_incr)
 {
     single_set(req.key, dsn::blob::create_from_bytes("abc"));
 
@@ -120,7 +135,7 @@ TEST_F(incr_test, invalid_incr)
     ASSERT_EQ(resp.new_value, 100);
 }
 
-TEST_F(incr_test, fail_on_get)
+TEST_P(incr_test, fail_on_get)
 {
     dsn::fail::setup();
     dsn::fail::cfg("db_get", "100%1*return()");
@@ -133,7 +148,7 @@ TEST_F(incr_test, fail_on_get)
     dsn::fail::teardown();
 }
 
-TEST_F(incr_test, fail_on_put)
+TEST_P(incr_test, fail_on_put)
 {
     dsn::fail::setup();
     dsn::fail::cfg("db_write_batch_put", "100%1*return()");
@@ -146,7 +161,7 @@ TEST_F(incr_test, fail_on_put)
     dsn::fail::teardown();
 }
 
-TEST_F(incr_test, incr_on_expire_record)
+TEST_P(incr_test, incr_on_expire_record)
 {
     // make the key expired
     req.expire_ts_seconds = 1;
@@ -154,7 +169,7 @@ TEST_F(incr_test, incr_on_expire_record)
 
     // check whether the key is expired
     db_get_context get_ctx;
-    db_get(req.key, &get_ctx);
+    db_get(req.key.to_string_view(), &get_ctx);
     ASSERT_TRUE(get_ctx.expired);
 
     // incr the expired key
@@ -163,7 +178,7 @@ TEST_F(incr_test, incr_on_expire_record)
     _write_impl->incr(0, req, resp);
     ASSERT_EQ(resp.new_value, 100);
 
-    db_get(req.key, &get_ctx);
+    db_get(req.key.to_string_view(), &get_ctx);
     ASSERT_TRUE(get_ctx.found);
 }
 } // namespace server

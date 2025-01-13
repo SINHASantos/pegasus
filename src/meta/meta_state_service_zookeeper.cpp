@@ -24,23 +24,25 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     meta state service implemented with zookeeper
- *
- * Revision history:
- *     2015-12-04, @shengofsun (sunweijie@xiaomi.com)
- */
-#include "runtime/task/async_calls.h"
-#include "common/replication.codes.h"
-
-#include <boost/algorithm/string.hpp>
-#include <boost/lexical_cast.hpp>
+#include <string.h>
+#include <zookeeper/proto.h>
+#include <zookeeper/zookeeper.h>
+#include <zookeeper/zookeeper.jute.h>
+#include <algorithm>
+#include <atomic>
+#include <functional>
+#include <utility>
 
 #include "meta_state_service_zookeeper.h"
-#include "zookeeper/zookeeper_session_mgr.h"
-#include "zookeeper/zookeeper_session.h"
+#include "runtime/service_app.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/utils.h"
 #include "zookeeper/zookeeper_error.h"
+#include "zookeeper/zookeeper_session.h"
+#include "zookeeper/zookeeper_session_mgr.h"
+
+DSN_DECLARE_int32(timeout_ms);
 
 namespace dsn {
 namespace dist {
@@ -56,6 +58,7 @@ public:
     virtual error_code get_result(unsigned int entry_index) override;
 
     std::shared_ptr<zookeeper_session::zoo_atomic_packet> packet() { return _pkt; }
+
 private:
     std::shared_ptr<zookeeper_session::zoo_atomic_packet> _pkt;
 };
@@ -163,7 +166,7 @@ error_code meta_state_service_zookeeper::initialize(const std::vector<std::strin
                                             ref_this(this),
                                             std::placeholders::_1));
     if (_zoo_state != ZOO_CONNECTED_STATE) {
-        _notifier.wait_for(zookeeper_session_mgr::instance().timeout());
+        _notifier.wait_for(FLAGS_timeout_ms);
         if (_zoo_state != ZOO_CONNECTED_STATE)
             return ERR_TIMEOUT;
     }
@@ -206,7 +209,7 @@ task_ptr meta_state_service_zookeeper::create_node(const std::string &node,
 {
     error_code_future_ptr tsk(new error_code_future(cb_code, cb_create, 0));
     tsk->set_tracker(tracker);
-    LOG_DEBUG("call create, node(%s)", node.c_str());
+    LOG_DEBUG("call create, node({})", node);
     VISIT_INIT(tsk, zookeeper_session::ZOO_OPERATION::ZOO_CREATE, node);
     input->_value = value;
     input->_flags = 0;
@@ -246,7 +249,7 @@ task_ptr meta_state_service_zookeeper::delete_empty_node(const std::string &node
 {
     error_code_future_ptr tsk(new error_code_future(cb_code, cb_delete, 0));
     tsk->set_tracker(tracker);
-    LOG_DEBUG("call delete, node(%s)", node.c_str());
+    LOG_DEBUG("call delete, node({})", node);
     VISIT_INIT(tsk, zookeeper_session::ZOO_OPERATION::ZOO_DELETE, node);
     _session->visit(op);
     return tsk;
@@ -260,47 +263,49 @@ task_ptr meta_state_service_zookeeper::delete_node(const std::string &node,
 {
     error_code_future_ptr tsk(new error_code_future(cb_code, cb_delete, 0));
     tsk->set_tracker(tracker);
-    err_stringv_callback after_get_children = [node, recursively_delete, cb_code, tsk, this](
-        error_code err, const std::vector<std::string> &children) {
-        if (ERR_OK != err)
-            tsk->enqueue_with(err);
-        else if (children.empty())
-            delete_empty_node(
-                node, cb_code, [tsk](error_code err) { tsk->enqueue_with(err); }, &_tracker);
-        else if (!recursively_delete)
-            tsk->enqueue_with(ERR_INVALID_PARAMETERS);
-        else {
-            std::atomic_int *child_count = new std::atomic_int();
-            std::atomic_int *error_count = new std::atomic_int();
+    err_stringv_callback after_get_children =
+        [node, recursively_delete, cb_code, tsk, this](error_code err,
+                                                       const std::vector<std::string> &children) {
+            if (ERR_OK != err)
+                tsk->enqueue_with(err);
+            else if (children.empty())
+                delete_empty_node(
+                    node, cb_code, [tsk](error_code err) { tsk->enqueue_with(err); }, &_tracker);
+            else if (!recursively_delete)
+                tsk->enqueue_with(ERR_INVALID_PARAMETERS);
+            else {
+                std::atomic_int *child_count = new std::atomic_int();
+                std::atomic_int *error_count = new std::atomic_int();
 
-            child_count->store((int)children.size());
-            error_count->store(0);
+                child_count->store((int)children.size());
+                error_count->store(0);
 
-            for (auto &child : children) {
-                delete_node(node + "/" + child,
-                            true,
-                            cb_code,
-                            [=](error_code err) {
-                                if (ERR_OK != err)
-                                    ++(*error_count);
-                                int result = --(*child_count);
-                                if (0 == result) {
-                                    if (0 == *error_count)
-                                        delete_empty_node(
-                                            node,
-                                            cb_code,
-                                            [tsk](error_code err) { tsk->enqueue_with(err); },
-                                            &_tracker);
-                                    else
-                                        tsk->enqueue_with(ERR_FILE_OPERATION_FAILED);
-                                    delete child_count;
-                                    delete error_count;
-                                }
-                            },
-                            &_tracker);
+                for (auto &child : children) {
+                    delete_node(
+                        node + "/" + child,
+                        true,
+                        cb_code,
+                        [=](error_code err) {
+                            if (ERR_OK != err)
+                                ++(*error_count);
+                            int result = --(*child_count);
+                            if (0 == result) {
+                                if (0 == *error_count)
+                                    delete_empty_node(
+                                        node,
+                                        cb_code,
+                                        [tsk](error_code err) { tsk->enqueue_with(err); },
+                                        &_tracker);
+                                else
+                                    tsk->enqueue_with(ERR_FILE_OPERATION_FAILED);
+                                delete child_count;
+                                delete error_count;
+                            }
+                        },
+                        &_tracker);
+                }
             }
-        }
-    };
+        };
 
     get_children(node, cb_code, after_get_children, &_tracker);
     return tsk;
@@ -313,7 +318,7 @@ task_ptr meta_state_service_zookeeper::get_data(const std::string &node,
 {
     err_value_future_ptr tsk(new err_value_future(cb_code, cb_get_data, 0));
     tsk->set_tracker(tracker);
-    LOG_DEBUG("call get, node(%s)", node.c_str());
+    LOG_DEBUG("call get, node({})", node);
     VISIT_INIT(tsk, zookeeper_session::ZOO_OPERATION::ZOO_GET, node);
     input->_is_set_watch = 0;
     _session->visit(op);
@@ -328,7 +333,7 @@ task_ptr meta_state_service_zookeeper::set_data(const std::string &node,
 {
     error_code_future_ptr tsk(new error_code_future(cb_code, cb_set_data, 0));
     tsk->set_tracker(tracker);
-    LOG_DEBUG("call set, node(%s)", node.c_str());
+    LOG_DEBUG("call set, node({})", node);
     VISIT_INIT(tsk, zookeeper_session::ZOO_OPERATION::ZOO_SET, node);
 
     input->_value = value;
@@ -343,7 +348,7 @@ task_ptr meta_state_service_zookeeper::node_exist(const std::string &node,
 {
     error_code_future_ptr tsk(new error_code_future(cb_code, cb_exist, 0));
     tsk->set_tracker(tracker);
-    LOG_DEBUG("call node_exist, node(%s)", node.c_str());
+    LOG_DEBUG("call node_exist, node({})", node);
     VISIT_INIT(tsk, zookeeper_session::ZOO_OPERATION::ZOO_EXISTS, node);
     input->_is_set_watch = 0;
     _session->visit(op);
@@ -357,7 +362,7 @@ task_ptr meta_state_service_zookeeper::get_children(const std::string &node,
 {
     err_stringv_future_ptr tsk(new err_stringv_future(cb_code, cb_get_children, 0));
     tsk->set_tracker(tracker);
-    LOG_DEBUG("call get children, node(%s)", node.c_str());
+    LOG_DEBUG("call get children, node({})", node);
     VISIT_INIT(tsk, zookeeper_session::ZOO_OPERATION::ZOO_GETCHILDREN, node);
     input->_is_set_watch = 0;
     _session->visit(op);
@@ -388,8 +393,9 @@ void meta_state_service_zookeeper::visit_zookeeper_internal(ref_this,
 {
     zookeeper_session::zoo_opcontext *op =
         reinterpret_cast<zookeeper_session::zoo_opcontext *>(result);
-    LOG_DEBUG(
-        "visit zookeeper internal: ans(%s), call type(%d)", zerror(op->_output.error), op->_optype);
+    LOG_DEBUG("visit zookeeper internal: ans({}), call type({})",
+              zerror(op->_output.error),
+              static_cast<int>(op->_optype));
 
     switch (op->_optype) {
     case zookeeper_session::ZOO_OPERATION::ZOO_CREATE:
@@ -426,5 +432,5 @@ void meta_state_service_zookeeper::visit_zookeeper_internal(ref_this,
         break;
     }
 }
-}
-}
+} // namespace dist
+} // namespace dsn

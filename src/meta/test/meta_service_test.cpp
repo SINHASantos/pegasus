@@ -15,11 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "meta_test_base.h"
-#include "meta/meta_service.h"
+#include <fmt/core.h>
+#include <memory>
+#include <string>
+#include <vector>
 
+#include "common/replication.codes.h"
+#include "gtest/gtest.h"
+#include "meta/meta_rpc_types.h"
+#include "meta/meta_service.h"
+#include "meta_admin_types.h"
+#include "meta_test_base.h"
+#include "rpc/network.sim.h"
+#include "rpc/rpc_address.h"
+#include "rpc/rpc_holder.h"
+#include "rpc/rpc_host_port.h"
+#include "rpc/rpc_message.h"
+#include "rpc/serialization.h"
+#include "utils/autoref_ptr.h"
+#include "utils/error_code.h"
 #include "utils/fail_point.h"
-#include "runtime/rpc/network.sim.h"
 
 namespace dsn {
 namespace replication {
@@ -30,18 +45,17 @@ public:
     void check_status_failure()
     {
         fail::setup();
-        fail::cfg("meta_server_failure_detector_get_leader", "return(false#1.2.3.4:10086)");
+        fail::cfg("meta_server_failure_detector_get_leader", "return(false#localhost:10086)");
 
         /** can't forward to others */
         RPC_MOCKING(app_env_rpc)
         {
-            rpc_address leader;
+            host_port leader;
             auto rpc = create_fake_rpc();
             rpc.dsn_request()->header->context.u.is_forward_supported = false;
-            bool res = _ms->check_status(rpc, &leader);
-            ASSERT_EQ(false, res);
+            ASSERT_FALSE(_ms->check_status_and_authz(rpc, &leader));
             ASSERT_EQ(ERR_FORWARD_TO_OTHERS, rpc.response().err);
-            ASSERT_EQ(leader.to_std_string(), "1.2.3.4:10086");
+            ASSERT_EQ(leader.to_string(), "localhost:10086");
             ASSERT_EQ(app_env_rpc::forward_mail_box().size(), 0);
         }
 
@@ -49,11 +63,10 @@ public:
         RPC_MOCKING(app_env_rpc)
         {
             auto rpc = create_fake_rpc();
-            bool res = _ms->check_status(rpc);
-            ASSERT_EQ(false, res);
+            ASSERT_FALSE(_ms->check_status_and_authz(rpc));
             ASSERT_EQ(app_env_rpc::forward_mail_box().size(), 1);
-            ASSERT_EQ(app_env_rpc::forward_mail_box()[0].remote_address().to_std_string(),
-                      "1.2.3.4:10086");
+            ASSERT_STREQ("127.0.0.1:10086",
+                         app_env_rpc::forward_mail_box()[0].remote_address().to_string());
         }
 
         fail::teardown();
@@ -62,14 +75,13 @@ public:
     void check_status_success()
     {
         fail::setup();
-        fail::cfg("meta_server_failure_detector_get_leader", "return(true#1.2.3.4:10086)");
+        fail::cfg("meta_server_failure_detector_get_leader", "return(true#localhost:10086)");
 
         RPC_MOCKING(app_env_rpc)
         {
-            rpc_address leader;
+            host_port leader;
             auto rpc = create_fake_rpc();
-            auto res = _ms->check_status(rpc, &leader);
-            ASSERT_EQ(true, res);
+            ASSERT_TRUE(_ms->check_status_and_authz(rpc, &leader));
             ASSERT_EQ(app_env_rpc::forward_mail_box().size(), 0);
         }
 

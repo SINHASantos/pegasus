@@ -15,15 +15,33 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "utils/fail_point.h"
-#include "utils/filesystem.h"
-#include <gtest/gtest.h>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <string>
+// IWYU pragma: no_include <type_traits>
+#include <utility>
+#include <vector>
 
+#include "backup_types.h"
 #include "common/backup_common.h"
+#include "common/gpid.h"
+#include "common/replication.codes.h"
+#include "gtest/gtest.h"
+#include "meta/backup_engine.h"
 #include "meta/meta_backup_service.h"
+#include "meta/meta_data.h"
+#include "meta/meta_rpc_types.h"
 #include "meta/meta_service.h"
 #include "meta/server_state.h"
 #include "meta_test_base.h"
+#include "rpc/rpc_host_port.h"
+#include "runtime/api_layer1.h"
+#include "utils/env.h"
+#include "utils/error_code.h"
+#include "utils/fail_point.h"
+#include "utils/filesystem.h"
+#include "utils/zlocks.h"
 
 namespace dsn {
 namespace replication {
@@ -53,7 +71,7 @@ public:
     start_backup_app_response
     start_backup(int32_t app_id, const std::string &provider, const std::string &backup_path = "")
     {
-        auto request = dsn::make_unique<start_backup_app_request>();
+        auto request = std::make_unique<start_backup_app_request>();
         request->app_id = app_id;
         request->backup_provider_type = provider;
         if (!backup_path.empty()) {
@@ -68,7 +86,7 @@ public:
 
     query_backup_status_response query_backup(int32_t app_id, int64_t backup_id)
     {
-        auto request = dsn::make_unique<query_backup_status_request>();
+        auto request = std::make_unique<query_backup_status_request>();
         request->app_id = app_id;
         request->__isset.backup_id = true;
         request->backup_id = backup_id;
@@ -90,7 +108,8 @@ public:
             cold_backup::get_app_metadata_file(backup_root, app->app_name, app_id, backup_id);
 
         int64_t metadata_file_size = 0;
-        if (!dsn::utils::filesystem::file_size(metadata_file, metadata_file_size)) {
+        if (!dsn::utils::filesystem::file_size(
+                metadata_file, dsn::utils::FileDataType::kSensitive, metadata_file_size)) {
             return false;
         }
         return metadata_file_size > 0;
@@ -186,6 +205,31 @@ TEST_F(backup_service_test, test_query_backup_status)
     ASSERT_EQ(1, resp.backup_items.size());
 }
 
+TEST_F(backup_service_test, test_valid_policy_name)
+{
+    std::string hint_message;
+    ASSERT_FALSE(_backup_service->is_valid_policy_name_unlocked(cold_backup_constant::BACKUP_INFO,
+                                                                hint_message));
+    ASSERT_EQ("policy name is reserved", hint_message);
+
+    ASSERT_FALSE(_backup_service->is_valid_policy_name_unlocked("bad-policy-name", hint_message));
+    ASSERT_EQ("policy name should match regex '[a-zA-Z_:][a-zA-Z0-9_:]*' when act as a metric name "
+              "in prometheus",
+              hint_message);
+
+    ASSERT_FALSE(_backup_service->is_valid_policy_name_unlocked("bad_policy_name:", hint_message));
+    ASSERT_EQ("policy name should match regex '[a-zA-Z_][a-zA-Z0-9_]*' when act as a metric label "
+              "in prometheus",
+              hint_message);
+
+    _backup_service->_policy_states.insert(std::make_pair("exist_policy_name", nullptr));
+    ASSERT_FALSE(_backup_service->is_valid_policy_name_unlocked("exist_policy_name", hint_message));
+    ASSERT_EQ("policy name is already exist", hint_message);
+
+    ASSERT_TRUE(_backup_service->is_valid_policy_name_unlocked("new_policy_name0", hint_message));
+    ASSERT_TRUE(hint_message.empty());
+}
+
 class backup_engine_test : public meta_test_base
 {
 public:
@@ -232,7 +276,7 @@ public:
                               int32_t progress)
     {
         gpid pid = gpid(_app_id, partition_index);
-        rpc_address mock_primary_address = rpc_address("127.0.0.1", 10000 + partition_index);
+        const auto hp_mock_primary = host_port("localhost", 10000 + partition_index);
 
         backup_response resp;
         resp.backup_id = _backup_engine->_cur_backup.backup_id;
@@ -240,15 +284,15 @@ public:
         resp.err = resp_err;
         resp.progress = progress;
 
-        _backup_engine->on_backup_reply(rpc_err, resp, pid, mock_primary_address);
+        _backup_engine->on_backup_reply(rpc_err, resp, pid, hp_mock_primary);
     }
 
     void mock_on_backup_reply_when_timeout(int32_t partition_index, error_code rpc_err)
     {
         gpid pid = gpid(_app_id, partition_index);
-        rpc_address mock_primary_address = rpc_address("127.0.0.1", 10000 + partition_index);
+        const auto hp_mock_primary = host_port("localhost", 10000 + partition_index);
         backup_response resp;
-        _backup_engine->on_backup_reply(rpc_err, resp, pid, mock_primary_address);
+        _backup_engine->on_backup_reply(rpc_err, resp, pid, hp_mock_primary);
     }
 
     bool is_backup_failed() const

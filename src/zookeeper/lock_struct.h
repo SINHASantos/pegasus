@@ -24,20 +24,19 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     distributed lock service implemented with zookeeper, the definition of each lock structure
- *
- * Revision history:
- *     2015-12-04, @shengofsun (sunweijie@xiaomi.com)
- */
 #pragma once
 
-#include "utils/thread_access_checker.h"
-#include "utils/distributed_lock_service.h"
+#include <stdint.h>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "lock_types.h"
+#include "task/future_types.h"
+#include "utils/autoref_ptr.h"
+#include "utils/distributed_lock_service.h"
+#include "utils/fmt_utils.h"
+#include "utils/thread_access_checker.h"
 
 namespace dsn {
 namespace dist {
@@ -52,6 +51,7 @@ enum lock_state
     unlocking,
     state_count
 };
+USER_DEFINED_ENUM_FORMATTER(lock_state)
 
 struct zoolock_pair
 {
@@ -122,5 +122,5 @@ private:
 
     thread_access_checker _checker;
 };
-}
-}
+} // namespace dist
+} // namespace dsn

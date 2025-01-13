@@ -17,18 +17,25 @@
 
 #include "hotspot_partition_calculator.h"
 
-#include <math.h>
-#include "utils/fmt_logging.h"
+// IWYU pragma: no_include <ext/alloc_traits.h>
+#include <fmt/core.h>
+#include <algorithm>
+#include <cmath>
+#include <string_view>
+
+#include "client/replication_ddl_client.h"
+#include "common/gpid.h"
 #include "common/serialization_helper/dsn.layer2_types.h"
-#include "utils/flags.h"
+#include "perf_counter/perf_counter.h"
+#include "rpc/rpc_host_port.h"
+#include "server/hotspot_partition_stat.h"
+#include "shell/command_executor.h"
 #include "utils/error_code.h"
 #include "utils/fail_point.h"
-#include "common//duplication_common.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
 
-namespace pegasus {
-namespace server {
-
-DSN_DEFINE_int64("pegasus.collector",
+DSN_DEFINE_int64(pegasus.collector,
                  max_hotspot_store_size,
                  100,
                  "the max count of historical data "
@@ -37,24 +44,29 @@ DSN_DEFINE_int64("pegasus.collector",
                  "eliminate outdated historical "
                  "data");
 
-DSN_DEFINE_bool("pegasus.collector",
+DSN_DEFINE_bool(pegasus.collector,
                 enable_detect_hotkey,
                 false,
                 "auto detect hot key in the hot paritition");
 DSN_TAG_VARIABLE(enable_detect_hotkey, FT_MUTABLE);
 
-DSN_DEFINE_uint32("pegasus.collector",
+DSN_DEFINE_uint32(pegasus.collector,
                   hot_partition_threshold,
                   3,
                   "threshold of hotspot partition value, if app.stat.hotspots >= "
                   "FLAGS_hotpartition_threshold, this partition is a hot partition");
 DSN_TAG_VARIABLE(hot_partition_threshold, FT_MUTABLE);
 
-DSN_DEFINE_uint32("pegasus.collector",
+DSN_DEFINE_uint32(pegasus.collector,
                   occurrence_threshold,
                   3,
                   "hot paritiotion occurrence times' threshold to send rpc to detect hotkey");
 DSN_TAG_VARIABLE(occurrence_threshold, FT_MUTABLE);
+
+struct row_data;
+
+namespace pegasus {
+namespace server {
 
 void hotspot_partition_calculator::data_aggregate(const std::vector<row_data> &partition_stats)
 {
@@ -72,7 +84,7 @@ void hotspot_partition_calculator::init_perf_counter(int partition_count)
 {
     for (int data_type = 0; data_type <= 1; data_type++) {
         for (int i = 0; i < partition_count; i++) {
-            string partition_desc =
+            std::string partition_desc =
                 _app_name + '.' +
                 (data_type == partition_qps_type::WRITE_HOTSPOT_DATA ? "write." : "read.") +
                 std::to_string(i);
@@ -83,7 +95,7 @@ void hotspot_partition_calculator::init_perf_counter(int partition_count)
                 "app.pegasus", counter_name.c_str(), COUNTER_TYPE_NUMBER, counter_desc.c_str());
         }
 
-        string total_desc =
+        std::string total_desc =
             _app_name + '.' +
             (data_type == partition_qps_type::WRITE_HOTSPOT_DATA ? "write.total" : "read.total");
         std::string counter_name = fmt::format("app.stat.hotspots.{}", total_desc);
@@ -176,10 +188,10 @@ void hotspot_partition_calculator::detect_hotkey_in_hotpartition(int data_type)
     for (int index = 0; index < _hot_points.size(); index++) {
         if (_hot_points[index][data_type].get()->get_value() >= now_hot_partition_threshold) {
             if (++_hotpartition_counter[index][data_type] >= now_occurrence_threshold) {
-                LOG_ERROR_F("Find a {} hot partition {}.{}",
-                            (data_type == partition_qps_type::READ_HOTSPOT_DATA ? "read" : "write"),
-                            _app_name,
-                            index);
+                LOG_ERROR("Find a {} hot partition {}.{}",
+                          (data_type == partition_qps_type::READ_HOTSPOT_DATA ? "read" : "write"),
+                          _app_name,
+                          index);
                 send_detect_hotkey_request(_app_name,
                                            index,
                                            (data_type == dsn::replication::hotkey_type::type::READ)
@@ -200,41 +212,40 @@ void hotspot_partition_calculator::send_detect_hotkey_request(
     const dsn::replication::hotkey_type::type hotkey_type,
     const dsn::replication::detect_action::type action)
 {
-    FAIL_POINT_INJECT_F("send_detect_hotkey_request", [](dsn::string_view) {});
+    FAIL_POINT_INJECT_F("send_detect_hotkey_request", [](std::string_view) {});
 
     int app_id = -1;
     int partition_count = -1;
-    std::vector<dsn::partition_configuration> partitions;
-    _shell_context->ddl_client->list_app(app_name, app_id, partition_count, partitions);
+    std::vector<dsn::partition_configuration> pcs;
+    _shell_context->ddl_client->list_app(app_name, app_id, partition_count, pcs);
 
-    auto target_address = partitions[partition_index].primary;
     dsn::replication::detect_hotkey_response resp;
     dsn::replication::detect_hotkey_request req;
     req.type = hotkey_type;
     req.action = action;
     req.pid = dsn::gpid(app_id, partition_index);
-    auto error = _shell_context->ddl_client->detect_hotkey(target_address, req, resp);
+    auto error =
+        _shell_context->ddl_client->detect_hotkey(pcs[partition_index].hp_primary, req, resp);
 
-    LOG_INFO_F("{} {} hotkey detection in {}.{}, server address: {}",
-               (action == dsn::replication::detect_action::STOP) ? "Stop" : "Start",
-               (hotkey_type == dsn::replication::hotkey_type::WRITE) ? "write" : "read",
-               app_name,
-               partition_index,
-               target_address.to_string());
-
+    LOG_INFO("{} {} hotkey detection in {}.{}, server: {}",
+             (action == dsn::replication::detect_action::STOP) ? "Stop" : "Start",
+             (hotkey_type == dsn::replication::hotkey_type::WRITE) ? "write" : "read",
+             app_name,
+             partition_index,
+             FMT_HOST_PORT_AND_IP(pcs[partition_index], primary));
     if (error != dsn::ERR_OK) {
-        LOG_ERROR_F("Hotkey detect rpc sending failed, in {}.{}, error_hint:{}",
-                    app_name,
-                    partition_index,
-                    error.to_string());
+        LOG_ERROR("Hotkey detect rpc sending failed, in {}.{}, error_hint:{}",
+                  app_name,
+                  partition_index,
+                  error);
     }
 
     if (resp.err != dsn::ERR_OK) {
-        LOG_ERROR_F("Hotkey detect rpc executing failed, in {}.{}, error_hint:{} {}",
-                    app_name,
-                    partition_index,
-                    resp.err,
-                    resp.err_hint);
+        LOG_ERROR("Hotkey detect rpc executing failed, in {}.{}, error_hint:{} {}",
+                  app_name,
+                  partition_index,
+                  resp.err,
+                  resp.err_hint);
     }
 }
 

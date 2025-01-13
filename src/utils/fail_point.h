@@ -33,28 +33,41 @@
 /// A fail point implementation in C++.
 /// This lib is ported from https://github.com/pingcap/fail-rs.
 
-#include "utils/string_view.h"
+#include <string>
 
-/// The only entry to define a fail point with `return` function: lambda function must be
-/// return non-void type. When a fail point is defined, it's referenced via the name.
-#define FAIL_POINT_INJECT_F(name, lambda)                                                          \
+#include "utils/ports.h"
+#include <string_view>
+
+// The only entry to define a fail point with `return` function: lambda function must be
+// return non-void type. When a fail point is defined, it's referenced via the name.
+//
+// Lambda function is declare as variadic argument, for the reason that comma(,) might exist in
+// lambda expressions (for example, capture or parameter list). If it was declared as a single
+// argument, preprocess for this macro would fail for mismatched arguments.
+#define FAIL_POINT_INJECT_F(name, ...)                                                             \
     do {                                                                                           \
-        if (dsn_likely(!::dsn::fail::_S_FAIL_POINT_ENABLED))                                       \
+        if (dsn_likely(!::dsn::fail::_S_FAIL_POINT_ENABLED)) {                                     \
             break;                                                                                 \
-        auto __Func = lambda;                                                                      \
+        }                                                                                          \
+        auto __Func = __VA_ARGS__;                                                                 \
         auto __Res = ::dsn::fail::eval(name);                                                      \
         if (__Res != nullptr) {                                                                    \
             return __Func(*__Res);                                                                 \
         }                                                                                          \
     } while (0)
 
-/// The only entry to define a fail point with `not return` function: lambda function usually
-/// return void type. When a fail point is defined, it's referenced via the name.
-#define FAIL_POINT_INJECT_NOT_RETURN_F(name, lambda)                                               \
+// The only entry to define a fail point with `not return` function: lambda function usually
+// return void type. When a fail point is defined, it's referenced via the name.
+//
+// Lambda function is declare as variadic argument, for the reason that comma(,) might exist in
+// lambda expressions (for example, capture or parameter list). If it was declared as a single
+// argument, preprocess for this macro would fail for mismatched arguments.
+#define FAIL_POINT_INJECT_NOT_RETURN_F(name, ...)                                                  \
     do {                                                                                           \
-        if (dsn_likely(!::dsn::fail::_S_FAIL_POINT_ENABLED))                                       \
+        if (dsn_likely(!::dsn::fail::_S_FAIL_POINT_ENABLED)) {                                     \
             break;                                                                                 \
-        auto __Func = lambda;                                                                      \
+        }                                                                                          \
+        auto __Func = __VA_ARGS__;                                                                 \
         auto __Res = ::dsn::fail::eval(name);                                                      \
         if (__Res != nullptr) {                                                                    \
             __Func(*__Res);                                                                        \
@@ -64,14 +77,14 @@
 namespace dsn {
 namespace fail {
 
-extern const std::string *eval(dsn::string_view name);
+extern const std::string *eval(std::string_view name);
 
 /// Set new actions to a fail point at runtime.
 /// The format of an action is `[p%][cnt*]task[(arg)]`. `p%` is the expected probability that
 /// the action is triggered, and `cnt*` is the max times the action can be triggered.
 /// For example, `20%3*print(still alive!)` means the fail point has 20% chance to print a
 /// message "still alive!". And the message will be printed at most 3 times.
-extern void cfg(dsn::string_view name, dsn::string_view action);
+extern void cfg(std::string_view name, std::string_view action);
 
 extern void setup();
 

@@ -16,19 +16,26 @@
 // under the License.
 
 #include <boost/algorithm/string/join.hpp>
-
-#include "utils/flags.h"
-#include "utils/config_api.h"
-#include "utils/singleton.h"
-#include "utils/errors.h"
-#include "utils/string_conv.h"
-#include "utils/join_point.h"
-#include "utils/api_utilities.h"
-#include <boost/optional/optional.hpp>
-#include "utils/fmt_logging.h"
-
+#include <fmt/core.h>
+#include <algorithm>
+#include <iosfwd>
+#include <iterator>
+#include <list>
 #include <map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "utils/config_api.h"
+#include "utils/enum_helper.h"
+#include "utils/error_code.h"
+#include "utils/errors.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/join_point.h"
 #include "utils/output_utils.h"
+#include "utils/singleton.h"
+#include "utils/string_conv.h"
 
 namespace dsn {
 
@@ -108,6 +115,8 @@ public:
           _name(name),
           _desc(desc)
     {
+        // For historical reason, check the 'section' parameter doesn't start with '"'.
+        CHECK_NE_MSG(*section, '"', "config section({}) should not start with '\"'", section);
     }
 
     error_s update(const std::string &val)
@@ -313,7 +322,7 @@ public:
     {
         const auto iter = _flags.find(name);
         if (iter == _flags.end()) {
-            return error_s::make(ERR_OBJECT_NOT_FOUND, fmt::format("{} is not found", name));
+            return error_s::make(ERR_OBJECT_NOT_FOUND, fmt::format("'{}' is not found", name));
         }
 
         return iter->second.to_json();

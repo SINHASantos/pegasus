@@ -24,32 +24,25 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     a singleton to manager all zookeeper sessions, so that each zookeeper session
- *     can be shared by all threads in one service-node. The implementation file.
- *
- * Revision history:
- *     2015-12-04, @shengofsun (sunweijie@xiaomi.com)
- */
 #include "zookeeper_session_mgr.h"
-#include "zookeeper_session.h"
 
 #include <stdio.h>
 #include <zookeeper/zookeeper.h>
-#include <stdexcept>
+#include <functional>
+
+#include "runtime/service_app.h"
+#include "utils/flags.h"
+#include "utils/singleton_store.h"
+#include "zookeeper_session.h"
+
+DSN_DEFINE_string(zookeeper, logfile, "zoo.log", "The Zookeeper logfile");
 
 namespace dsn {
 namespace dist {
 
 zookeeper_session_mgr::zookeeper_session_mgr()
 {
-    _zoo_hosts = dsn_config_get_value_string("zookeeper", "hosts_list", "", "zookeeper_hosts");
-    _timeout_ms = dsn_config_get_value_uint64(
-        "zookeeper", "timeout_ms", 30000, "zookeeper_timeout_milliseconds");
-    _zoo_logfile = dsn_config_get_value_string("zookeeper", "logfile", "", "zookeeper logfile");
-
-    FILE *fp = fopen(_zoo_logfile.c_str(), "a");
+    FILE *fp = fopen(FLAGS_logfile, "a");
     if (fp != nullptr)
         zoo_set_log_stream(fp);
 }
@@ -58,12 +51,11 @@ zookeeper_session *zookeeper_session_mgr::get_session(const service_app_info &in
 {
     auto &store = utils::singleton_store<int, zookeeper_session *>::instance();
     zookeeper_session *ans = nullptr;
-    utils::auto_lock<utils::ex_lock_nr> l(_store_lock);
     if (!store.get(info.entity_id, ans)) {
         ans = new zookeeper_session(info);
         store.put(info.entity_id, ans);
     }
     return ans;
 }
-}
-}
+} // namespace dist
+} // namespace dsn

@@ -19,11 +19,20 @@
 
 #include "value_schema_v0.h"
 
+#include <string_view>
+#include <stdint.h>
+#include <string.h>
+#include <algorithm>
+#include <array>
+#include <utility>
+#include <vector>
+
+#include "utils/endians.h"
 #include "utils/fmt_logging.h"
-#include "utils/smart_pointers.h"
+#include "utils/ports.h"
 
 namespace pegasus {
-std::unique_ptr<value_field> value_schema_v0::extract_field(dsn::string_view value,
+std::unique_ptr<value_field> value_schema_v0::extract_field(std::string_view value,
                                                             value_field_type type)
 {
     std::unique_ptr<value_field> field = nullptr;
@@ -71,17 +80,17 @@ rocksdb::SliceParts value_schema_v0::generate_value(const value_params &params)
     params.write_slices.clear();
     params.write_slices.emplace_back(params.write_buf.data(), params.write_buf.size());
 
-    dsn::string_view user_data = data_field->user_data;
+    std::string_view user_data = data_field->user_data;
     if (user_data.length() > 0) {
         params.write_slices.emplace_back(user_data.data(), user_data.length());
     }
     return {&params.write_slices[0], static_cast<int>(params.write_slices.size())};
 }
 
-std::unique_ptr<value_field> value_schema_v0::extract_timestamp(dsn::string_view value)
+std::unique_ptr<value_field> value_schema_v0::extract_timestamp(std::string_view value)
 {
     uint32_t expire_ts = dsn::data_input(value).read_u32();
-    return dsn::make_unique<expire_timestamp_field>(expire_ts);
+    return std::make_unique<expire_timestamp_field>(expire_ts);
 }
 
 void value_schema_v0::update_expire_ts(std::string &value, std::unique_ptr<value_field> field)

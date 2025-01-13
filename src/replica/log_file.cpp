@@ -26,15 +26,32 @@
 
 #include "log_file.h"
 
-#include <fcntl.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <utility>
+#include <vector>
 
-#include "utils/filesystem.h"
-#include "utils/crc.h"
-#include "utils/fmt_logging.h"
-
+#include "aio/file_io.h"
 #include "log_file_stream.h"
+#include "replica/log_block.h"
+#include "replica/mutation.h"
+#include "utils/binary_reader.h"
+#include "utils/binary_writer.h"
+#include "utils/blob.h"
+#include "utils/crc.h"
+#include "utils/env.h"
+#include "utils/filesystem.h"
+#include "utils/fmt_logging.h"
+#include "utils/latency_tracer.h"
+#include "utils/ports.h"
+#include "utils/strings.h"
 
 namespace dsn {
+class disk_file;
+class task_tracker;
+
 namespace replication {
 
 log_file::~log_file() { close(); }
@@ -46,7 +63,7 @@ log_file::~log_file() { close(); }
     // log.index.start_offset
     if (name.length() < strlen("log.") || name.substr(0, strlen("log.")) != std::string("log.")) {
         err = ERR_INVALID_PARAMETERS;
-        LOG_WARNING("invalid log path %s", path);
+        LOG_WARNING("invalid log path {}", path);
         return nullptr;
     }
 
@@ -55,7 +72,7 @@ log_file::~log_file() { close(); }
     auto pos2 = name.find_first_of('.', pos + 1);
     if (pos2 == std::string::npos) {
         err = ERR_INVALID_PARAMETERS;
-        LOG_WARNING("invalid log path %s", path);
+        LOG_WARNING("invalid log path {}", path);
         return nullptr;
     }
 
@@ -64,7 +81,7 @@ log_file::~log_file() { close(); }
     std::string start_offset_str = name.substr(pos2 + 1);
     if (index_str.empty() || start_offset_str.empty()) {
         err = ERR_INVALID_PARAMETERS;
-        LOG_WARNING("invalid log path %s", path);
+        LOG_WARNING("invalid log path {}", path);
         return nullptr;
     }
 
@@ -72,20 +89,20 @@ log_file::~log_file() { close(); }
     int index = static_cast<int>(strtol(index_str.c_str(), &p, 10));
     if (*p != 0) {
         err = ERR_INVALID_PARAMETERS;
-        LOG_WARNING("invalid log path %s", path);
+        LOG_WARNING("invalid log path {}", path);
         return nullptr;
     }
     int64_t start_offset = static_cast<int64_t>(strtoll(start_offset_str.c_str(), &p, 10));
     if (*p != 0) {
         err = ERR_INVALID_PARAMETERS;
-        LOG_WARNING("invalid log path %s", path);
+        LOG_WARNING("invalid log path {}", path);
         return nullptr;
     }
 
-    disk_file *hfile = file::open(path, O_RDONLY | O_BINARY, 0);
+    disk_file *hfile = file::open(path, file::FileOpenType::kReadOnly);
     if (!hfile) {
         err = ERR_FILE_OPERATION_FAILED;
-        LOG_WARNING("open log file %s failed", path);
+        LOG_WARNING("open log file {} failed", path);
         return nullptr;
     }
 
@@ -96,10 +113,10 @@ log_file::~log_file() { close(); }
     if (err == ERR_INVALID_DATA || err == ERR_INCOMPLETE_DATA || err == ERR_HANDLE_EOF ||
         err == ERR_FILE_OPERATION_FAILED) {
         std::string removed = std::string(path) + ".removed";
-        LOG_ERROR("read first log entry of file %s failed, err = %s. Rename the file to %s",
+        LOG_ERROR("read first log entry of file {} failed, err = {}. Rename the file to {}",
                   path,
-                  err.to_string(),
-                  removed.c_str());
+                  err,
+                  removed);
         delete lf;
         lf = nullptr;
 
@@ -113,8 +130,7 @@ log_file::~log_file() { close(); }
     lf->read_file_header(reader);
     if (!lf->is_right_header()) {
         std::string removed = std::string(path) + ".removed";
-        LOG_ERROR(
-            "invalid log file header of file %s. Rename the file to %s", path, removed.c_str());
+        LOG_ERROR("invalid log file header of file {}. Rename the file to {}", path, removed);
         delete lf;
         lf = nullptr;
 
@@ -135,13 +151,13 @@ log_file::~log_file() { close(); }
     sprintf(path, "%s/log.%d.%" PRId64, dir, index, start_offset);
 
     if (dsn::utils::filesystem::path_exists(std::string(path))) {
-        LOG_WARNING("log file %s already exist", path);
+        LOG_WARNING("log file {} already exist", path);
         return nullptr;
     }
 
-    disk_file *hfile = file::open(path, O_RDWR | O_CREAT | O_BINARY, 0666);
+    disk_file *hfile = file::open(path, file::FileOpenType::kWriteOnly);
     if (!hfile) {
-        LOG_WARNING("create log %s failed", path);
+        LOG_WARNING("create log {} failed", path);
         return nullptr;
     }
 
@@ -150,20 +166,22 @@ log_file::~log_file() { close(); }
 
 log_file::log_file(
     const char *path, disk_file *handle, int index, int64_t start_offset, bool is_read)
-    : _is_read(is_read)
+    : _crc32(0),
+      _start_offset(start_offset),
+      _end_offset(start_offset),
+      _handle(handle),
+      _is_read(is_read),
+      _path(path),
+      _index(index),
+      _last_write_time(0)
 {
-    _start_offset = start_offset;
-    _end_offset = start_offset;
-    _handle = handle;
-    _path = path;
-    _index = index;
-    _crc32 = 0;
-    _last_write_time = 0;
     memset(&_header, 0, sizeof(_header));
 
     if (is_read) {
         int64_t sz;
-        CHECK(dsn::utils::filesystem::file_size(_path, sz), "fail to get file size of {}.", _path);
+        CHECK(dsn::utils::filesystem::file_size(_path, dsn::utils::FileDataType::kSensitive, sz),
+              "fail to get file size of {}.",
+              _path);
         _end_offset += sz;
     }
 }
@@ -203,10 +221,10 @@ error_code log_file::read_next_log_block(/*out*/ ::dsn::blob &bb)
             // if read_count is 0, then we meet the end of file
             err = (bb.length() == 0 ? ERR_HANDLE_EOF : ERR_INCOMPLETE_DATA);
         } else {
-            LOG_ERROR("read data block header failed, size = %d vs %d, err = %s",
+            LOG_ERROR("read data block header failed, size = {} vs {}, err = {}",
                       bb.length(),
-                      (int)sizeof(log_block_header),
-                      err.to_string());
+                      sizeof(log_block_header),
+                      err);
         }
 
         return err;
@@ -214,16 +232,14 @@ error_code log_file::read_next_log_block(/*out*/ ::dsn::blob &bb)
     log_block_header hdr = *reinterpret_cast<const log_block_header *>(bb.data());
 
     if (hdr.magic != 0xdeadbeef) {
-        LOG_ERROR("invalid data header magic: 0x%x", hdr.magic);
+        LOG_ERROR("invalid data header magic: {:#x}", static_cast<uint32_t>(hdr.magic));
         return ERR_INVALID_DATA;
     }
 
     err = _stream->read_next(hdr.length, bb);
     if (err != ERR_OK || hdr.length != bb.length()) {
-        LOG_ERROR("read data block body failed, size = %d vs %d, err = %s",
-                  bb.length(),
-                  (int)hdr.length,
-                  err.to_string());
+        LOG_ERROR(
+            "read data block body failed, size = {} vs {}, err = {}", bb.length(), hdr.length, err);
 
         if (err == ERR_OK || err == ERR_HANDLE_EOF) {
             // because already read log_block_header above, so here must be imcomplete data
@@ -254,6 +270,7 @@ aio_task_ptr log_file::commit_log_block(log_block &block,
     log_appender pending(offset, block);
     return commit_log_blocks(pending, evt, tracker, std::move(callback), hash);
 }
+
 aio_task_ptr log_file::commit_log_blocks(log_appender &pending,
                                          dsn::task_code evt,
                                          dsn::task_tracker *tracker,
@@ -319,7 +336,7 @@ aio_task_ptr log_file::commit_log_blocks(log_appender &pending,
                                  hash);
     }
 
-    if (utils::FLAGS_enable_latency_tracer) {
+    if (dsn_unlikely(FLAGS_enable_latency_tracer)) {
         tsk->_tracer->set_parent_point_name("commit_pending_mutations");
         tsk->_tracer->set_description("log");
         for (const auto &mutation : pending.mutations()) {
@@ -343,7 +360,7 @@ void log_file::reset_stream(size_t offset /*default = 0*/)
     }
 }
 
-decree log_file::previous_log_max_decree(const dsn::gpid &pid)
+decree log_file::previous_log_max_decree(const dsn::gpid &pid) const
 {
     auto it = _previous_log_max_decrees.find(pid);
     return it == _previous_log_max_decrees.end() ? 0 : it->second.max_decree;

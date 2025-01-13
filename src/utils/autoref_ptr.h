@@ -24,15 +24,6 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 
 #include <atomic>
@@ -159,6 +150,8 @@ public:
 
     void swap(ref_ptr<T> &r) noexcept { std::swap(_obj, r._obj); }
 
+    void reset(T *obj = nullptr) { *this = obj; }
+
     T *get() const { return _obj; }
 
     operator T *() const { return _obj; }
@@ -166,6 +159,15 @@ public:
     T &operator*() const { return (*_obj); }
 
     T *operator->() const { return _obj; }
+
+    bool operator==(const ref_ptr<T> &r) const { return _obj == r._obj; }
+
+    template <typename U,
+              typename = typename std::enable_if<std::is_convertible<U *, T *>::value>::type>
+    bool operator==(const ref_ptr<U> &r) const
+    {
+        return _obj == r._obj;
+    }
 
     bool operator==(T *r) const { return _obj == r; }
 

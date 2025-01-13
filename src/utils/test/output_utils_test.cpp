@@ -26,14 +26,15 @@
 
 #include "utils/output_utils.h"
 
-#include <gtest/gtest.h>
-
-#include <vector>
+// IWYU pragma: no_include <ext/alloc_traits.h>
 #include <string>
+#include <vector>
 
-using std::vector;
-using std::string;
+#include "gtest/gtest.h"
+
 using dsn::utils::table_printer;
+using std::string;
+using std::vector;
 
 namespace dsn {
 

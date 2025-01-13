@@ -17,9 +17,10 @@
 
 #include "utils/nth_element.h"
 
-#include <fmt/format.h>
-#include <gtest/gtest.h>
+#include <fmt/core.h>
+#include <cstdint>
 
+#include "gtest/gtest.h"
 #include "nth_element_utils.h"
 
 namespace dsn {

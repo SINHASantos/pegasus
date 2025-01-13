@@ -23,16 +23,18 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #pragma once
 
-#include <vector>
+#include <cctype>
 #include <map>
-#include <unordered_map>
 #include <set>
 #include <sstream>
 #include <string>
 #include <type_traits>
-#include <cctype>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include <rapidjson/ostreamwrapper.h>
 #include <rapidjson/prettywriter.h>
@@ -47,7 +49,7 @@
 
 #include "utils/error_code.h"
 #include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
+#include "task/task_code.h"
 #include "common/gpid.h"
 #include "meta_admin_types.h"
 #include "partition_split_types.h"
@@ -57,6 +59,7 @@
 #include "consensus_types.h"
 #include "replica_admin_types.h"
 #include "common/replication_enums.h"
+#include "ranger/access_type.h"
 
 #define JSON_ENCODE_ENTRY(out, prefix, T)                                                          \
     out.Key(#T);                                                                                   \
@@ -234,6 +237,12 @@
         JSON_DECODE_ENTRIES(input, t, __VA_ARGS__);                                                \
     }
 
+#define JSON_ENCODE_OBJ(writer, name, ...)                                                         \
+    do {                                                                                           \
+        writer.Key(#name);                                                                         \
+        dsn::json::json_encode(writer, __VA_ARGS__);                                               \
+    } while (0)
+
 namespace dsn {
 namespace json {
 
@@ -335,6 +344,23 @@ INT_TYPE_SERIALIZATION(int16_t)
 INT_TYPE_SERIALIZATION(int32_t)
 INT_TYPE_SERIALIZATION(int64_t)
 
+template <typename Writer>
+inline void json_encode(Writer &out, dsn::ranger::access_type t)
+{
+    out.Uint64(static_cast<uint64_t>(t));
+}
+
+inline bool json_decode(const JsonObject &in, dsn::ranger::access_type &t)
+{
+    dverify(in.IsUint64());
+    auto ans = in.GetUint64();
+    auto act_none = static_cast<uint64_t>(dsn::ranger::kAccessTypeNone);
+    auto act_all = static_cast<uint64_t>(dsn::ranger::kAccessTypeAll);
+    dverify(ans >= act_none && ans <= act_all);
+    t = static_cast<dsn::ranger::access_type>(ans);
+    return true;
+}
+
 // json serialization for uint types
 #define UINT_TYPE_SERIALIZATION(TName)                                                             \
     template <typename Writer>                                                                     \
@@ -401,11 +427,29 @@ inline bool json_decode(const dsn::json::JsonObject &in, dsn::rpc_address &addre
     if (rpc_address_string == "invalid address") {
         return true;
     }
-    return address.from_string_ipv4(rpc_address_string.c_str());
+
+    address = dsn::rpc_address::from_host_port(rpc_address_string);
+    return static_cast<bool>(address);
 }
 
-inline void json_encode(JsonWriter &out, const dsn::partition_configuration &config);
-inline bool json_decode(const JsonObject &in, dsn::partition_configuration &config);
+// json serialization for rpc host_port, we use the string representation of a host_port
+inline void json_encode(JsonWriter &out, const dsn::host_port &hp)
+{
+    json_encode(out, hp.to_string());
+}
+inline bool json_decode(const dsn::json::JsonObject &in, dsn::host_port &hp)
+{
+    std::string host_port_string;
+    dverify(json_decode(in, host_port_string));
+    if (host_port_string == "invalid host_port") {
+        return true;
+    }
+    hp = host_port::from_string(host_port_string);
+    return static_cast<bool>(hp);
+}
+
+inline void json_encode(JsonWriter &out, const dsn::partition_configuration &pc);
+inline bool json_decode(const JsonObject &in, dsn::partition_configuration &pc);
 inline void json_encode(JsonWriter &out, const dsn::app_info &info);
 inline bool json_decode(const JsonObject &in, dsn::app_info &info);
 inline void json_encode(JsonWriter &out, const dsn::replication::file_meta &f_meta);
@@ -452,6 +496,19 @@ inline bool json_decode_map(const JsonObject &in, TMap &t)
     return true;
 }
 
+template <typename TSet>
+inline bool json_decode_set(const JsonObject &in, TSet &t)
+{
+    dverify(in.IsArray());
+    t.clear();
+    for (rapidjson::Value::ConstValueIterator it = in.Begin(); it != in.End(); ++it) {
+        typename TSet::value_type value;
+        dverify(json_forwarder<decltype(value)>::decode(*it, value));
+        dverify(t.emplace(std::move(value)).second);
+    }
+    return true;
+}
+
 template <typename T>
 inline void json_encode(JsonWriter &out, const std::vector<T> &t)
 {
@@ -482,15 +539,19 @@ inline void json_encode(JsonWriter &out, const std::set<T> &t)
 template <typename T>
 inline bool json_decode(const JsonObject &in, std::set<T> &t)
 {
-    dverify(in.IsArray());
-    t.clear();
+    return json_decode_set(in, t);
+}
 
-    for (rapidjson::Value::ConstValueIterator it = in.Begin(); it != in.End(); ++it) {
-        T value;
-        dverify(json_forwarder<T>::decode(*it, value));
-        dverify(t.emplace(std::move(value)).second);
-    }
-    return true;
+template <typename T>
+inline void json_encode(JsonWriter &out, const std::unordered_set<T> &t)
+{
+    json_encode_iterable(out, t);
+}
+
+template <typename T>
+inline bool json_decode(const JsonObject &in, std::unordered_set<T> &t)
+{
+    return json_decode_set(in, t);
 }
 
 template <typename T1, typename T2>
@@ -660,7 +721,10 @@ NON_MEMBER_JSON_SERIALIZATION(dsn::partition_configuration,
                               secondaries,
                               last_drops,
                               last_committed_decree,
-                              partition_flags)
+                              partition_flags,
+                              hp_primary,
+                              hp_secondaries,
+                              hp_last_drops)
 
 NON_MEMBER_JSON_SERIALIZATION(dsn::app_info,
                               status,

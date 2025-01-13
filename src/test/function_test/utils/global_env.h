@@ -19,8 +19,8 @@
 
 #pragma once
 
+#include <stdint.h>
 #include <string>
-#include <sstream>
 
 #include "utils/singleton.h"
 
@@ -29,7 +29,7 @@ class global_env : public dsn::utils::singleton<global_env>
 public:
     std::string _pegasus_root;
     std::string _working_dir;
-    std::string _host_ip;
+    uint32_t _host_ip;
 
 private:
     global_env();

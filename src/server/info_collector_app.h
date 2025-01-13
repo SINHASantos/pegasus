@@ -19,10 +19,13 @@
 
 #pragma once
 
-#include "runtime/service_app.h"
-#include "http/http_server.h"
-#include "info_collector.h"
+#include <string>
+#include <vector>
+
 #include "available_detector.h"
+#include "info_collector.h"
+#include "runtime/service_app.h"
+#include "utils/error_code.h"
 
 namespace pegasus {
 namespace server {
@@ -39,7 +42,6 @@ public:
 private:
     info_collector _collector;
     available_detector _detector;
-    bool _updater_started;
 };
-}
-} // namespace
+} // namespace server
+} // namespace pegasus

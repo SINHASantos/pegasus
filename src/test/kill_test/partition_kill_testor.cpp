@@ -17,23 +17,30 @@
  * under the License.
  */
 
-#include <vector>
-#include <bitset>
-#include <thread>
-#include <iostream>
-#include <cstdio>
+// IWYU pragma: no_include <ext/alloc_traits.h>
 #include <unistd.h>
 #include <chrono>
-#include <thread>
-#include <atomic>
 #include <memory>
-#include <sys/time.h>
-#include "remote_cmd/remote_command.h"
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "common/gpid.h"
+#include "dsn.layer2_types.h"
 #include "partition_kill_testor.h"
+#include "remote_cmd/remote_command.h"
+#include "task/task.h"
+#include "test/kill_test/kill_testor.h"
+#include "utils/autoref_ptr.h"
+#include "utils/error_code.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+
+DSN_DECLARE_uint32(kill_interval_seconds);
 
 namespace pegasus {
 namespace test {
+
 partition_kill_testor::partition_kill_testor(const char *config_file) : kill_testor(config_file) {}
 
 void partition_kill_testor::Run()
@@ -45,21 +52,21 @@ void partition_kill_testor::Run()
         } else {
             run();
         }
-        LOG_INFO("sleep %d seconds before checking", kill_interval_seconds);
-        sleep(kill_interval_seconds);
+        LOG_INFO("sleep {} seconds before checking", FLAGS_kill_interval_seconds);
+        sleep(FLAGS_kill_interval_seconds);
     }
 }
 
 void partition_kill_testor::run()
 {
-    if (partitions.size() == 0) {
+    if (pcs.empty()) {
         LOG_INFO("partitions empty");
         return;
     }
 
-    int random_num = generate_one_number(0, partitions.size() - 1);
+    int random_num = generate_one_number(0, pcs.size() - 1);
     std::vector<int> random_indexs;
-    generate_random(random_indexs, random_num, 0, partitions.size() - 1);
+    generate_random(random_indexs, random_num, 0, pcs.size() - 1);
 
     std::vector<dsn::task_ptr> tasks(random_num);
     std::vector<std::pair<bool, std::string>> results(random_num);
@@ -67,10 +74,10 @@ void partition_kill_testor::run()
     std::vector<std::string> arguments(2);
     for (int i = 0; i < random_indexs.size(); ++i) {
         int index = random_indexs[i];
-        const auto &p = partitions[index];
+        const auto &pc = pcs[index];
 
-        arguments[0] = to_string(p.pid.get_app_id());
-        arguments[1] = to_string(p.pid.get_partition_index());
+        arguments[0] = to_string(pc.pid.get_app_id());
+        arguments[1] = to_string(pc.pid.get_partition_index());
 
         auto callback = [&results, i](::dsn::error_code err, const std::string &resp) {
             if (err == ::dsn::ERR_OK) {
@@ -81,7 +88,7 @@ void partition_kill_testor::run()
                 results[i].second = err.to_string();
             }
         };
-        tasks[i] = dsn::dist::cmd::async_call_remote(p.primary,
+        tasks[i] = dsn::dist::cmd::async_call_remote(pc.primary,
                                                      "replica.kill_partition",
                                                      arguments,
                                                      callback,

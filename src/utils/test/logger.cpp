@@ -24,99 +24,147 @@
  * THE SOFTWARE.
  */
 
-#include <gtest/gtest.h>
+#include <fmt/core.h>
+#include <unistd.h>
+#include <memory>
+#include <regex>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
 
+#include "gtest/gtest.h"
+#include "gutil/map_util.h"
+#include "utils/api_utilities.h"
 #include "utils/filesystem.h"
-#include "utils/safe_strerror_posix.h"
+#include "utils/flags.h"
 #include "utils/simple_logger.h"
-#include "utils/smart_pointers.h"
+#include "utils/test_macros.h"
 
-using std::vector;
-using std::string;
+DSN_DECLARE_uint64(max_number_of_log_files_on_disk);
 
-using namespace dsn;
-using namespace dsn::tools;
-
-static const int simple_logger_gc_gap = 20;
-
-static void get_log_file_index(vector<int> &log_index)
+namespace dsn {
+namespace tools {
+class logger_test : public testing::Test
 {
-    vector<string> sub_list;
-    string path = "./";
-    ASSERT_TRUE(utils::filesystem::get_subfiles(path, sub_list, false));
-
-    for (auto &ptr : sub_list) {
-        auto &&name = utils::filesystem::get_file_name(ptr);
-        if (name.length() <= 8 || name.substr(0, 4) != "log.")
-            continue;
-        int index;
-        if (1 != sscanf(name.c_str(), "log.%d.txt", &index))
-            continue;
-        log_index.push_back(index);
-    }
-}
-
-static void clear_files(vector<int> &log_index)
-{
-    char file[256] = {};
-    for (auto i : log_index) {
-        snprintf_p(file, 256, "log.%d.txt", i);
-        dsn::utils::filesystem::remove_path(string(file));
-    }
-}
-
-static void prepare_test_dir()
-{
-    const char *dir = "./test";
-    string dr(dir);
-    ASSERT_TRUE(dsn::utils::filesystem::create_directory(dr));
-    ASSERT_EQ(0, ::chdir(dir));
-}
-
-static void finish_test_dir()
-{
-    const char *dir = "./test";
-    ASSERT_EQ(0, ::chdir("..")) << "chdir failed, err = " << utils::safe_strerror(errno);
-    ASSERT_TRUE(utils::filesystem::remove_path(dir)) << "remove_directory " << dir << " failed";
-}
-
-void log_print(logging_provider *logger, const char *fmt, ...)
-{
-    va_list vl;
-    va_start(vl, fmt);
-    logger->dsn_logv(__FILE__, __FUNCTION__, __LINE__, LOG_LEVEL_DEBUG, fmt, vl);
-    va_end(vl);
-}
-
-TEST(tools_common, simple_logger)
-{
-    // Deregister commands to avoid re-register error.
-    dsn::logging_provider::instance()->deregister_commands();
-
+public:
+    void SetUp() override
     {
-        auto logger = dsn::make_unique<screen_logger>("./");
-        log_print(logger.get(), "%s", "test_print");
-        std::thread t([](screen_logger *lg) { log_print(lg, "%s", "test_print"); }, logger.get());
-        t.join();
+        std::string cwd;
+        ASSERT_TRUE(dsn::utils::filesystem::get_current_directory(cwd));
+        // NOTE: Don't name the dir with "test", otherwise the whole utils test dir would be
+        // removed.
+        test_dir = dsn::utils::filesystem::path_combine(cwd, "logger_test");
 
-        logger->flush();
+        NO_FATALS(prepare_test_dir());
+        std::set<std::string> files;
+        NO_FATALS(get_log_files(files));
+        NO_FATALS(clear_files(files));
     }
 
-    prepare_test_dir();
-    // create multiple files
-    for (unsigned int i = 0; i < simple_logger_gc_gap + 10; ++i) {
-        auto logger = dsn::make_unique<simple_logger>("./");
+    void get_log_files(std::set<std::string> &file_names)
+    {
+        std::vector<std::string> sub_list;
+        ASSERT_TRUE(utils::filesystem::get_subfiles(test_dir, sub_list, false));
+
+        file_names.clear();
+        std::regex pattern(R"(SimpleLogger\.log\.[0-9]{8}_[0-9]{6}_[0-9]{3})");
+        for (const auto &path : sub_list) {
+            std::string name(utils::filesystem::get_file_name(path));
+            if (std::regex_match(name, pattern)) {
+                ASSERT_TRUE(gutil::InsertIfNotPresent(&file_names, name));
+            }
+        }
+    }
+
+    void compare_log_files(const std::set<std::string> &before_files,
+                           const std::set<std::string> &after_files)
+    {
+        ASSERT_FALSE(after_files.empty());
+
+        // One new log file is created.
+        if (after_files.size() == before_files.size() + 1) {
+            // All the file names are the same.
+            for (auto it1 = before_files.begin(), it2 = after_files.begin();
+                 it1 != before_files.end();
+                 ++it1, ++it2) {
+                ASSERT_EQ(*it1, *it2);
+            }
+            // The number of log files is the same, but they have rolled.
+        } else if (after_files.size() == before_files.size()) {
+            auto it1 = before_files.begin();
+            auto it2 = after_files.begin();
+            // The first file is different, the one in 'before_files' is older.
+            ASSERT_NE(*it1, *it2);
+
+            // The rest of the files are the same.
+            for (++it1; it1 != before_files.end(); ++it1, ++it2) {
+                ASSERT_EQ(*it1, *it2);
+            }
+        } else {
+            ASSERT_TRUE(false) << "Invalid number of log files, before=" << before_files.size()
+                               << ", after=" << after_files.size();
+        }
+    }
+
+    void clear_files(const std::set<std::string> &file_names)
+    {
+        for (const auto &file_name : file_names) {
+            ASSERT_TRUE(dsn::utils::filesystem::remove_path(file_name));
+        }
+    }
+
+    void prepare_test_dir()
+    {
+        ASSERT_TRUE(dsn::utils::filesystem::create_directory(test_dir)) << test_dir;
+    }
+
+    void remove_test_dir()
+    {
+        ASSERT_TRUE(dsn::utils::filesystem::remove_path(test_dir)) << test_dir;
+    }
+
+public:
+    std::string test_dir;
+};
+
+#define LOG_PRINT(logger, ...)                                                                     \
+    (logger)->log(                                                                                 \
+        __FILE__, __FUNCTION__, __LINE__, LOG_LEVEL_DEBUG, fmt::format(__VA_ARGS__).c_str())
+
+TEST_F(logger_test, screen_logger_test)
+{
+    auto logger = std::make_unique<screen_logger>(nullptr, nullptr);
+    LOG_PRINT(logger.get(), "{}", "test_print");
+    std::thread t([](screen_logger *lg) { LOG_PRINT(lg, "{}", "test_print"); }, logger.get());
+    t.join();
+    logger->flush();
+}
+
+TEST_F(logger_test, redundant_log_test)
+{
+    // Create redundant log files to test if their number could be restricted.
+    for (unsigned int i = 0; i < FLAGS_max_number_of_log_files_on_disk + 10; ++i) {
+        std::set<std::string> before_files;
+        NO_FATALS(get_log_files(before_files));
+
+        auto logger = std::make_unique<simple_logger>(test_dir.c_str(), "SimpleLogger");
         for (unsigned int i = 0; i != 1000; ++i) {
-            log_print(logger.get(), "%s", "test_print");
+            LOG_PRINT(logger.get(), "{}", "test_print");
         }
         logger->flush();
+
+        std::set<std::string> after_files;
+        NO_FATALS(get_log_files(after_files));
+        NO_FATALS(compare_log_files(before_files, after_files));
+        ::usleep(2000);
     }
 
-    vector<int> index;
-    get_log_file_index(index);
-    ASSERT_TRUE(!index.empty());
-    sort(index.begin(), index.end());
-    ASSERT_EQ(simple_logger_gc_gap, index.size());
-    clear_files(index);
-    finish_test_dir();
+    std::set<std::string> files;
+    NO_FATALS(get_log_files(files));
+    ASSERT_FALSE(files.empty());
+    ASSERT_EQ(FLAGS_max_number_of_log_files_on_disk, files.size());
 }
+
+} // namespace tools
+} // namespace dsn

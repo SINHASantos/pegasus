@@ -26,17 +26,35 @@
 
 #pragma once
 
-#include <fcntl.h>
+#include <stdint.h>
+#include <list>
+#include <string>
+#include <utility>
 
 #include "aio/aio_task.h"
+#include "runtime/api_task.h"
+#include "task/task.h"
+#include "task/task_code.h"
+#include "task/task_spec.h"
+#include "utils/autoref_ptr.h"
+#include "utils/error_code.h"
+#include "utils/join_point.h"
 
 namespace dsn {
 
 // forward declaration
 class disk_file;
+class task_tracker;
 
 namespace file {
 
+enum class FileOpenType
+{
+    kReadOnly = 0,
+    kWriteOnly
+};
+
+// TODO(yingchun): consider to return a smart pointer
 /// open file
 ///
 /// \param file_name filename of the file.
@@ -45,7 +63,7 @@ namespace file {
 ///
 /// \return file handle
 ///
-extern disk_file *open(const char *file_name, int flag, int pmode);
+extern disk_file *open(const std::string &fname, FileOpenType type);
 
 /// close the file handle
 extern error_code close(disk_file *file);

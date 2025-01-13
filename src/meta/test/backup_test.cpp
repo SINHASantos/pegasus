@@ -15,31 +15,60 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
-#include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
-#include "runtime/serverlet.h"
-#include "runtime/service_app.h"
-#include "runtime/rpc/rpc_address.h"
-#include "utils/fail_point.h"
-#include "utils/time_utils.h"
-#include <gtest/gtest.h>
+#include <fmt/core.h>
+#include <unistd.h>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
+#include "backup_types.h"
+#include "common/gpid.h"
+#include "common/replication.codes.h"
+#include "dsn.layer2_types.h"
+#include "gtest/gtest.h"
 #include "meta/meta_backup_service.h"
+#include "meta/meta_data.h"
 #include "meta/meta_service.h"
+#include "meta/meta_state_service.h"
+#include "meta/server_state.h"
 #include "meta/test/misc/misc.h"
 #include "meta_service_test_app.h"
 #include "meta_test_base.h"
+#include "rpc/rpc_address.h"
+#include "rpc/rpc_holder.h"
+#include "rpc/rpc_host_port.h"
+#include "rpc/rpc_message.h"
+#include "rpc/serialization.h"
+#include "runtime/api_layer1.h"
+#include "task/async_calls.h"
+#include "task/task.h"
+#include "task/task_code.h"
+#include "utils/autoref_ptr.h"
+#include "utils/chrono_literals.h"
+#include "utils/error_code.h"
+#include "utils/fail_point.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/synchronize.h"
+#include "utils/time_utils.h"
+#include "utils/zlocks.h"
+
+DSN_DECLARE_int32(cold_backup_checkpoint_reserve_minutes);
+DSN_DECLARE_string(cluster_root);
+DSN_DECLARE_string(meta_state_service_type);
 
 namespace dsn {
 namespace replication {
+class meta_options;
+class mock_policy;
 
 struct method_record
 {
@@ -76,7 +105,7 @@ protected:
     MOCK_HELPER_FUNCS(method_name)                                                                 \
     void method_name()                                                                             \
     {                                                                                              \
-        LOG_INFO("%s is called", #method_name);                                                    \
+        LOG_INFO("{} is called", #method_name);                                                    \
         int &c = counter_##method_name();                                                          \
         ++c;                                                                                       \
         int max_call = maxcall_##method_name();                                                    \
@@ -92,7 +121,7 @@ protected:
     MOCK_HELPER_FUNCS(method_name)                                                                 \
     void method_name(type1 arg1)                                                                   \
     {                                                                                              \
-        LOG_INFO("%s is called", #method_name);                                                    \
+        LOG_INFO("{} is called", #method_name);                                                    \
         int &c = counter_##method_name();                                                          \
         ++c;                                                                                       \
         int max_call = maxcall_##method_name();                                                    \
@@ -108,7 +137,7 @@ protected:
     MOCK_HELPER_FUNCS(method_name)                                                                 \
     void method_name(type1 arg1, type2 arg2)                                                       \
     {                                                                                              \
-        LOG_INFO("%s is called", #method_name);                                                    \
+        LOG_INFO("{} is called", #method_name);                                                    \
         int &c = counter_##method_name();                                                          \
         ++c;                                                                                       \
         int max_call = maxcall_##method_name();                                                    \
@@ -124,7 +153,7 @@ protected:
     MOCK_HELPER_FUNCS(method_name)                                                                 \
     void method_name(type1 arg1, type2 arg2, type3, arg3)                                          \
     {                                                                                              \
-        LOG_INFO("%s is called", #method_name);                                                    \
+        LOG_INFO("{} is called", #method_name);                                                    \
         int &c = counter_##method_name();                                                          \
         ++c;                                                                                       \
         int max_call = maxcall_##method_name();                                                    \
@@ -159,7 +188,7 @@ class progress_liar : public meta_service
 public:
     // req is held by callback, we don't need to handle the life-time of it
     virtual void send_request(dsn::message_ex *req,
-                              const rpc_address &target,
+                              const host_port &target,
                               const rpc_response_task_ptr &callback)
     {
         // need to handle life-time manually
@@ -241,7 +270,7 @@ protected:
         _policy.app_names[4] = "app4";
         _policy.app_names[6] = "app6";
         _mp._backup_service = _service->_backup_handler.get();
-        _mp.set_policy(policy(_policy));
+        _mp.set_policy(_policy);
 
         _service->_storage
             ->create_node(
@@ -470,14 +499,14 @@ TEST_F(policy_context_test, test_app_dropped_during_backup)
         int64_t cur_start_time_ms = static_cast<int64_t>(dsn_now_ms());
         {
             zauto_lock l(_mp._lock);
-            std::vector<dsn::rpc_address> node_list;
+            std::vector<dsn::host_port> node_list;
             generate_node_list(node_list, 3, 3);
 
             app_state *app = state->_all_apps[3].get();
             app->status = dsn::app_status::AS_AVAILABLE;
-            for (partition_configuration &pc : app->partitions) {
-                pc.primary = node_list[0];
-                pc.secondaries = {node_list[1], node_list[2]};
+            for (auto &pc : app->pcs) {
+                SET_IP_AND_HOST_PORT_BY_DNS(pc, primary, node_list[0]);
+                SET_IPS_AND_HOST_PORTS_BY_DNS(pc, secondaries, node_list[1], node_list[2]);
             }
 
             _mp._backup_history.clear();
@@ -726,11 +755,11 @@ protected:
         meta_test_base::SetUp();
 
         meta_options &opt = _meta_svc->_meta_opts;
-        opt.cluster_root = "/meta_test";
-        opt.meta_state_service_type = "meta_state_service_simple";
+        FLAGS_cluster_root = "/meta_test";
+        FLAGS_meta_state_service_type = "meta_state_service_simple";
         _meta_svc->remote_storage_initialize();
         std::string backup_root = "/backup_test";
-        std::string policy_meta_root = opt.cluster_root + "/backup_policies";
+        std::string policy_meta_root = std::string(FLAGS_cluster_root) + "/backup_policies";
         _meta_svc->_backup_handler = std::make_shared<backup_service>(
             _meta_svc.get(), policy_meta_root, backup_root, [](backup_service *bs) {
                 return std::make_shared<mock_policy>(bs);
@@ -793,8 +822,8 @@ TEST_F(meta_backup_service_test, test_add_backup_policy)
         fake_wait_rpc(r, resp);
 
         std::string hint_message = fmt::format(
-            "backup interval must be greater than cold_backup_checkpoint_reserve_minutes={}",
-            _meta_svc->get_options().cold_backup_checkpoint_reserve_minutes);
+            "backup interval must be larger than cold_backup_checkpoint_reserve_minutes={}",
+            FLAGS_cold_backup_checkpoint_reserve_minutes);
         ASSERT_EQ(ERR_INVALID_PARAMETERS, resp.err);
         ASSERT_EQ(hint_message, resp.hint_message);
         req.backup_interval_seconds = old_backup_interval_seconds;

@@ -17,13 +17,17 @@
 
 #pragma once
 
+#include <stdint.h>
 #include <string>
-#include "common/gpid.h"
-#include "backup_types.h"
-#include "runtime/rpc/rpc_holder.h"
+
+#include "rpc/rpc_holder.h"
 
 namespace dsn {
+class gpid;
+
 namespace replication {
+class backup_request;
+class backup_response;
 
 class cold_backup_constant
 {
@@ -156,7 +160,7 @@ std::string get_current_chkpt_file(const std::string &root,
 
 // compose the checkpoint directory name on block service
 // return:
-//      checkpoint directory name: checkpoint@<ip:port>
+//      checkpoint directory name: chkpt_<host>_<port>
 std::string get_remote_chkpt_dirname();
 
 // compose the absolute path(AP) of checkpoint dir for replica on block service

@@ -15,36 +15,62 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
-#include "utils/fmt_logging.h"
-#include "common/replica_envs.h"
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/defer.h"
+#include <fmt/core.h>
+#include <cstdint>
+#include <algorithm>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "common/duplication_common.h"
+#include "common/gpid.h"
+#include "common/json_helper.h"
+#include "common/replica_envs.h"
+#include "common/replication.codes.h"
+#include "dsn.layer2_types.h"
+#include "gtest/gtest.h"
+#include "meta/meta_data.h"
+#include "meta/meta_rpc_types.h"
+#include "meta/meta_service.h"
+#include "meta/meta_state_service.h"
+#include "meta/server_state.h"
+#include "meta_admin_types.h"
 #include "meta_service_test_app.h"
 #include "meta_test_base.h"
-#include "meta/meta_split_service.h"
 #include "misc/misc.h"
+#include "rpc/rpc_host_port.h"
+#include "rpc/rpc_message.h"
+#include "task/task_tracker.h"
+#include "utils/defer.h"
+#include "utils/error_code.h"
+#include "utils/errors.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+
+DSN_DECLARE_int32(max_allowed_replica_count);
+DSN_DECLARE_int32(min_allowed_replica_count);
+DSN_DECLARE_uint64(min_live_node_count_for_unfreeze);
 
 namespace dsn {
-namespace replication {
+class blob;
 
-DSN_DECLARE_uint64(min_live_node_count_for_unfreeze);
-DSN_DECLARE_int32(min_allowed_replica_count);
-DSN_DECLARE_int32(max_allowed_replica_count);
+namespace replication {
 
 class meta_app_operation_test : public meta_test_base
 {
 public:
-    meta_app_operation_test() {}
+    meta_app_operation_test() = default;
 
     error_code create_app_test(int32_t partition_count,
                                int32_t replica_count,
                                bool success_if_exist,
-                               const std::string &app_name)
+                               const std::string &app_name,
+                               const std::map<std::string, std::string> &envs = {})
     {
         configuration_create_app_request create_request;
         configuration_create_app_response create_response;
@@ -54,6 +80,7 @@ public:
         create_request.options.replica_count = replica_count;
         create_request.options.success_if_exist = success_if_exist;
         create_request.options.is_stateful = true;
+        create_request.options.envs = envs;
 
         auto result = fake_create_app(_ss.get(), create_request);
         fake_wait_rpc(result, create_response);
@@ -103,7 +130,7 @@ public:
 
         // dropped app can only be find by app_id
         auto app = _ss->get_app(app_id);
-        // hold_seconds_for_dropped_app = 604800 in unit test config
+        // FLAGS_hold_seconds_for_dropped_app = 604800 in unit test config
         // make app expired immediatly
         app->expire_second -= 604800;
     }
@@ -112,7 +139,7 @@ public:
 
     configuration_get_max_replica_count_response get_max_replica_count(const std::string &app_name)
     {
-        auto req = dsn::make_unique<configuration_get_max_replica_count_request>();
+        auto req = std::make_unique<configuration_get_max_replica_count_request>();
         req->__set_app_name(app_name);
 
         configuration_get_max_replica_count_rpc rpc(std::move(req), RPC_CM_GET_MAX_REPLICA_COUNT);
@@ -129,8 +156,8 @@ public:
         auto app = find_app(app_name);
         CHECK(app, "app({}) does not exist", app_name);
 
-        auto &partition_config = app->partitions[partition_index];
-        partition_config.max_replica_count = max_replica_count;
+        auto &pc = app->pcs[partition_index];
+        pc.max_replica_count = max_replica_count;
     }
 
     void set_max_replica_count_env(const std::string &app_name, const std::string &env)
@@ -149,23 +176,38 @@ public:
         auto ainfo = *(reinterpret_cast<app_info *>(app.get()));
         auto json_config = dsn::json::json_forwarder<app_info>::encode(ainfo);
         dsn::task_tracker tracker;
-        _ms->get_remote_storage()->set_data(app_path,
-                                            json_config,
-                                            LPC_META_STATE_HIGH,
-                                            [](dsn::error_code ec) { ASSERT_EQ(ec, ERR_OK); },
-                                            &tracker);
+        _ms->get_remote_storage()->set_data(
+            app_path,
+            json_config,
+            LPC_META_STATE_HIGH,
+            [](dsn::error_code ec) { ASSERT_EQ(ec, ERR_OK); },
+            &tracker);
         tracker.wait_outstanding_tasks();
     }
 
     configuration_set_max_replica_count_response set_max_replica_count(const std::string &app_name,
                                                                        int32_t max_replica_count)
     {
-        auto req = dsn::make_unique<configuration_set_max_replica_count_request>();
+        auto req = std::make_unique<configuration_set_max_replica_count_request>();
         req->__set_app_name(app_name);
         req->__set_max_replica_count(max_replica_count);
 
         configuration_set_max_replica_count_rpc rpc(std::move(req), RPC_CM_SET_MAX_REPLICA_COUNT);
         _ss->set_max_replica_count(rpc);
+        _ss->wait_all_task();
+
+        return rpc.response();
+    }
+
+    configuration_rename_app_response rename_app(const std::string &old_app_name,
+                                                 const std::string &new_app_name)
+    {
+        auto req = std::make_unique<configuration_rename_app_request>();
+        req->__set_old_app_name(old_app_name);
+        req->__set_new_app_name(new_app_name);
+
+        configuration_rename_app_rpc rpc(std::move(req), RPC_CM_RENAME_APP);
+        _ss->rename_app(rpc);
         _ss->wait_all_task();
 
         return rpc.response();
@@ -177,22 +219,22 @@ public:
         auto app = find_app(app_name);
         CHECK(app, "app({}) does not exist", app_name);
 
-        auto partition_size = static_cast<int>(app->partitions.size());
+        auto partition_size = static_cast<int>(app->pcs.size());
         for (int i = 0; i < partition_size; ++i) {
             // set local max_replica_count of each partition
-            auto &partition_config = app->partitions[i];
-            partition_config.max_replica_count = max_replica_count;
+            auto &pc = app->pcs[i];
+            pc.max_replica_count = max_replica_count;
 
             // set remote max_replica_count of each partition
-            auto partition_path = _ss->get_partition_path(partition_config.pid);
-            auto json_config =
-                dsn::json::json_forwarder<partition_configuration>::encode(partition_config);
+            auto partition_path = _ss->get_partition_path(pc.pid);
+            auto json_config = dsn::json::json_forwarder<partition_configuration>::encode(pc);
             dsn::task_tracker tracker;
-            _ms->get_remote_storage()->set_data(partition_path,
-                                                json_config,
-                                                LPC_META_STATE_HIGH,
-                                                [](dsn::error_code ec) { ASSERT_EQ(ec, ERR_OK); },
-                                                &tracker);
+            _ms->get_remote_storage()->set_data(
+                partition_path,
+                json_config,
+                LPC_META_STATE_HIGH,
+                [](dsn::error_code ec) { ASSERT_EQ(ec, ERR_OK); },
+                &tracker);
             tracker.wait_outstanding_tasks();
         }
 
@@ -204,11 +246,12 @@ public:
         auto ainfo = *(reinterpret_cast<app_info *>(app.get()));
         auto json_config = dsn::json::json_forwarder<app_info>::encode(ainfo);
         dsn::task_tracker tracker;
-        _ms->get_remote_storage()->set_data(app_path,
-                                            json_config,
-                                            LPC_META_STATE_HIGH,
-                                            [](dsn::error_code ec) { ASSERT_EQ(ec, ERR_OK); },
-                                            &tracker);
+        _ms->get_remote_storage()->set_data(
+            app_path,
+            json_config,
+            LPC_META_STATE_HIGH,
+            [](dsn::error_code ec) { ASSERT_EQ(ec, ERR_OK); },
+            &tracker);
         tracker.wait_outstanding_tasks();
     }
 
@@ -218,28 +261,27 @@ public:
         auto app = find_app(app_name);
         CHECK(app, "app({}) does not exist", app_name);
 
-        auto partition_size = static_cast<int>(app->partitions.size());
+        auto partition_size = static_cast<int>(app->pcs.size());
         for (int i = 0; i < partition_size; ++i) {
             // verify local max_replica_count of each partition
-            auto &partition_config = app->partitions[i];
-            ASSERT_EQ(partition_config.max_replica_count, expected_max_replica_count);
+            auto &pc = app->pcs[i];
+            ASSERT_EQ(pc.max_replica_count, expected_max_replica_count);
 
             // verify remote max_replica_count of each partition
-            auto partition_path = _ss->get_partition_path(partition_config.pid);
+            auto partition_path = _ss->get_partition_path(pc.pid);
             dsn::task_tracker tracker;
             _ms->get_remote_storage()->get_data(
                 partition_path,
                 LPC_META_CALLBACK,
-                [ expected_pid = partition_config.pid,
-                  expected_max_replica_count ](error_code ec, const blob &value) {
+                [expected_pid = pc.pid, expected_max_replica_count](error_code ec,
+                                                                    const blob &value) {
                     ASSERT_EQ(ec, ERR_OK);
 
-                    partition_configuration partition_config;
-                    dsn::json::json_forwarder<partition_configuration>::decode(value,
-                                                                               partition_config);
+                    partition_configuration pc;
+                    dsn::json::json_forwarder<partition_configuration>::decode(value, pc);
 
-                    ASSERT_EQ(partition_config.pid, expected_pid);
-                    ASSERT_EQ(partition_config.max_replica_count, expected_max_replica_count);
+                    ASSERT_EQ(pc.pid, expected_pid);
+                    ASSERT_EQ(pc.max_replica_count, expected_max_replica_count);
                 },
                 &tracker);
             tracker.wait_outstanding_tasks();
@@ -280,50 +322,43 @@ public:
         tracker.wait_outstanding_tasks();
     }
 
+    void verify_app_envs(const std::string &app_name,
+                         const std::map<std::string, std::string> &expected_envs)
+    {
+        auto app = find_app(app_name);
+        CHECK(app, "app({}) does not exist", app_name);
+
+        auto app_path = _ss->get_app_path(*app);
+
+        dsn::task_tracker tracker;
+        _ms->get_remote_storage()->get_data(
+            app_path,
+            LPC_META_CALLBACK,
+            [app_name, expected_envs, app](error_code ec, const blob &value) {
+                ASSERT_EQ(ERR_OK, ec);
+
+                app_info ainfo;
+                dsn::json::json_forwarder<app_info>::decode(value, ainfo);
+
+                ASSERT_EQ(app_name, app->app_name);
+                ASSERT_EQ(app_name, ainfo.app_name);
+                ASSERT_EQ(app->app_id, ainfo.app_id);
+                ASSERT_EQ(expected_envs, app->envs);
+                ASSERT_EQ(expected_envs, ainfo.envs);
+            },
+            &tracker);
+        tracker.wait_outstanding_tasks();
+    }
+
     const std::string APP_NAME = "app_operation_test";
     const std::string OLD_APP_NAME = "old_app_operation";
+    const std::string DUP_MASTER_APP_NAME = "dup_master_test";
+    const std::string DUP_FOLLOWER_APP_NAME = "dup_follower_test";
 };
 
 TEST_F(meta_app_operation_test, create_app)
 {
     // Test cases: (assert min_allowed_replica_count <= max_allowed_replica_count)
-    // - wrong partition_count (< 0)
-    // - wrong partition_count (= 0)
-    // - wrong replica_count (< 0)
-    // - wrong replica_count (= 0)
-    // - wrong replica_count (> max_allowed_replica_count > alive_node_count)
-    // - wrong replica_count (> alive_node_count > max_allowed_replica_count)
-    // - wrong replica_count (> alive_node_count = max_allowed_replica_count)
-    // - wrong replica_count (= max_allowed_replica_count, and > alive_node_count)
-    // - wrong replica_count (< max_allowed_replica_count, and > alive_node_count)
-    // - wrong replica_count (= alive_node_count, and > max_allowed_replica_count)
-    // - wrong replica_count (< alive_node_count, and > max_allowed_replica_count)
-    // - valid replica_count (= max_allowed_replica_count, and = alive_node_count)
-    // - valid replica_count (= max_allowed_replica_count, and < alive_node_count)
-    // - valid replica_count (< max_allowed_replica_count, and = alive_node_count)
-    // - valid replica_count (< max_allowed_replica_count < alive_node_count)
-    // - valid replica_count (< alive_node_count < max_allowed_replica_count)
-    // - valid replica_count (< alive_node_count = max_allowed_replica_count)
-    // - wrong replica_count (< min_allowed_replica_count < alive_node_count)
-    // - wrong replica_count (< alive_node_count < min_allowed_replica_count)
-    // - wrong replica_count (< min_allowed_replica_count = alive_node_count)
-    // - wrong replica_count (< min_allowed_replica_count, and > alive_node_count)
-    // - wrong replica_count (< min_allowed_replica_count, and = alive_node_count)
-    // - wrong replica_count (= min_allowed_replica_count, and > alive_node_count)
-    // - valid replica_count (= min_allowed_replica_count, and < alive_node_count)
-    // - cluster freezed (alive_node_count = 0)
-    // - cluster freezed (alive_node_count = 1 < min_live_node_count_for_unfreeze)
-    // - cluster freezed (alive_node_count = 2 < min_live_node_count_for_unfreeze)
-    // - cluster not freezed (alive_node_count = min_live_node_count_for_unfreeze)
-    // - create succeed with single-replica
-    // - create succeed with double-replica
-    // - create app succeed
-    // - create failed with table existed
-    // - wrong app_status creating
-    // - wrong app_status recalling
-    // - wrong app_status dropping
-    // - create succeed with app_status dropped
-    // - create succeed with success_if_exist=true
     struct create_test
     {
         std::string app_name;
@@ -335,69 +370,324 @@ TEST_F(meta_app_operation_test, create_app)
         bool success_if_exist;
         app_status::type before_status;
         error_code expected_err;
-    } tests[] = {{APP_NAME, -1, 3, 2, 3, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 0, 3, 2, 3, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, -1, 1, 3, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 0, 1, 3, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 6, 2, 4, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 7, 2, 6, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 6, 2, 5, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 5, 2, 4, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 4, 2, 3, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 6, 2, 6, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 6, 2, 7, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME + "_1", 4, 5, 2, 5, 1, false, app_status::AS_INVALID, ERR_OK},
-                 {APP_NAME + "_2", 4, 5, 2, 6, 1, false, app_status::AS_INVALID, ERR_OK},
-                 {APP_NAME + "_3", 4, 4, 2, 4, 1, false, app_status::AS_INVALID, ERR_OK},
-                 {APP_NAME + "_4", 4, 4, 2, 6, 1, false, app_status::AS_INVALID, ERR_OK},
-                 {APP_NAME + "_5", 4, 3, 2, 4, 1, false, app_status::AS_INVALID, ERR_OK},
-                 {APP_NAME + "_6", 4, 4, 2, 5, 1, false, app_status::AS_INVALID, ERR_OK},
-                 {APP_NAME, 4, 3, 2, 5, 4, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 3, 2, 4, 5, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 3, 2, 4, 4, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 3, 2, 2, 4, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 3, 2, 3, 4, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME, 4, 4, 2, 3, 4, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
-                 {APP_NAME + "_7", 4, 3, 2, 4, 3, false, app_status::AS_INVALID, ERR_OK},
-                 {APP_NAME, 4, 1, 1, 0, 1, false, app_status::AS_INVALID, ERR_STATE_FREEZED},
-                 {APP_NAME, 4, 2, 2, 1, 1, false, app_status::AS_INVALID, ERR_STATE_FREEZED},
-                 {APP_NAME, 4, 3, 3, 2, 1, false, app_status::AS_INVALID, ERR_STATE_FREEZED},
-                 {APP_NAME + "_8", 4, 3, 3, 3, 1, false, app_status::AS_INVALID, ERR_OK},
-                 {APP_NAME + "_9", 4, 1, 1, 1, 1, false, app_status::AS_INVALID, ERR_OK},
-                 {APP_NAME + "_10", 4, 2, 1, 2, 2, false, app_status::AS_INVALID, ERR_OK},
-                 {APP_NAME, 4, 3, 2, 3, 3, false, app_status::AS_INVALID, ERR_OK},
-                 {APP_NAME, 4, 3, 2, 3, 3, false, app_status::AS_INVALID, ERR_APP_EXIST},
-                 {APP_NAME, 4, 3, 2, 3, 3, false, app_status::AS_CREATING, ERR_BUSY_CREATING},
-                 {APP_NAME, 4, 3, 2, 3, 3, false, app_status::AS_RECALLING, ERR_BUSY_CREATING},
-                 {APP_NAME, 4, 3, 2, 3, 3, false, app_status::AS_DROPPING, ERR_BUSY_DROPPING},
-                 {APP_NAME, 4, 3, 2, 3, 3, false, app_status::AS_DROPPED, ERR_OK},
-                 {APP_NAME, 4, 3, 2, 3, 3, true, app_status::AS_INVALID, ERR_OK}};
+        std::map<std::string, std::string> envs = {};
+    } tests[] = {
+        // Wrong partition_count (< 0).
+        {APP_NAME, -1, 3, 2, 3, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong partition_count (= 0).
+        {APP_NAME, 0, 3, 2, 3, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (< 0).
+        {APP_NAME, 4, -1, 1, 3, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (= 0).
+        {APP_NAME, 4, 0, 1, 3, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (> max_allowed_replica_count > alive_node_count).
+        {APP_NAME, 4, 6, 2, 4, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (> alive_node_count > max_allowed_replica_count).
+        {APP_NAME, 4, 7, 2, 6, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (> alive_node_count = max_allowed_replica_count).
+        {APP_NAME, 4, 6, 2, 5, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (= max_allowed_replica_count, and > alive_node_count).
+        {APP_NAME, 4, 5, 2, 4, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (< max_allowed_replica_count, and > alive_node_count).
+        {APP_NAME, 4, 4, 2, 3, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (= alive_node_count, and > max_allowed_replica_count).
+        {APP_NAME, 4, 6, 2, 6, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (< alive_node_count, and > max_allowed_replica_count).
+        {APP_NAME, 4, 6, 2, 7, 1, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Valid replica_count (= max_allowed_replica_count, and = alive_node_count).
+        {APP_NAME + "_1", 4, 5, 2, 5, 1, false, app_status::AS_INVALID, ERR_OK},
+        // Valid replica_count (= max_allowed_replica_count, and < alive_node_count).
+        {APP_NAME + "_2", 4, 5, 2, 6, 1, false, app_status::AS_INVALID, ERR_OK},
+        // Valid replica_count (< max_allowed_replica_count, and = alive_node_count).
+        {APP_NAME + "_3", 4, 4, 2, 4, 1, false, app_status::AS_INVALID, ERR_OK},
+        // Valid replica_count (< max_allowed_replica_count < alive_node_count).
+        {APP_NAME + "_4", 4, 4, 2, 6, 1, false, app_status::AS_INVALID, ERR_OK},
+        // Valid replica_count (< alive_node_count < max_allowed_replica_count).
+        {APP_NAME + "_5", 4, 3, 2, 4, 1, false, app_status::AS_INVALID, ERR_OK},
+        // Valid replica_count (< alive_node_count = max_allowed_replica_count).
+        {APP_NAME + "_6", 4, 4, 2, 5, 1, false, app_status::AS_INVALID, ERR_OK},
+        // Wrong replica_count (< min_allowed_replica_count < alive_node_count).
+        {APP_NAME, 4, 3, 2, 5, 4, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (< alive_node_count < min_allowed_replica_count).
+        {APP_NAME, 4, 3, 2, 4, 5, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (< min_allowed_replica_count = alive_node_count).
+        {APP_NAME, 4, 3, 2, 4, 4, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (< min_allowed_replica_count, and > alive_node_count).
+        {APP_NAME, 4, 3, 2, 2, 4, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (< min_allowed_replica_count, and = alive_node_count).
+        {APP_NAME, 4, 3, 2, 3, 4, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Wrong replica_count (= min_allowed_replica_count, and > alive_node_count).
+        {APP_NAME, 4, 4, 2, 3, 4, false, app_status::AS_INVALID, ERR_INVALID_PARAMETERS},
+        // Valid replica_count (= min_allowed_replica_count, and < alive_node_count).
+        {APP_NAME + "_7", 4, 3, 2, 4, 3, false, app_status::AS_INVALID, ERR_OK},
+        // Cluster freezed (alive_node_count = 0).
+        {APP_NAME, 4, 1, 1, 0, 1, false, app_status::AS_INVALID, ERR_STATE_FREEZED},
+        // Cluster freezed (alive_node_count = 1 < min_live_node_count_for_unfreeze).
+        {APP_NAME, 4, 2, 2, 1, 1, false, app_status::AS_INVALID, ERR_STATE_FREEZED},
+        // Cluster freezed (alive_node_count = 2 < min_live_node_count_for_unfreeze).
+        {APP_NAME, 4, 3, 3, 2, 1, false, app_status::AS_INVALID, ERR_STATE_FREEZED},
+        // Cluster not freezed (alive_node_count = min_live_node_count_for_unfreeze).
+        {APP_NAME + "_8", 4, 3, 3, 3, 1, false, app_status::AS_INVALID, ERR_OK},
+        // Create succeed with single-replica.
+        {APP_NAME + "_9", 4, 1, 1, 1, 1, false, app_status::AS_INVALID, ERR_OK},
+        // Create succeed with double-replica.
+        {APP_NAME + "_10", 4, 2, 1, 2, 2, false, app_status::AS_INVALID, ERR_OK},
+        // Create app succeed.
+        {APP_NAME, 4, 3, 2, 3, 3, false, app_status::AS_INVALID, ERR_OK},
+        // Create failed with table existed.
+        {APP_NAME, 4, 3, 2, 3, 3, false, app_status::AS_INVALID, ERR_APP_EXIST},
+        // Wrong app_status creating.
+        {APP_NAME, 4, 3, 2, 3, 3, false, app_status::AS_CREATING, ERR_BUSY_CREATING},
+        // Wrong app_status recalling.
+        {APP_NAME, 4, 3, 2, 3, 3, false, app_status::AS_RECALLING, ERR_BUSY_CREATING},
+        // Wrong app_status dropping.
+        {APP_NAME, 4, 3, 2, 3, 3, false, app_status::AS_DROPPING, ERR_BUSY_DROPPING},
+        // Create succeed with app_status dropped.
+        {APP_NAME, 4, 3, 2, 3, 3, false, app_status::AS_DROPPED, ERR_OK},
+        // Create succeed with success_if_exist=true.
+        {APP_NAME, 4, 3, 2, 3, 3, true, app_status::AS_INVALID, ERR_OK},
+        // Wrong rocksdb.num_levels (< 1).
+        {APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_INVALID,
+         ERR_INVALID_PARAMETERS,
+         {{"rocksdb.num_levels", "0"}}},
+        // Wrong rocksdb.num_levels (> 10).
+        {APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_INVALID,
+         ERR_INVALID_PARAMETERS,
+         {{"rocksdb.num_levels", "11"}}},
+        // Wrong rocksdb.num_levels (non-digital character).
+        {APP_NAME + "_11",
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_INVALID,
+         ERR_INVALID_PARAMETERS,
+         {{"rocksdb.num_levels", "5i"}}},
+        // Create app with rocksdb.num_levels (= 5) succeed.
+        {APP_NAME + "_11",
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_INVALID,
+         ERR_OK,
+         {{"rocksdb.num_levels", "5"}}},
+        // Wrong rocksdb.write_buffer_size (< (16<<20)).
+        {APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_INVALID,
+         ERR_INVALID_PARAMETERS,
+         {{"rocksdb.write_buffer_size", "1000"}}},
+        // Wrong rocksdb.write_buffer_size (> (512<<20)).
+        {APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_INVALID,
+         ERR_INVALID_PARAMETERS,
+         {{"rocksdb.write_buffer_size", "1073741824"}}},
+        // Wrong rocksdb.write_buffer_size (non-digital character).
+        {APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_INVALID,
+         ERR_INVALID_PARAMETERS,
+         {{"rocksdb.write_buffer_size", "n33554432"}}},
+        // Create app with rocksdb.write_buffer_size (= (32<<20)) succeed.
+        {APP_NAME + "_12",
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_INVALID,
+         ERR_OK,
+         {{"rocksdb.write_buffer_size", "33554432"}}},
+        // Process the first request of creating follower app for duplication from the
+        // source cluster.
+        {DUP_FOLLOWER_APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_INVALID,
+         ERR_OK,
+         {{duplication_constants::kEnvMasterClusterKey, "source_cluster"},
+          {duplication_constants::kEnvMasterMetasKey, "10.1.2.3:34601"},
+          {duplication_constants::kEnvMasterAppNameKey, DUP_MASTER_APP_NAME},
+          {duplication_constants::kEnvFollowerAppStatusKey,
+           duplication_constants::kEnvFollowerAppStatusCreating}}},
+        // Process the request of creating follower app for duplication from the wrong
+        // source cluster.
+        {DUP_FOLLOWER_APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_AVAILABLE,
+         ERR_APP_EXIST,
+         {{duplication_constants::kEnvMasterClusterKey, "another_source_cluster"},
+          {duplication_constants::kEnvMasterMetasKey, "10.1.2.3:34601"},
+          {duplication_constants::kEnvMasterAppNameKey, DUP_MASTER_APP_NAME},
+          {duplication_constants::kEnvFollowerAppStatusKey,
+           duplication_constants::kEnvFollowerAppStatusCreating}}},
+        // Process the request of creating follower app for duplication without the env of
+        // creating status.
+        {DUP_FOLLOWER_APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_AVAILABLE,
+         ERR_APP_EXIST,
+         {
+             {duplication_constants::kEnvMasterClusterKey, "source_cluster"},
+             {duplication_constants::kEnvMasterMetasKey, "10.1.2.3:34601"},
+             {duplication_constants::kEnvMasterAppNameKey, DUP_MASTER_APP_NAME},
+         }},
+        // Process the repeated request of creating follower app for duplication from the
+        // source cluster.
+        {DUP_FOLLOWER_APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_AVAILABLE,
+         ERR_OK,
+         {{duplication_constants::kEnvMasterClusterKey, "source_cluster"},
+          {duplication_constants::kEnvMasterMetasKey, "10.1.2.3:34601"},
+          {duplication_constants::kEnvMasterAppNameKey, DUP_MASTER_APP_NAME},
+          {duplication_constants::kEnvFollowerAppStatusKey,
+           duplication_constants::kEnvFollowerAppStatusCreating}}},
+        // Process the request of marking follower app as created for duplication from the
+        // source cluster.
+        {DUP_FOLLOWER_APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_AVAILABLE,
+         ERR_OK,
+         {{duplication_constants::kEnvMasterClusterKey, "source_cluster"},
+          {duplication_constants::kEnvMasterMetasKey, "10.1.2.3:34601"},
+          {duplication_constants::kEnvMasterAppNameKey, DUP_MASTER_APP_NAME},
+          {duplication_constants::kEnvFollowerAppStatusKey,
+           duplication_constants::kEnvFollowerAppStatusCreated}}},
+        // Process the request of creating follower app for duplication from the source
+        // cluster while it has been marked as created.
+        {DUP_FOLLOWER_APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_AVAILABLE,
+         ERR_APP_EXIST,
+         {{duplication_constants::kEnvMasterClusterKey, "source_cluster"},
+          {duplication_constants::kEnvMasterMetasKey, "10.1.2.3:34601"},
+          {duplication_constants::kEnvMasterAppNameKey, DUP_MASTER_APP_NAME},
+          {duplication_constants::kEnvFollowerAppStatusKey,
+           duplication_constants::kEnvFollowerAppStatusCreating}}},
+        // Process the repeated request of marking follower app as created for duplication
+        // from the source cluster.
+        {DUP_FOLLOWER_APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_AVAILABLE,
+         ERR_OK,
+         {{duplication_constants::kEnvMasterClusterKey, "source_cluster"},
+          {duplication_constants::kEnvMasterMetasKey, "10.1.2.3:34601"},
+          {duplication_constants::kEnvMasterAppNameKey, DUP_MASTER_APP_NAME},
+          {duplication_constants::kEnvFollowerAppStatusKey,
+           duplication_constants::kEnvFollowerAppStatusCreated}}},
+        // Process the request of creating follower app for duplication with invalid creating
+        // status.
+        {DUP_FOLLOWER_APP_NAME,
+         4,
+         3,
+         2,
+         3,
+         3,
+         false,
+         app_status::AS_AVAILABLE,
+         ERR_INVALID_PARAMETERS,
+         {{duplication_constants::kEnvMasterClusterKey, "source_cluster"},
+          {duplication_constants::kEnvMasterMetasKey, "10.1.2.3:34601"},
+          {duplication_constants::kEnvMasterAppNameKey, DUP_MASTER_APP_NAME},
+          {duplication_constants::kEnvFollowerAppStatusKey, "invalid_creating_status"}}},
+    };
 
     clear_nodes();
 
-    // keep the number of all nodes greater than that of alive nodes
+    // Keep the number of all nodes greater than that of alive nodes.
     const int total_node_count = 10;
-    std::vector<rpc_address> nodes = ensure_enough_alive_nodes(total_node_count);
+    auto nodes = ensure_enough_alive_nodes(total_node_count);
 
-    // the meta function level will become freezed once
-    // alive_nodes * 100 < total_nodes * node_live_percentage_threshold_for_update
+    // The meta function level will become freezed once
+    // alive_nodes * 100 < total_nodes * _node_live_percentage_threshold_for_update
     // even if alive_nodes >= min_live_node_count_for_unfreeze
     set_node_live_percentage_threshold_for_update(0);
 
-    // save original FLAGS_min_live_node_count_for_unfreeze
+    // Save original FLAGS_min_live_node_count_for_unfreeze
     auto reserved_min_live_node_count_for_unfreeze = FLAGS_min_live_node_count_for_unfreeze;
 
-    // save original FLAGS_max_allowed_replica_count
+    // Save original FLAGS_max_allowed_replica_count
     auto reserved_max_allowed_replica_count = FLAGS_max_allowed_replica_count;
 
-    // keep FLAGS_max_allowed_replica_count fixed in the tests
+    // Keep FLAGS_max_allowed_replica_count fixed in the tests
     auto res = update_flag("max_allowed_replica_count", "5");
     ASSERT_TRUE(res.is_ok());
 
-    // save original FLAGS_min_allowed_replica_count
+    // Save original FLAGS_min_allowed_replica_count.
     auto reserved_min_allowed_replica_count = FLAGS_min_allowed_replica_count;
 
-    for (auto test : tests) {
+    for (const auto &test : tests) {
         res = update_flag("min_allowed_replica_count",
                           std::to_string(test.min_allowed_replica_count));
         ASSERT_TRUE(res.is_ok());
@@ -415,60 +705,83 @@ TEST_F(meta_app_operation_test, create_app)
         } else if (test.before_status != app_status::AS_INVALID) {
             update_app_status(test.before_status);
         }
-        auto err = create_app_test(
-            test.partition_count, test.replica_count, test.success_if_exist, test.app_name);
-        ASSERT_EQ(err, test.expected_err);
+
+        auto err = create_app_test(test.partition_count,
+                                   test.replica_count,
+                                   test.success_if_exist,
+                                   test.app_name,
+                                   test.envs);
+        ASSERT_EQ(test.expected_err, err);
+
+        if (test.expected_err == ERR_OK) {
+            verify_app_envs(test.app_name, test.envs);
+        }
 
         _ms->set_node_state(nodes, true);
     }
 
-    // set FLAGS_min_allowed_replica_count successfully
+    {
+        // Make sure all rocksdb options of ROCKSDB_DYNAMIC_OPTIONS and ROCKSDB_STATIC_OPTIONS are
+        // tested. Hint: Mainly verify the validate_app_envs function.
+        std::map<std::string, std::string> all_test_envs;
+        for (const auto &test : tests) {
+            all_test_envs.insert(test.envs.begin(), test.envs.end());
+        }
+        for (const auto &option : replica_envs::ROCKSDB_DYNAMIC_OPTIONS) {
+            ASSERT_TRUE(all_test_envs.find(option) != all_test_envs.end());
+        }
+        for (const auto &option : replica_envs::ROCKSDB_STATIC_OPTIONS) {
+            ASSERT_TRUE(all_test_envs.find(option) != all_test_envs.end());
+        }
+    }
+
+    // Set FLAGS_min_allowed_replica_count successfully.
     res = update_flag("min_allowed_replica_count", "2");
     ASSERT_TRUE(res.is_ok());
-    ASSERT_EQ(FLAGS_min_allowed_replica_count, 2);
+    ASSERT_EQ(2, FLAGS_min_allowed_replica_count);
 
-    // set FLAGS_max_allowed_replica_count successfully
+    // Set FLAGS_max_allowed_replica_count successfully.
     res = update_flag("max_allowed_replica_count", "6");
     ASSERT_TRUE(res.is_ok());
-    ASSERT_EQ(FLAGS_max_allowed_replica_count, 6);
+    ASSERT_EQ(6, FLAGS_max_allowed_replica_count);
 
-    // failed to set FLAGS_min_allowed_replica_count due to individual validation
+    // Failed to set FLAGS_min_allowed_replica_count due to individual validation.
     res = update_flag("min_allowed_replica_count", "0");
     ASSERT_EQ(res.code(), ERR_INVALID_PARAMETERS);
-    ASSERT_EQ(FLAGS_min_allowed_replica_count, 2);
+    ASSERT_EQ(2, FLAGS_min_allowed_replica_count);
     std::cout << res.description() << std::endl;
 
-    // failed to set FLAGS_max_allowed_replica_count due to individual validation
+    // Failed to set FLAGS_max_allowed_replica_count due to individual validation.
     res = update_flag("max_allowed_replica_count", "0");
     ASSERT_EQ(res.code(), ERR_INVALID_PARAMETERS);
-    ASSERT_EQ(FLAGS_max_allowed_replica_count, 6);
+    ASSERT_EQ(6, FLAGS_max_allowed_replica_count);
     std::cout << res.description() << std::endl;
 
-    // failed to set FLAGS_min_allowed_replica_count due to grouped validation
+    // Failed to set FLAGS_min_allowed_replica_count due to grouped validation.
     res = update_flag("min_allowed_replica_count", "7");
     ASSERT_EQ(res.code(), ERR_INVALID_PARAMETERS);
-    ASSERT_EQ(FLAGS_min_allowed_replica_count, 2);
+    ASSERT_EQ(2, FLAGS_min_allowed_replica_count);
     std::cout << res.description() << std::endl;
 
-    // failed to set FLAGS_max_allowed_replica_count due to grouped validation
+    // Failed to set FLAGS_max_allowed_replica_count due to grouped validation.
     res = update_flag("max_allowed_replica_count", "1");
     ASSERT_EQ(res.code(), ERR_INVALID_PARAMETERS);
-    ASSERT_EQ(FLAGS_max_allowed_replica_count, 6);
+    ASSERT_EQ(6, FLAGS_max_allowed_replica_count);
     std::cout << res.description() << std::endl;
 
-    // recover original FLAGS_min_allowed_replica_count
+    // Recover original FLAGS_min_allowed_replica_count.
     res = update_flag("min_allowed_replica_count",
                       std::to_string(reserved_min_allowed_replica_count));
     ASSERT_TRUE(res.is_ok());
     ASSERT_EQ(FLAGS_min_allowed_replica_count, reserved_min_allowed_replica_count);
 
-    // recover original FLAGS_max_allowed_replica_count
+    // Recover original FLAGS_max_allowed_replica_count.
     res = update_flag("max_allowed_replica_count",
                       std::to_string(reserved_max_allowed_replica_count));
     ASSERT_TRUE(res.is_ok());
-    ASSERT_EQ(FLAGS_max_allowed_replica_count, reserved_max_allowed_replica_count);
+    ASSERT_EQ(reserved_max_allowed_replica_count, FLAGS_max_allowed_replica_count);
 
-    // recover original FLAGS_min_live_node_count_for_unfreeze
+    // Recover original FLAGS_min_live_node_count_for_unfreeze.
     set_min_live_node_count_for_unfreeze(reserved_min_live_node_count_for_unfreeze);
 }
 
@@ -578,10 +891,9 @@ TEST_F(meta_app_operation_test, get_max_replica_count)
             auto partition_index = static_cast<int32_t>(random32(0, partition_count - 1));
             set_partition_max_replica_count(test.app_name, partition_index, 2);
             recover_partition_max_replica_count =
-                [ this, app_name = test.app_name, partition_index ]()
-            {
-                set_partition_max_replica_count(app_name, partition_index, 3);
-            };
+                [this, app_name = test.app_name, partition_index]() {
+                    set_partition_max_replica_count(app_name, partition_index, 3);
+                };
         }
 
         const auto resp = get_max_replica_count(test.app_name);
@@ -712,9 +1024,9 @@ TEST_F(meta_app_operation_test, set_max_replica_count)
                   << ", max_allowed_replica_count=" << test.max_allowed_replica_count
                   << ", expected_err=" << test.expected_err << std::endl;
 
-        // disable node_live_percentage_threshold_for_update
+        // disable _node_live_percentage_threshold_for_update
         // for the reason that the meta function level will become freezed once
-        // alive_nodes * 100 < total_nodes * node_live_percentage_threshold_for_update
+        // alive_nodes * 100 < total_nodes * _node_live_percentage_threshold_for_update
         // even if alive_nodes >= min_live_node_count_for_unfreeze
         set_node_live_percentage_threshold_for_update(0);
 
@@ -731,15 +1043,14 @@ TEST_F(meta_app_operation_test, set_max_replica_count)
 
         // recover automatically the original FLAGS_min_live_node_count_for_unfreeze,
         // FLAGS_min_allowed_replica_count and FLAGS_max_allowed_replica_count
-        auto recover = defer([
-            reserved_min_live_node_count_for_unfreeze = FLAGS_min_live_node_count_for_unfreeze,
-            reserved_min_allowed_replica_count = FLAGS_min_allowed_replica_count,
-            reserved_max_allowed_replica_count = FLAGS_max_allowed_replica_count
-        ]() {
-            FLAGS_max_allowed_replica_count = reserved_max_allowed_replica_count;
-            FLAGS_min_allowed_replica_count = reserved_min_allowed_replica_count;
-            FLAGS_min_live_node_count_for_unfreeze = reserved_min_live_node_count_for_unfreeze;
-        });
+        auto recover = defer(
+            [reserved_min_live_node_count_for_unfreeze = FLAGS_min_live_node_count_for_unfreeze,
+             reserved_min_allowed_replica_count = FLAGS_min_allowed_replica_count,
+             reserved_max_allowed_replica_count = FLAGS_max_allowed_replica_count]() {
+                FLAGS_max_allowed_replica_count = reserved_max_allowed_replica_count;
+                FLAGS_min_allowed_replica_count = reserved_min_allowed_replica_count;
+                FLAGS_min_live_node_count_for_unfreeze = reserved_min_live_node_count_for_unfreeze;
+            });
         FLAGS_min_live_node_count_for_unfreeze = test.min_live_node_count_for_unfreeze;
         FLAGS_min_allowed_replica_count = test.min_allowed_replica_count;
         FLAGS_max_allowed_replica_count = test.max_allowed_replica_count;
@@ -795,5 +1106,35 @@ TEST_F(meta_app_operation_test, recover_from_max_replica_count_env)
     verify_app_max_replica_count(APP_NAME, new_max_replica_count);
 }
 
+TEST_F(meta_app_operation_test, rename_app)
+{
+    const std::string app_name_1 = APP_NAME + "_rename_1";
+    create_app(app_name_1);
+    auto app = find_app(app_name_1);
+    ASSERT_TRUE(app) << fmt::format("app({}) does not exist", app_name_1);
+    auto app_id_1 = app->app_id;
+
+    const std::string app_name_2 = APP_NAME + "_rename_2";
+    create_app(app_name_2);
+    app = find_app(app_name_2);
+    ASSERT_TRUE(app) << fmt::format("app({}) does not exist", app_name_2);
+    auto app_id_2 = app->app_id;
+
+    // case 1: new_app_name table exist
+    auto resp = rename_app(app_name_1, app_name_2);
+    ASSERT_EQ(ERR_INVALID_PARAMETERS, resp.err);
+
+    const std::string app_name_3 = APP_NAME + "_rename_3";
+    // case 2: old_app_name table not exist
+    resp = rename_app(APP_NAME + "_rename_invaild", app_name_3);
+    ASSERT_EQ(ERR_APP_NOT_EXIST, resp.err);
+
+    // case 3: rename successful
+    resp = rename_app(app_name_1, app_name_3);
+    ASSERT_EQ(ERR_OK, resp.err);
+    app = find_app(app_name_3);
+    ASSERT_TRUE(app) << fmt::format("app({}) does not exist", app_name_3);
+    ASSERT_EQ(app_id_1, app->app_id);
+}
 } // namespace replication
 } // namespace dsn

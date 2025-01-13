@@ -24,15 +24,6 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 #include <iostream>
 
@@ -51,7 +42,11 @@ public:
     simple_kv_service(replica *r) : replication_app_base(r) {}
     virtual ~simple_kv_service() {}
 
-    virtual int on_request(dsn::message_ex *request) override { return handle_request(request); }
+    virtual int on_request(dsn::message_ex *request) override WARN_UNUSED_RESULT
+    {
+        return handle_request(request);
+    }
+
 protected:
     // all service handlers to be implemented further
     // RPC_SIMPLE_KV_SIMPLE_KV_READ
@@ -100,6 +95,6 @@ private:
         svc->on_append(pr, reply);
     }
 };
-}
-}
-}
+} // namespace application
+} // namespace replication
+} // namespace dsn

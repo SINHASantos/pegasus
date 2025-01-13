@@ -17,17 +17,24 @@
 
 #pragma once
 
-#include <climits>
+#include <ctype.h>
+#include <errno.h>
+#include <stdint.h>
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
+#include <string>
+#include <type_traits>
 
-#include "string_view.h"
+#include <string_view>
 
 namespace dsn {
 
 namespace internal {
 
 template <typename T>
-bool buf2signed(string_view buf, T &result)
+bool buf2signed(std::string_view buf, T &result)
 {
     static_assert(std::is_signed<T>::value, "buf2signed works only with signed integer");
 
@@ -58,7 +65,7 @@ bool buf2signed(string_view buf, T &result)
 }
 
 template <typename T>
-bool buf2unsigned(string_view buf, T &result)
+bool buf2unsigned(std::string_view buf, T &result)
 {
     static_assert(std::is_unsigned<T>::value, "buf2unsigned works only with unsigned integer");
 
@@ -97,27 +104,32 @@ bool buf2unsigned(string_view buf, T &result)
 
 /// buf2*: `result` will keep unmodified if false is returned.
 
-inline bool buf2int32(string_view buf, int32_t &result)
+inline bool buf2int32(std::string_view buf, int32_t &result)
 {
     return internal::buf2signed(buf, result);
 }
 
-inline bool buf2int64(string_view buf, int64_t &result)
+inline bool buf2int64(std::string_view buf, int64_t &result)
 {
     return internal::buf2signed(buf, result);
 }
 
-inline bool buf2uint32(string_view buf, uint32_t &result)
+inline bool buf2uint32(std::string_view buf, uint32_t &result)
 {
     return internal::buf2unsigned(buf, result);
 }
 
-inline bool buf2uint64(string_view buf, uint64_t &result)
+inline bool buf2uint64(std::string_view buf, uint64_t &result)
 {
     return internal::buf2unsigned(buf, result);
 }
 
-inline bool buf2bool(string_view buf, bool &result, bool ignore_case = true)
+inline bool buf2uint16(std::string_view buf, uint16_t &result)
+{
+    return internal::buf2unsigned(buf, result);
+}
+
+inline bool buf2bool(std::string_view buf, bool &result, bool ignore_case = true)
 {
     std::string data(buf.data(), buf.length());
     if (ignore_case) {
@@ -134,7 +146,7 @@ inline bool buf2bool(string_view buf, bool &result, bool ignore_case = true)
     return false;
 }
 
-inline bool buf2double(string_view buf, double &result)
+inline bool buf2double(std::string_view buf, double &result)
 {
     if (buf.empty()) {
         return false;
@@ -161,4 +173,29 @@ inline bool buf2double(string_view buf, double &result)
     result = v;
     return true;
 }
+
+#define DEF_BUF2NUMERIC_FUNC(type, postfix)                                                        \
+    inline bool buf2numeric(std::string_view buf, type &result)                                    \
+    {                                                                                              \
+        return buf2##postfix(buf, result);                                                         \
+    }
+
+#define DEF_BUF2INT_FUNC(type) DEF_BUF2NUMERIC_FUNC(type##_t, type)
+
+DEF_BUF2INT_FUNC(int32)
+DEF_BUF2INT_FUNC(int64)
+DEF_BUF2INT_FUNC(uint16)
+DEF_BUF2INT_FUNC(uint32)
+DEF_BUF2INT_FUNC(uint64)
+
+#undef DEF_BUF2INT_FUNC
+
+#define DEF_BUF2FLOAT_FUNC(type) DEF_BUF2NUMERIC_FUNC(type, type)
+
+DEF_BUF2FLOAT_FUNC(double)
+
+#undef DEF_BUF2FLOAT_FUNC
+
+#undef DEF_BUF2NUMERIC_FUNC
+
 } // namespace dsn

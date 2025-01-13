@@ -19,15 +19,35 @@
 
 #pragma once
 
-#include "replica/duplication/mutation_duplicator.h"
-#include "replica/replica_base.h"
-#include <rrdb/rrdb.code.definition.h>
-#include "utils/flags.h"
-#include "common//duplication_common.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <deque>
+#include <map>
+#include <string>
 
-#include "client_lib/pegasus_client_factory_impl.h"
+#include "replica/duplication/mutation_duplicator.h"
+#include "rrdb/rrdb.client.h"
+#include "runtime/pipeline.h"
+#include "task/task_code.h"
+#include "task/task_tracker.h"
+#include "utils/chrono_literals.h"
+#include <string_view>
+#include "utils/metrics.h"
+#include "utils/zlocks.h"
+
+namespace dsn {
+class blob;
+class error_code;
+namespace replication {
+struct replica_base;
+} // namespace replication
+} // namespace dsn
 
 namespace pegasus {
+namespace client {
+class pegasus_client_impl;
+} // namespace client
+
 namespace server {
 
 using namespace dsn::literals::chrono_literals;
@@ -41,8 +61,8 @@ class pegasus_mutation_duplicator : public dsn::replication::mutation_duplicator
 
 public:
     pegasus_mutation_duplicator(dsn::replication::replica_base *r,
-                                dsn::string_view remote_cluster,
-                                dsn::string_view app);
+                                std::string_view remote_cluster,
+                                std::string_view app);
 
     void duplicate(mutation_tuple_set muts, callback cb) override;
 
@@ -69,8 +89,8 @@ private:
 
     size_t _total_shipped_size{0};
 
-    dsn::perf_counter_wrapper _shipped_ops;
-    dsn::perf_counter_wrapper _failed_shipping_ops;
+    METRIC_VAR_DECLARE_counter(dup_shipped_successful_requests);
+    METRIC_VAR_DECLARE_counter(dup_shipped_failed_requests);
 };
 
 // Decodes the binary `request_data` into write request in thrift struct, and

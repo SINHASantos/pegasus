@@ -26,6 +26,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <iostream>
 #include <list>
 #include <map>
@@ -33,10 +34,50 @@
 #include <unordered_set>
 #include <vector>
 
-namespace dsn {
-namespace utils {
+#include "utils_types.h"
+#include "utils/enum_helper.h"
+#include "utils/error_code.h"
+
+namespace dsn::utils {
+
+ENUM_BEGIN2(pattern_match_type::type, pattern_match_type, pattern_match_type::PMT_INVALID)
+ENUM_REG_WITH_CUSTOM_NAME(pattern_match_type::PMT_INVALID, invalid)
+ENUM_REG_WITH_CUSTOM_NAME(pattern_match_type::PMT_MATCH_ALL, all)
+ENUM_REG_WITH_CUSTOM_NAME(pattern_match_type::PMT_MATCH_EXACT, exact)
+ENUM_REG_WITH_CUSTOM_NAME(pattern_match_type::PMT_MATCH_ANYWHERE, anywhere)
+ENUM_REG_WITH_CUSTOM_NAME(pattern_match_type::PMT_MATCH_PREFIX, prefix)
+ENUM_REG_WITH_CUSTOM_NAME(pattern_match_type::PMT_MATCH_POSTFIX, postfix)
+ENUM_REG_WITH_CUSTOM_NAME(pattern_match_type::PMT_MATCH_REGEX, regex)
+ENUM_END2(pattern_match_type::type, pattern_match_type)
 
 inline bool is_empty(const char *str) { return str == nullptr || *str == '\0'; }
+
+// Decide whether two C strings are equal, even if one of them is NULL.
+// The second function is similar except it compares the only first (at most) n bytes
+// of both strings.
+bool equals(const char *lhs, const char *rhs);
+bool equals(const char *lhs, const char *rhs, size_t n);
+
+// Decide whether two C strings are equal, ignoring the case of the characters,
+// even if one of them is NULL.
+// The second function is similar except it compares the only first (at most) n bytes
+// of both strings.
+bool iequals(const char *lhs, const char *rhs);
+bool iequals(const char *lhs, const char *rhs, size_t n);
+
+// Decide whether two strings one of which is C string are equal, ignoring the
+// case of the characters, even if the C string is NULL.
+bool iequals(const std::string &lhs, const char *rhs);
+bool iequals(const std::string &lhs, const char *rhs, size_t n);
+bool iequals(const char *lhs, const std::string &rhs);
+bool iequals(const char *lhs, const std::string &rhs, size_t n);
+
+// Decide whether the first n bytes of two memory areas are equal, even if one of them is NULL.
+bool mequals(const void *lhs, const void *rhs, size_t n);
+
+error_code pattern_match(const std::string &str,
+                         const std::string &pattern,
+                         pattern_match_type::type match_type);
 
 // Split the `input` string by the only character `separator` into tokens. Leading and trailing
 // spaces of each token will be stripped. Once the token is empty, or become empty after
@@ -90,7 +131,15 @@ std::string get_last_component(const std::string &input, const char splitters[])
 
 char *trim_string(char *s);
 
+// TODO(yingchun): unify the following functions with the ones in utils::filesystem
 // calculate the md5 checksum of buffer
 std::string string_md5(const char *buffer, unsigned int length);
-} // namespace utils
-} // namespace dsn
+
+// splits the "input" string by the only character "separator" to get the string prefix.
+// if there is no prefix or the first character is "separator", it will return "".
+std::string find_string_prefix(const std::string &input, char separator);
+
+// Decide if there are some space characters in the given string, such as ' ', '\r', '\n' or '\t'.
+bool has_space(const std::string &str);
+
+} // namespace dsn::utils

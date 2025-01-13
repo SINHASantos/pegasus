@@ -24,20 +24,25 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #include "runtime/tool_api.h"
-#include "utils/factory_store.h"
-#include "utils/singleton_store.h"
+
+#include <functional>
+#include <map>
+#include <memory>
+#include <type_traits>
+#include <utility>
+
+#include "rpc/message_parser_manager.h"
+#include "runtime/global_config.h"
 #include "runtime/service_engine.h"
-#include "runtime/rpc/message_parser_manager.h"
+#include "task/task.h"
+#include "task/task_code.h"
+#include "utils/error_code.h"
+#include "utils/factory_store.h"
+#include "utils/fmt_logging.h"
+#include "utils/singleton_store.h"
+#include "utils/sys_exit_hook.h"
+#include "utils/threadpool_code.h"
 
 namespace dsn {
 
@@ -60,7 +65,7 @@ public:
             err = _node->start_app();
             CHECK_EQ_MSG(err, ERR_OK, "start app failed");
         } else {
-            LOG_INFO("stop app result(%s)", _node->stop_app(_cleanup).to_string());
+            LOG_INFO("stop app result({})", _node->stop_app(_cleanup));
         }
     }
 

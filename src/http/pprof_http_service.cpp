@@ -17,27 +17,58 @@
 
 #ifdef DSN_ENABLE_GPERF
 
-#include <fcntl.h>
-
-#include <cstdlib>
-#include <chrono>
-#include <fstream>
-#include <sstream>
-
 #include "pprof_http_service.h"
 
-#include "utils/fmt_logging.h"
-#include "runtime/api_layer1.h"
-#include "utils/process_utils.h"
-#include "utils/string_conv.h"
-#include "utils/defer.h"
-#include "utils/timer.h"
-#include "utils/string_splitter.h"
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <gperftools/heap-profiler.h>
 #include <gperftools/malloc_extension.h>
 #include <gperftools/profiler.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "http/http_method.h"
+#include "http/http_server.h"
+#include "http/http_status_code.h"
+#include "runtime/api_layer1.h"
+#include "utils/api_utilities.h"
+#include "utils/blob.h"
+#include "utils/defer.h"
+#include "utils/fmt_logging.h"
+#include "utils/process_utils.h"
+#include "utils/string_conv.h"
+#include "utils/string_splitter.h"
+#include "utils/strings.h"
+#include "utils/timer.h"
 
 namespace dsn {
+
+bool check_TCMALLOC_SAMPLE_PARAMETER()
+{
+    char *str = getenv("TCMALLOC_SAMPLE_PARAMETER");
+    if (str == nullptr) {
+        return false;
+    }
+    char *endptr;
+    int val = strtol(str, &endptr, 10);
+    return (*endptr == '\0' && val > 0);
+}
+
+bool has_TCMALLOC_SAMPLE_PARAMETER()
+{
+    static bool val = check_TCMALLOC_SAMPLE_PARAMETER();
+    return val;
+}
 
 //                            //
 // == ip:port/pprof/symbol == //
@@ -67,15 +98,14 @@ static bool has_ext(const std::string &name, const std::string &ext)
 static int extract_symbols_from_binary(std::map<uintptr_t, std::string> &addr_map,
                                        const lib_info &lib_info)
 {
-    timer tm;
-    tm.start();
+    SCOPED_LOG_TIMING(INFO, "load {}", lib_info.path);
     std::string cmd = "nm -C -p ";
     cmd.append(lib_info.path);
     std::stringstream ss;
-    LOG_INFO("executing `%s`", cmd.c_str());
+    LOG_INFO("executing `{}`", cmd);
     const int rc = utils::pipe_execute(cmd.c_str(), ss);
     if (rc < 0) {
-        LOG_ERROR("fail to popen `%s`", cmd.c_str());
+        LOG_ERROR("fail to popen `{}`", cmd);
         return -1;
     }
     std::string line;
@@ -109,9 +139,9 @@ static int extract_symbols_from_binary(std::map<uintptr_t, std::string> &addr_ma
             continue;
         }
         const char *name_begin = sp.field();
-        if (strncmp(name_begin, "typeinfo ", 9) == 0 || strncmp(name_begin, "VTT ", 4) == 0 ||
-            strncmp(name_begin, "vtable ", 7) == 0 || strncmp(name_begin, "global ", 7) == 0 ||
-            strncmp(name_begin, "guard ", 6) == 0) {
+        if (utils::equals(name_begin, "typeinfo ", 9) || utils::equals(name_begin, "VTT ", 4) ||
+            utils::equals(name_begin, "vtable ", 7) || utils::equals(name_begin, "global ", 7) ||
+            utils::equals(name_begin, "guard ", 6)) {
             addr_map[addr] = std::string();
             continue;
         }
@@ -160,15 +190,12 @@ static int extract_symbols_from_binary(std::map<uintptr_t, std::string> &addr_ma
     if (addr_map.find(lib_info.end_addr) == addr_map.end()) {
         addr_map[lib_info.end_addr] = std::string();
     }
-    tm.stop();
-    LOG_INFO("Loaded %s in %zdms", lib_info.path.c_str(), tm.m_elapsed());
     return 0;
 }
 
 static void load_symbols()
 {
-    timer tm;
-    tm.start();
+    SCOPED_LOG_TIMING(INFO, "load all symbols");
     auto fp = fopen("/proc/self/maps", "r");
     if (fp == nullptr) {
         return;
@@ -239,9 +266,8 @@ static void load_symbols()
     info.path = program_invocation_name;
     extract_symbols_from_binary(symbol_map, info);
 
-    timer tm2;
-    tm2.start();
     size_t num_removed = 0;
+    LOG_TIMING_IF(INFO, num_removed > 0, "removed {} entries", num_removed);
     bool last_is_empty = false;
     for (auto it = symbol_map.begin(); it != symbol_map.end();) {
         if (it->second.empty()) {
@@ -256,13 +282,6 @@ static void load_symbols()
             ++it;
         }
     }
-    tm2.stop();
-    if (num_removed) {
-        LOG_INFO("Removed %zd entries in %zdms", num_removed, tm2.m_elapsed());
-    }
-
-    tm.stop();
-    LOG_INFO("Loaded all symbols in %zdms", tm.m_elapsed());
 }
 
 static void find_symbols(std::string *out, std::vector<uintptr_t> &addr_list)
@@ -296,7 +315,7 @@ void pprof_http_service::symbol_handler(const http_request &req, http_response &
     // Load /proc/self/maps
     pthread_once(&s_load_symbolmap_once, load_symbols);
 
-    if (req.method != http_method::HTTP_METHOD_POST) {
+    if (req.method != http_method::POST) {
         char buf[64];
         snprintf(buf, sizeof(buf), "num_symbols: %lu\n", symbol_map.size());
         resp.body = buf;
@@ -328,35 +347,57 @@ void pprof_http_service::heap_handler(const http_request &req, http_response &re
 {
     bool in_pprof = false;
     if (!_in_pprof_action.compare_exchange_strong(in_pprof, true)) {
-        LOG_WARNING_F("node is already exectuting pprof action, please wait and retry");
-        resp.status_code = http_status_code::internal_server_error;
+        LOG_WARNING("node is already exectuting pprof action, please wait and retry");
+        resp.status_code = http_status_code::kInternalServerError;
         return;
     }
+    auto cleanup = dsn::defer([this]() { _in_pprof_action.store(false); });
 
-    const std::string SECOND = "seconds";
-    const uint32_t kDefaultSecond = 10;
+    // If "seconds" parameter is specified with a valid value, use heap profiling,
+    // otherwise, use heap sampling.
+    bool use_heap_profile = false;
+    uint32_t seconds = 0;
+    const auto &iter = req.query_args.find("seconds");
+    if (iter != req.query_args.end() && buf2uint32(iter->second, seconds)) {
+        // This is true between calls to HeapProfilerStart() and HeapProfilerStop(), and
+        // also if the program has been run with HEAPPROFILER, or some other
+        // way to turn on whole-program profiling.
+        if (IsHeapProfilerRunning()) {
+            LOG_WARNING("heap profiling is running, dump the full profile directly");
+            char *profile = GetHeapProfile();
+            resp.status_code = http_status_code::kOk;
+            resp.body = profile;
+            free(profile);
+            return;
+        }
 
-    // get seconds from query params, default value is `kDefaultSecond`
-    uint32_t seconds = kDefaultSecond;
-    const auto iter = req.query_args.find(SECOND);
-    if (iter != req.query_args.end()) {
-        const auto seconds_str = iter->second;
-        dsn::internal::buf2unsigned(seconds_str, seconds);
+        std::stringstream profile_name_prefix;
+        profile_name_prefix << "heap_profile." << getpid() << "." << dsn_now_ns();
+
+        HeapProfilerStart(profile_name_prefix.str().c_str());
+        sleep(seconds);
+        char *profile = GetHeapProfile();
+        HeapProfilerStop();
+
+        resp.status_code = http_status_code::kOk;
+        resp.body = profile;
+        free(profile);
+    } else {
+        if (!has_TCMALLOC_SAMPLE_PARAMETER()) {
+            static const std::string kNoEnvMsg = "The environment variable "
+                                                 "TCMALLOC_SAMPLE_PARAMETER should set to a "
+                                                 "positive value, such as 524288, before running.";
+            LOG_WARNING(kNoEnvMsg);
+            resp.status_code = http_status_code::kInternalServerError;
+            resp.body = kNoEnvMsg;
+            return;
+        }
+
+        std::string buf;
+        MallocExtension::instance()->GetHeapSample(&buf);
+        resp.status_code = http_status_code::kOk;
+        resp.body = std::move(buf);
     }
-
-    std::stringstream profile_name_prefix;
-    profile_name_prefix << "heap_profile." << getpid() << "." << dsn_now_ns();
-
-    HeapProfilerStart(profile_name_prefix.str().c_str());
-    sleep(seconds);
-    const char *profile = GetHeapProfile();
-    HeapProfilerStop();
-
-    resp.status_code = http_status_code::ok;
-    resp.body = profile;
-    delete profile;
-
-    _in_pprof_action.store(false);
 }
 
 //                             //
@@ -425,8 +466,8 @@ void pprof_http_service::growth_handler(const http_request &req, http_response &
 {
     bool in_pprof = false;
     if (!_in_pprof_action.compare_exchange_strong(in_pprof, true)) {
-        LOG_WARNING_F("node is already exectuting pprof action, please wait and retry");
-        resp.status_code = http_status_code::internal_server_error;
+        LOG_WARNING("node is already exectuting pprof action, please wait and retry");
+        resp.status_code = http_status_code::kInternalServerError;
         return;
     }
 
@@ -440,12 +481,12 @@ void pprof_http_service::growth_handler(const http_request &req, http_response &
 //                             //
 // == ip:port/pprof/profile == //
 //                             //
-static bool get_cpu_profile(std::string &result, useconds_t seconds)
+static bool get_cpu_profile(std::string &result, useconds_t micro_seconds)
 {
     const char *file_name = "cpu.prof";
 
     ProfilerStart(file_name);
-    usleep(seconds);
+    usleep(micro_seconds);
     ProfilerStop();
 
     std::ifstream in(file_name);
@@ -468,12 +509,12 @@ void pprof_http_service::profile_handler(const http_request &req, http_response 
 {
     bool in_pprof = false;
     if (!_in_pprof_action.compare_exchange_strong(in_pprof, true)) {
-        LOG_WARNING_F("node is already exectuting pprof action, please wait and retry");
-        resp.status_code = http_status_code::internal_server_error;
+        LOG_WARNING("node is already exectuting pprof action, please wait and retry");
+        resp.status_code = http_status_code::kInternalServerError;
         return;
     }
 
-    useconds_t seconds = 60000000;
+    useconds_t micro_seconds = 60000000;
 
     std::string req_url = req.full_url.to_string();
     size_t len = req.full_url.length();
@@ -485,16 +526,16 @@ void pprof_http_service::profile_handler(const http_request &req, http_response 
             std::string key(kv_sp.field(), kv_sp.length());
             if (kv_sp != NULL && key == "seconds" && ++kv_sp != NULL) {
                 char *end_ptr;
-                seconds = strtoul(kv_sp.field(), &end_ptr, 10) * 1000000;
+                micro_seconds = strtoul(kv_sp.field(), &end_ptr, 10) * 1000000;
                 break;
             }
             param_sp++;
         }
     }
 
-    resp.status_code = http_status_code::ok;
+    resp.status_code = http_status_code::kOk;
 
-    get_cpu_profile(resp.body, seconds);
+    get_cpu_profile(resp.body, micro_seconds);
 
     _in_pprof_action.store(false);
 }

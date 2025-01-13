@@ -26,14 +26,23 @@
 
 #pragma once
 
+#include <ctime>
+#include <functional>
 #include <string>
+#include <utility>
+#include <vector>
+
+#include "utils/errors.h"
 #include "utils/error_code.h"
 
 #ifndef _XOPEN_SOURCE
 #define _XOPEN_SOURCE 500
 #endif
 
+#include <assert.h>
+// IWYU pragma: no_include <features.h>
 #include <ftw.h>
+#include <stdint.h>
 
 #ifndef FTW_CONTINUE
 #define FTW_CONTINUE 0
@@ -53,9 +62,15 @@
 
 namespace dsn {
 namespace utils {
+enum class FileDataType;
+
 namespace filesystem {
 
-int get_normalized_path(const std::string &path, std::string &npath);
+// TODO(yingchun): Consider using rocksdb APIs to rewrite the following functions.
+
+void get_normalized_path(const std::string &path, std::string &npath);
+
+bool is_absolute_path(const std::string &path);
 
 bool get_absolute_path(const std::string &path1, std::string &path2);
 
@@ -63,7 +78,9 @@ std::string remove_file_name(const std::string &path);
 
 std::string get_file_name(const std::string &path);
 
+// TODO(yingchun): The 2 functions are similar, remove concat_path_unix_style.
 std::string path_combine(const std::string &path1, const std::string &path2);
+std::string concat_path_unix_style(const std::string &prefix, const std::string &postfix);
 
 typedef std::function<int(const char *, int, struct FTW *)> ftw_handler;
 bool file_tree_walk(const std::string &dirpath, ftw_handler handler, bool recursive = true);
@@ -88,7 +105,15 @@ bool remove_path(const std::string &path);
 // this will always remove target path if exist
 bool rename_path(const std::string &path1, const std::string &path2);
 
+// Get the file size. The encryption header is considered as part of the file if it is an encrypted
+// file.
+// TODO(yingchun): refactor to use uint64_t.
 bool file_size(const std::string &path, int64_t &sz);
+// The legacy file_size(), just for testing.
+bool deprecated_file_size(const std::string &path, int64_t &sz);
+// Get the file size. The encryption header is not considered as part of the file if it is an
+// encrypted file and 'type' is specified as FileDataType::kSensitive.
+bool file_size(const std::string &path, FileDataType type, int64_t &sz);
 
 bool create_directory(const std::string &path);
 
@@ -118,6 +143,7 @@ bool get_disk_space_info(const std::string &path, disk_space_info &info);
 bool link_file(const std::string &src, const std::string &target);
 
 error_code md5sum(const std::string &file_path, /*out*/ std::string &result);
+error_code deprecated_md5sum(const std::string &file_path, /*out*/ std::string &result);
 
 // return value:
 //  - <A, B>:
@@ -125,30 +151,29 @@ error_code md5sum(const std::string &file_path, /*out*/ std::string &result);
 //          B is represent wheter the directory is empty, true means empty, otherwise false
 std::pair<error_code, bool> is_directory_empty(const std::string &dirname);
 
-error_code read_file(const std::string &fname, /*out*/ std::string &buf);
-
 // compare file metadata calculated by fname with expected md5 and file_size
 bool verify_file(const std::string &fname,
+                 FileDataType type,
                  const std::string &expected_md5,
                  const int64_t &expected_fsize);
 
-bool verify_file_size(const std::string &fname, const int64_t &expected_fsize);
-
-bool verify_data_md5(const std::string &fname,
-                     const char *data,
-                     const size_t data_size,
-                     const std::string &expected_md5);
+bool verify_file_size(const std::string &fname, FileDataType type, const int64_t &expected_fsize);
 
 // create driectory and get absolute path
 bool create_directory(const std::string &path,
                       /*out*/ std::string &absolute_path,
                       /*out*/ std::string &err_msg);
 
-bool write_file(const std::string &fname, std::string &buf);
-
 // check if directory is readable and writable
 // call `create_directory` before to make `path` exist
 bool check_dir_rw(const std::string &path, /*out*/ std::string &err_msg);
+
+// Finds paths on the filesystem matching a pattern.
+//
+// The found pathnames are added to the 'paths' vector. If no pathnames are
+// found matching the pattern, no paths are added to the vector and an OK
+// status is returned.
+error_s glob(const std::string &path_pattern, std::vector<std::string> &path_list);
 
 } // namespace filesystem
 } // namespace utils

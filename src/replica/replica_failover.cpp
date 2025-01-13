@@ -24,51 +24,59 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     failure handling in replica
- *
- * Revision history:
- *     Mar., 2015, @imzhenyu (Zhenyu Guo), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
+#include <atomic>
+#include <string>
 
+#include "common/fs_manager.h"
+#include "common/replication_common.h"
+#include "common/replication_enums.h"
+#include "dsn.layer2_types.h"
+#include "meta_admin_types.h"
+#include "metadata_types.h"
 #include "replica.h"
-#include "mutation.h"
-#include "mutation_log.h"
+#include "replica/replica_context.h"
 #include "replica_stub.h"
+#include "rpc/rpc_address.h"
+#include "rpc/rpc_host_port.h"
+#include "utils/error_code.h"
+#include "utils/fmt_logging.h"
 
 namespace dsn {
+
 namespace replication {
+
+// The failure handling part of replica.
 
 void replica::handle_local_failure(error_code error)
 {
-    LOG_INFO("%s: handle local failure error %s, status = %s",
-             name(),
-             error.to_string(),
-             enum_to_string(status()));
+    LOG_INFO_PREFIX("handle local failure error {}, status = {}", error, enum_to_string(status()));
+
+    if (error == ERR_DISK_IO_ERROR) {
+        _dir_node->status = disk_status::IO_ERROR;
+    } else if (error == ERR_RDB_CORRUPTION) {
+        _data_corrupted = true;
+    }
 
     if (status() == partition_status::PS_PRIMARY) {
-        _stub->remove_replica_on_meta_server(_app_info, _primary_states.membership);
+        _stub->remove_replica_on_meta_server(_app_info, _primary_states.pc);
     }
 
     update_local_configuration_with_no_ballot_change(partition_status::PS_ERROR);
 }
 
 void replica::handle_remote_failure(partition_status::type st,
-                                    ::dsn::rpc_address node,
+                                    const ::dsn::host_port &node,
                                     error_code error,
                                     const std::string &caused_by)
 {
-    LOG_ERROR("%s: handle remote failure caused by %s, error = %s, status = %s, node = %s",
-              name(),
-              caused_by.c_str(),
-              error.to_string(),
-              enum_to_string(st),
-              node.to_string());
+    LOG_ERROR_PREFIX("handle remote failure caused by {}, error = {}, status = {}, node = {}",
+                     caused_by,
+                     error,
+                     enum_to_string(st),
+                     node);
 
     CHECK_EQ(status(), partition_status::PS_PRIMARY);
-    CHECK_NE(node, _stub->_primary_address);
+    CHECK_NE(node, _stub->primary_host_port());
 
     switch (st) {
     case partition_status::PS_SECONDARY:
@@ -78,14 +86,14 @@ void replica::handle_remote_failure(partition_status::type st,
               enum_to_string(st));
         {
             configuration_update_request request;
-            request.node = node;
+            SET_IP_AND_HOST_PORT_BY_DNS(request, node, node);
             request.type = config_type::CT_DOWNGRADE_TO_INACTIVE;
-            request.config = _primary_states.membership;
+            request.config = _primary_states.pc;
             downgrade_to_inactive_on_primary(request);
         }
         break;
     case partition_status::PS_POTENTIAL_SECONDARY: {
-        LOG_INFO("%s: remove learner %s for remote failure", name(), node.to_string());
+        LOG_INFO_PREFIX("remove learner {} for remote failure", node);
         // potential secondary failure does not lead to ballot change
         // therefore, it is possible to have multiple exec here
         _primary_states.learners.erase(node);
@@ -102,7 +110,7 @@ void replica::handle_remote_failure(partition_status::type st,
 
 void replica::on_meta_server_disconnected()
 {
-    LOG_INFO("%s: meta server disconnected", name());
+    LOG_INFO_PREFIX("meta server disconnected");
 
     auto old_status = status();
     update_local_configuration_with_no_ballot_change(partition_status::PS_INACTIVE);
@@ -113,5 +121,5 @@ void replica::on_meta_server_disconnected()
         set_inactive_state_transient(true);
     }
 }
-}
-} // namespace
+} // namespace replication
+} // namespace dsn

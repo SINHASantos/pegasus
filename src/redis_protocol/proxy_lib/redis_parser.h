@@ -19,17 +19,32 @@
 
 #pragma once
 
-#include <queue>
+#include <stddef.h>
+#include <stdint.h>
+#include <atomic>
 #include <deque>
 #include <list>
-#include "proxy_layer.h"
+#include <memory>
+#include <queue>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
 #include "geo/lib/geo_client.h"
+#include "proxy_layer.h"
+#include "rpc/rpc_message.h"
+#include "rpc/rpc_stream.h"
+#include "utils/blob.h"
+#include "utils/zlocks.h"
 
 namespace dsn {
+class binary_writer;
+
 namespace apps {
 class rrdb_client;
 }
-}
+} // namespace dsn
 
 class proxy_test;
 
@@ -250,5 +265,5 @@ public:
     redis_parser(proxy_stub *op, dsn::message_ex *first_msg);
     ~redis_parser() override;
 };
-}
-} // namespace
+} // namespace proxy
+} // namespace pegasus

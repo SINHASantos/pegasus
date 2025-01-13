@@ -18,6 +18,13 @@
  */
 
 #include "value_schema_manager.h"
+
+#include <string_view>
+#include <iterator>
+#include <utility>
+
+#include "utils/endians.h"
+#include "utils/fmt_logging.h"
 #include "value_schema_v0.h"
 #include "value_schema_v1.h"
 #include "value_schema_v2.h"
@@ -29,9 +36,9 @@ value_schema_manager::value_schema_manager()
      * If someone wants to add a new data version, he only need to implement the new value schema,
      * and register it here.
      */
-    register_schema(dsn::make_unique<value_schema_v0>());
-    register_schema(dsn::make_unique<value_schema_v1>());
-    register_schema(dsn::make_unique<value_schema_v2>());
+    register_schema(std::make_unique<value_schema_v0>());
+    register_schema(std::make_unique<value_schema_v1>());
+    register_schema(std::make_unique<value_schema_v2>());
 }
 
 void value_schema_manager::register_schema(std::unique_ptr<value_schema> schema)
@@ -40,7 +47,7 @@ void value_schema_manager::register_schema(std::unique_ptr<value_schema> schema)
 }
 
 value_schema *value_schema_manager::get_value_schema(uint32_t meta_cf_data_version,
-                                                     dsn::string_view value) const
+                                                     std::string_view value) const
 {
     dsn::data_input input(value);
     uint8_t first_byte = input.read_u8();

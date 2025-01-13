@@ -26,15 +26,26 @@
 
 #include "meta_state_service_simple.h"
 
-#include <fcntl.h>
-
+#include <string.h>
+#include <algorithm>
+#include <set>
 #include <stack>
 #include <utility>
 
-#include "runtime/task/async_calls.h"
-#include "runtime/task/task.h"
+#include "aio/file_io.h"
+#include "rocksdb/env.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
+#include "runtime/service_app.h"
+#include "task/async_calls.h"
+#include "task/task.h"
+#include "utils/autoref_ptr.h"
+#include "utils/binary_reader.h"
+#include "utils/env.h"
 #include "utils/filesystem.h"
 #include "utils/fmt_logging.h"
+#include "utils/strings.h"
+#include "utils/utils.h"
 
 namespace dsn {
 namespace dist {
@@ -82,8 +93,8 @@ void meta_state_service_simple::write_log(blob &&log_blob,
         CHECK(log_succeed, "we cannot handle logging failure now");
         __err_cb_bind_and_enqueue(task, internal_operation(), 0);
     }));
-    auto continuation_task_ptr = continuation_task.get();
-    _task_queue.emplace(move(continuation_task));
+    auto *continuation_task_ptr = continuation_task.get();
+    _task_queue.emplace(std::move(continuation_task));
     _log_lock.unlock();
 
     file::write(_log,
@@ -218,7 +229,7 @@ error_code meta_state_service_simple::apply_transaction(
         default:
             CHECK(false, "unsupported operation");
         }
-        CHECK_EQ_MSG(ec, ERR_OK, "unexpected error when applying");
+        CHECK_EQ_MSG(ERR_OK, ec, "unexpected error when applying");
     }
 
     return ERR_OK;
@@ -226,65 +237,85 @@ error_code meta_state_service_simple::apply_transaction(
 
 error_code meta_state_service_simple::initialize(const std::vector<std::string> &args)
 {
-    const char *work_dir =
-        args.empty() ? service_app::current_service_app_info().data_dir.c_str() : args[0].c_str();
+    const char *work_dir = args.empty() ? service_app::current_service_app_info().data_dir.c_str()
+                                        : args[0].c_str();
 
     _offset = 0;
     std::string log_path = dsn::utils::filesystem::path_combine(work_dir, "meta_state_service.log");
     if (utils::filesystem::file_exists(log_path)) {
-        if (FILE *fd = fopen(log_path.c_str(), "rb")) {
-            for (;;) {
-                log_header header;
-                if (fread(&header, sizeof(log_header), 1, fd) != 1) {
-                    break;
-                }
-                if (header.magic != log_header::default_magic) {
-                    break;
-                }
-                std::shared_ptr<char> buffer(dsn::utils::make_shared_array<char>(header.size));
-                if (fread(buffer.get(), header.size, 1, fd) != 1) {
-                    break;
-                }
-                _offset += sizeof(header) + header.size;
-                binary_reader reader(blob(buffer, (int)header.size));
-                int op_type = 0;
-                reader.read(op_type);
+        std::unique_ptr<rocksdb::SequentialFile> log_file;
+        auto s = dsn::utils::PegasusEnv(dsn::utils::FileDataType::kSensitive)
+                     ->NewSequentialFile(log_path, &log_file, rocksdb::EnvOptions());
+        CHECK(s.ok(), "open log file '{}' failed, err = {}", log_path, s.ToString());
 
-                switch (static_cast<operation_type>(op_type)) {
-                case operation_type::create_node: {
-                    std::string node;
-                    blob data;
-                    create_node_log::parse(reader, node, data);
-                    create_node_internal(node, data);
-                    break;
-                }
-                case operation_type::delete_node: {
-                    std::string node;
-                    bool recursively_delete;
-                    delete_node_log::parse(reader, node, recursively_delete);
-                    delete_node_internal(node, recursively_delete);
-                    break;
-                }
-                case operation_type::set_data: {
-                    std::string node;
-                    blob data;
-                    set_data_log::parse(reader, node, data);
-                    set_data_internal(node, data);
-                    break;
-                }
-                default:
-                    // The log is complete but its content is modified by cosmic ray. This is
-                    // unacceptable
-                    CHECK(false, "meta state server log corrupted");
-                }
+        while (true) {
+            static const int kLogHeaderSize = sizeof(log_header);
+            static const int kDefaultMagic = 0xdeadbeef;
+            rocksdb::Slice result;
+
+            // Read header.
+            char scratch[kLogHeaderSize] = {0};
+            s = log_file->PositionedRead(_offset, kLogHeaderSize, &result, scratch);
+            CHECK(s.ok(), "read log file '{}' header failed, err = {}", log_path, s.ToString());
+            if (result.empty()) {
+                LOG_INFO("read EOF of log file '{}'", log_path);
+                break;
             }
-            fclose(fd);
+            log_header *header = reinterpret_cast<log_header *>(scratch);
+            if (header->magic != kDefaultMagic) {
+                LOG_WARNING("read log file '{}' header with bad magic {}, skip the left!",
+                            log_path,
+                            header->magic);
+                break;
+            }
+            _offset += kLogHeaderSize;
+
+            // Read body.
+            std::shared_ptr<char> buffer(dsn::utils::make_shared_array<char>(header->size));
+            s = log_file->PositionedRead(_offset, header->size, &result, buffer.get());
+            CHECK(s.ok(),
+                  "read log file '{}' header with bad body, err = {}",
+                  log_path,
+                  s.ToString());
+            _offset += header->size;
+
+            binary_reader reader(blob(buffer, header->size));
+            int op_type = 0;
+            CHECK_EQ(sizeof(op_type), reader.read(op_type));
+
+            switch (static_cast<operation_type>(op_type)) {
+            case operation_type::create_node: {
+                std::string node;
+                blob data;
+                create_node_log::parse(reader, node, data);
+                create_node_internal(node, data);
+                break;
+            }
+            case operation_type::delete_node: {
+                std::string node;
+                bool recursively_delete;
+                delete_node_log::parse(reader, node, recursively_delete);
+                delete_node_internal(node, recursively_delete);
+                break;
+            }
+            case operation_type::set_data: {
+                std::string node;
+                blob data;
+                set_data_log::parse(reader, node, data);
+                set_data_internal(node, data);
+                break;
+            }
+            default:
+                // The log is complete but its content is modified by cosmic ray. This is
+                // unacceptable
+                CHECK(false, "meta state server log corrupted");
+            }
         }
     }
 
-    _log = file::open(log_path.c_str(), O_RDWR | O_CREAT | O_BINARY, 0666);
+    _log = file::open(log_path, file::FileOpenType::kWriteOnly);
     if (!_log) {
-        LOG_ERROR("open file failed: %s", log_path.c_str());
+        LOG_ERROR("open file failed: {}", log_path);
         return ERR_FILE_OPERATION_FAILED;
     }
     return ERR_OK;
@@ -349,7 +380,7 @@ task_ptr meta_state_service_simple::submit_transaction(
                 op._node.push_back('/');
                 std::set<std::string>::iterator iter = snapshot.lower_bound(op._node);
                 if (iter != snapshot.end() && (*iter).length() >= op._node.length() &&
-                    memcmp((*iter).c_str(), op._node.c_str(), op._node.length()) == 0) {
+                    utils::mequals((*iter).c_str(), op._node.c_str(), op._node.length())) {
                     // op._node is the prefix of some path, so we regard this directory as not empty
                     op._result = ERR_INVALID_PARAMETERS;
                 } else {
@@ -395,9 +426,10 @@ task_ptr meta_state_service_simple::submit_transaction(
         CHECK_EQ_MSG(dest - batch.get(), total_size, "memcpy error");
         task_ptr task(new error_code_future(cb_code, cb_transaction, 0));
         task->set_tracker(tracker);
-        write_log(blob(batch, total_size),
-                  [this, t_entries] { return apply_transaction(t_entries); },
-                  task);
+        write_log(
+            blob(batch, total_size),
+            [this, t_entries] { return apply_transaction(t_entries); },
+            task);
         return task;
     }
 }
@@ -410,9 +442,10 @@ task_ptr meta_state_service_simple::create_node(const std::string &node,
 {
     task_ptr task(new error_code_future(cb_code, cb_create, 0));
     task->set_tracker(tracker);
-    write_log(create_node_log::get_log(node, value),
-              [=] { return create_node_internal(node, value); },
-              task);
+    write_log(
+        create_node_log::get_log(node, value),
+        [=] { return create_node_internal(node, value); },
+        task);
     return task;
 }
 
@@ -424,9 +457,10 @@ task_ptr meta_state_service_simple::delete_node(const std::string &node,
 {
     task_ptr task(new error_code_future(cb_code, cb_delete, 0));
     task->set_tracker(tracker);
-    write_log(delete_node_log::get_log(node, recursively_delete),
-              [=] { return delete_node_internal(node, recursively_delete); },
-              task);
+    write_log(
+        delete_node_log::get_log(node, recursively_delete),
+        [=] { return delete_node_internal(node, recursively_delete); },
+        task);
     return task;
 }
 
@@ -491,14 +525,15 @@ task_ptr meta_state_service_simple::get_children(const std::string &node,
             result.push_back(child_pair.first);
         }
         return tasking::enqueue(
-            cb_code, tracker, [=]() mutable { cb_get_children(ERR_OK, move(result)); });
+            cb_code, tracker, [=]() mutable { cb_get_children(ERR_OK, result); });
     }
 }
 
 meta_state_service_simple::~meta_state_service_simple()
 {
-    _tracker.cancel_outstanding_tasks();
-    file::close(_log);
+    _tracker.wait_outstanding_tasks();
+    CHECK_EQ(ERR_OK, file::flush(_log));
+    CHECK_EQ(ERR_OK, file::close(_log));
 
     for (const auto &kv : _quick_map) {
         if ("/" != kv.first) {
@@ -507,5 +542,6 @@ meta_state_service_simple::~meta_state_service_simple()
     }
     _quick_map.clear();
 }
-}
-}
+
+} // namespace dist
+} // namespace dsn

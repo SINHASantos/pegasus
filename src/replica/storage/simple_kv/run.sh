@@ -29,6 +29,25 @@ if [ ! -f dsn.replication.simple_kv ]; then
     exit 1
 fi
 
+if [ -n ${TEST_OPTS} ]; then
+    if [ ! -f "./config.ini" ]; then
+        echo "./config.ini does not exists"
+        exit 1
+    fi
+
+    OPTS=`echo ${TEST_OPTS} | xargs`
+    config_kvs=(${OPTS//;/ })
+    for config_kv in ${config_kvs[@]}; do
+        config_kv=`echo $config_kv | xargs`
+        kv=(${config_kv//=/ })
+        if [ ! ${#kv[*]} -eq 2 ]; then
+            echo "Invalid config kv !"
+            exit 1
+        fi
+        sed -i '/^\s*'"${kv[0]}"'/c '"${kv[0]}"' = '"${kv[1]}" ./config.ini
+    done
+fi
+
 ./clear.sh
 
 echo "running dsn.replication.simple_kv for 20 seconds ..."
@@ -43,9 +62,9 @@ if [ -f core ] || ! grep ERR_OK out > /dev/null ; then
     ls -l
     echo "---- head -n 100 out ----"
     head -n 100 out
-    if [ -f data/logs/log.1.txt ]; then
-        echo "---- tail -n 100 log.1.txt ----"
-        tail -n 100 data/logs/log.1.txt
+    if [ `find data/logs -name pegasus.log.* | wc -l` -ne 0 ]; then
+        echo "---- tail -n 100 pegasus.log.* ----"
+        tail -n 100 `find data/logs -name pegasus.log.*`
     fi
     if [ -f core ]; then
         echo "---- gdb ./dsn.replication.simple_kv core ----"

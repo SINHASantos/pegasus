@@ -23,6 +23,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #pragma once
 
 namespace dsn {
@@ -44,4 +45,4 @@ private:
     int _access_thread_id;
     bool _access_thread_id_inited;
 };
-}
+} // namespace dsn

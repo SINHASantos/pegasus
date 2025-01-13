@@ -17,16 +17,21 @@
  * under the License.
  */
 
-#include "base/value_schema_manager.h"
+#include <stdint.h>
+#include <string>
 
-#include <gtest/gtest.h>
+#include "base/value_schema_manager.h"
+#include "gtest/gtest.h"
+#include "pegasus_value_schema.h"
+#include <string_view>
+#include "value_field.h"
 
 using namespace pegasus;
 
 extern std::string generate_value(value_schema *schema,
                                   uint32_t expire_ts,
                                   uint64_t time_tag,
-                                  dsn::string_view user_data);
+                                  std::string_view user_data);
 
 TEST(value_schema_manager, get_latest_value_schema)
 {

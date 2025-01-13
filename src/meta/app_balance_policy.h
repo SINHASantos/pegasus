@@ -17,10 +17,22 @@
 
 #pragma once
 
+#include <gtest/gtest_prod.h>
+#include <memory>
+#include <unordered_map>
+#include <vector>
+
 #include "load_balance_policy.h"
+#include "meta/meta_data.h"
+#include "utils/command_manager.h"
 
 namespace dsn {
+class gpid;
+class host_port;
+
 namespace replication {
+class meta_service;
+
 class app_balance_policy : public load_balance_policy
 {
 public:
@@ -47,8 +59,8 @@ public:
     copy_secondary_operation(const std::shared_ptr<app_state> app,
                              const app_mapper &apps,
                              node_mapper &nodes,
-                             const std::vector<dsn::rpc_address> &address_vec,
-                             const std::unordered_map<dsn::rpc_address, int> &address_id,
+                             const std::vector<dsn::host_port> &address_vec,
+                             const std::unordered_map<dsn::host_port, int> &address_id,
                              int replicas_low);
     ~copy_secondary_operation() = default;
 

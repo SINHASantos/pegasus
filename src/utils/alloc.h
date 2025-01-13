@@ -17,18 +17,23 @@
 
 #pragma once
 
-#include <algorithm>
+#include <algorithm> // IWYU pragma: keep
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <new>
 
-#include "utils/api_utilities.h"
-#include "utils/fmt_logging.h"
 #include "utils/ports.h"
 
-namespace dsn {
-
+// The check for the definition of CACHELINE_SIZE has to be put after including "utils/ports.h",
+// where CACHELINE_SIZE is defined.
 #ifdef CACHELINE_SIZE
+
+#ifndef NDEBUG
+#include "utils/fmt_logging.h"
+#endif
+
+namespace dsn {
 
 extern void *cacheline_aligned_alloc(size_t size);
 
@@ -80,6 +85,6 @@ cacheline_aligned_ptr<T> cacheline_aligned_alloc_array(size_t len, const T &val)
     return array;
 }
 
-#endif
-
 } // namespace dsn
+
+#endif // CACHELINE_SIZE

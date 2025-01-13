@@ -5,6 +5,7 @@
 #include "utils/safe_strerror_posix.h"
 
 #include <errno.h>
+// IWYU pragma: no_include <features.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -112,5 +113,5 @@ std::string safe_strerror(int err)
     safe_strerror_r(err, buf, sizeof(buf));
     return std::string(buf);
 }
-}
-}
+} // namespace utils
+} // namespace dsn

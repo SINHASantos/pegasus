@@ -19,13 +19,13 @@
 
 #pragma once
 
-#include "runtime/task/task_code.h"
-#include "runtime/task/task_tracker.h"
-#include "runtime/task/task_queue.h"
-#include "runtime/task/async_calls.h"
-#include <pegasus/client.h>
+#include <string>
+
+#include "task/task_tracker.h"
 
 namespace pegasus {
+class pegasus_client;
+
 namespace server {
 
 class result_writer

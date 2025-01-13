@@ -17,22 +17,23 @@
 
 #pragma once
 
-#include "replica_duplicator.h"
+#include <stdint.h>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "meta_admin_types.h"
-#include "partition_split_types.h"
-#include "duplication_types.h"
-#include "bulk_load_types.h"
-#include "backup_types.h"
-#include "consensus_types.h"
-#include "replica_admin_types.h"
 #include "common//duplication_common.h"
-
-#include "replica/replica.h"
-#include "replica/mutation_log.h"
+#include "common/replication_other_types.h"
+#include "duplication_types.h"
+#include "replica/replica_base.h"
+#include "replica_duplicator.h"
+#include "utils/metrics.h"
+#include "utils/zlocks.h"
 
 namespace dsn {
 namespace replication {
+class replica;
 
 /// replica_duplicator_manager manages the set of duplications on this replica.
 /// \see duplication_sync_timer
@@ -41,25 +42,13 @@ namespace replication {
 class replica_duplicator_manager : public replica_base
 {
 public:
-    explicit replica_duplicator_manager(replica *r) : replica_base(r), _replica(r) {}
+    explicit replica_duplicator_manager(replica *r);
 
     // Immediately stop duplication in the following conditions:
     // - replica is not primary on replica-server perspective (status != PRIMARY)
     // - replica is not primary on meta-server perspective (progress.find(partition_id) == end())
     // - the app is not assigned with duplication (dup_map.empty())
-    void update_duplication_map(const std::map<int32_t, duplication_entry> &new_dup_map)
-    {
-        if (_replica->status() != partition_status::PS_PRIMARY || new_dup_map.empty()) {
-            remove_all_duplications();
-            return;
-        }
-
-        remove_non_existed_duplications(new_dup_map);
-
-        for (const auto &kv2 : new_dup_map) {
-            sync_duplication(kv2.second);
-        }
-    }
+    void update_duplication_map(const std::map<int32_t, duplication_entry> &new_dup_map);
 
     /// collect updated duplication confirm points from this replica.
     std::vector<duplication_confirm_entry> get_duplication_confirms_to_update() const;
@@ -75,9 +64,8 @@ public:
     /// \see replica_check.cpp
     void update_confirmed_decree_if_secondary(decree confirmed);
 
-    /// Sums up the number of pending mutations for all duplications
-    /// on this replica, for metric "dup.pending_mutations_count".
-    int64_t get_pending_mutations_count() const;
+    /// Sums up the number of pending mutations for all duplications on this replica.
+    void METRIC_FUNC_NAME_SET(dup_pending_mutations)();
 
     struct dup_state
     {
@@ -86,24 +74,34 @@ public:
         decree last_decree{invalid_decree};
         decree confirmed_decree{invalid_decree};
         duplication_fail_mode::type fail_mode{duplication_fail_mode::FAIL_SLOW};
+        std::string remote_app_name;
     };
     std::vector<dup_state> get_dup_states() const;
+
+    // Encode current progress of all duplication into json.
+    template <typename TWriter>
+    void encode_progress(TWriter &writer) const
+    {
+        zauto_lock l(_lock);
+
+        if (_duplications.empty()) {
+            return;
+        }
+
+        writer.Key("duplications");
+        writer.StartArray();
+        for (const auto &[_, dup] : _duplications) {
+            dup->encode_progress(writer);
+        }
+        writer.EndArray();
+    }
 
 private:
     void sync_duplication(const duplication_entry &ent);
 
     void remove_non_existed_duplications(const std::map<dupid_t, duplication_entry> &);
 
-    void remove_all_duplications()
-    {
-        // fast path
-        if (_duplications.empty())
-            return;
-
-        LOG_WARNING_PREFIX("remove all duplication, replica status = {}",
-                           enum_to_string(_replica->status()));
-        _duplications.clear();
-    }
+    void remove_all_duplications();
 
 private:
     friend class duplication_sync_timer_test;
@@ -119,6 +117,11 @@ private:
     // avoid thread conflict between replica::on_checkpoint_timer and
     // duplication_sync_timer.
     mutable zlock _lock;
+
+    // <- Duplication Metrics ->
+    // TODO(wutao1): calculate the counters independently for each remote cluster
+    //               if we need to duplicate to multiple clusters someday.
+    METRIC_VAR_DECLARE_gauge_int64(dup_pending_mutations);
 };
 
 } // namespace replication

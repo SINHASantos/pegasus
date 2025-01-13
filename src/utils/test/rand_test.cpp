@@ -16,8 +16,12 @@
 // under the License.
 
 #include "utils/rand.h"
-#include <gtest/gtest.h>
+
+#include <algorithm>
 #include <thread>
+#include <vector>
+
+#include "gtest/gtest.h"
 
 namespace dsn {
 

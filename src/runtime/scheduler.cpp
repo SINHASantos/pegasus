@@ -24,25 +24,24 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
+#include <stddef.h>
+#include <algorithm>
+#include <chrono>
+#include <random>
+#include <thread>
+#include <type_traits>
+#include <utility>
 
-#include "utils/rand.h"
-#include "runtime/simulator.h"
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
 #include "runtime/node_scoper.h"
+#include "runtime/service_app.h"
+#include "runtime/simulator.h"
+#include "task/task_code.h"
+#include "task/task_queue.h"
+#include "task/task_spec.h"
 #include "scheduler.h"
-#include "env.sim.h"
-#include <set>
+#include "utils/fmt_logging.h"
+#include "utils/join_point.h"
+#include "utils/rand.h"
 
 namespace dsn {
 namespace tools {
@@ -269,10 +268,9 @@ void scheduler::schedule()
                 _time_ns = ts;
             }
 
-            // randomize the events, and see
-            std::random_shuffle(
-                events->begin(), events->end(), [](int n) { return rand::next_u32(0, n - 1); });
-
+            std::random_device rd;
+            std::mt19937 g(rd());
+            std::shuffle(events->begin(), events->end(), g);
             for (auto e : *events) {
                 if (e.app_task != nullptr) {
                     task *t = e.app_task;
@@ -299,5 +297,5 @@ void scheduler::schedule()
 
     _is_scheduling = false;
 }
-}
-} // end namespace
+} // namespace tools
+} // namespace dsn

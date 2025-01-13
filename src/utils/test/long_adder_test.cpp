@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <fmt/core.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <chrono>
 #include <functional>
+#include <ratio>
 #include <thread>
 #include <vector>
 
-#include <fmt/ostream.h>
-#include <gtest/gtest.h>
-
+#include "gtest/gtest.h"
 #include "runtime/api_layer1.h"
 #include "utils/long_adder.h"
 
@@ -148,7 +150,7 @@ public:
 
         // Define runner to time each case
         auto runner = [num_operations, num_threads](
-            const char *name, std::function<void(int64_t &)> func, int64_t &result) {
+                          const char *name, std::function<void(int64_t &)> func, int64_t &result) {
             uint64_t start = dsn_now_ns();
             func(result);
             uint64_t end = dsn_now_ns();

@@ -17,18 +17,37 @@
 
 #include "server/hotkey_collector.h"
 
-#include "utils/rand.h"
-#include "utils/flags.h"
-#include "utils/defer.h"
-#include "runtime/task/task_tracker.h"
-#include "server/test/message_utils.h"
+#include <fmt/core.h>
+#include <chrono>
+#include <string_view>
+#include <thread>
+
 #include "base/pegasus_key_schema.h"
+#include "common/gpid.h"
+#include "common/replication.codes.h"
+#include "gtest/gtest.h"
 #include "pegasus_server_test_base.h"
+#include "rpc/rpc_holder.h"
+#include "rrdb/rrdb.code.definition.h"
+#include "rrdb/rrdb_types.h"
+#include "server/hotkey_collector_state.h"
+#include "server/pegasus_read_service.h"
+#include "server/test/message_utils.h"
+#include "task/async_calls.h"
+#include "task/task_tracker.h"
+#include "utils/error_code.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/rand.h"
+
+DSN_DECLARE_uint32(hotkey_buckets_num);
+
+namespace dsn {
+class message_ex;
+} // namespace dsn
 
 namespace pegasus {
 namespace server {
-
-DSN_DECLARE_uint32(hotkey_buckets_num);
 
 static std::string generate_hash_key_by_random(bool is_hotkey, int probability = 100)
 {
@@ -51,7 +70,7 @@ TEST(hotkey_collector_public_func_test, get_bucket_id_test)
 {
     int bucket_id = -1;
     for (int i = 0; i < 1000000; i++) {
-        bucket_id = get_bucket_id(dsn::blob::create_from_bytes(generate_hash_key_by_random(false)),
+        bucket_id = get_bucket_id(std::string_view(generate_hash_key_by_random(false)),
                                   FLAGS_hotkey_buckets_num);
         ASSERT_GE(bucket_id, 0);
         ASSERT_LT(bucket_id, FLAGS_hotkey_buckets_num);
@@ -103,7 +122,9 @@ public:
     dsn::task_tracker _tracker;
 };
 
-TEST_F(coarse_collector_test, coarse_collector)
+INSTANTIATE_TEST_SUITE_P(, coarse_collector_test, ::testing::Values(false, true));
+
+TEST_P(coarse_collector_test, coarse_collector)
 {
     detect_hotkey_result result;
 
@@ -158,7 +179,9 @@ public:
     dsn::task_tracker _tracker;
 };
 
-TEST_F(fine_collector_test, fine_collector)
+INSTANTIATE_TEST_SUITE_P(, fine_collector_test, ::testing::Values(false, true));
+
+TEST_P(fine_collector_test, fine_collector)
 {
     detect_hotkey_result result;
 
@@ -203,7 +226,7 @@ TEST_F(fine_collector_test, fine_collector)
 class hotkey_collector_test : public pegasus_server_test_base
 {
 public:
-    hotkey_collector_test() { start(); }
+    hotkey_collector_test() { CHECK_EQ(::dsn::ERR_OK, start()); }
 
     std::shared_ptr<pegasus::server::hotkey_collector> get_read_collector()
     {
@@ -238,7 +261,7 @@ public:
     {
         dsn::blob raw_key;
         pegasus_generate_key(raw_key, hash_key, std::string("sortkey"));
-        get_rpc rpc(dsn::make_unique<dsn::blob>(raw_key), dsn::apps::RPC_RRDB_RRDB_GET);
+        get_rpc rpc(std::make_unique<dsn::blob>(raw_key), dsn::apps::RPC_RRDB_RRDB_GET);
         return rpc;
     }
 
@@ -266,13 +289,15 @@ public:
     dsn::task_tracker _tracker;
 };
 
-TEST_F(hotkey_collector_test, hotkey_type)
+INSTANTIATE_TEST_SUITE_P(, hotkey_collector_test, ::testing::Values(false, true));
+
+TEST_P(hotkey_collector_test, hotkey_type)
 {
     ASSERT_EQ(get_collector_type(get_read_collector()), dsn::replication::hotkey_type::READ);
     ASSERT_EQ(get_collector_type(get_write_collector()), dsn::replication::hotkey_type::WRITE);
 }
 
-TEST_F(hotkey_collector_test, state_transform)
+TEST_P(hotkey_collector_test, state_transform)
 {
     auto collector = get_read_collector();
     ASSERT_EQ(get_collector_stat(collector), hotkey_collector_state::STOPPED);
@@ -340,7 +365,7 @@ TEST_F(hotkey_collector_test, state_transform)
     _tracker.wait_outstanding_tasks();
 }
 
-TEST_F(hotkey_collector_test, data_completeness)
+TEST_P(hotkey_collector_test, data_completeness)
 {
     dsn::replication::detect_hotkey_response resp;
     on_detect_hotkey(generate_control_rpc(dsn::replication::hotkey_type::READ,

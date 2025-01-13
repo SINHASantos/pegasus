@@ -16,11 +16,28 @@
 // under the License.
 
 #include "replica_backup_server.h"
-#include "replica_backup_manager.h"
+
+#include <string>
+
+#include "backup_types.h"
+#include "common/gpid.h"
+#include "common/replication.codes.h"
 #include "replica/replica.h"
 #include "replica/replica_stub.h"
+#include "replica_backup_manager.h"
+#include "runtime/api_layer1.h"
+#include "rpc/serialization.h"
+#include "utils/autoref_ptr.h"
+#include "utils/error_code.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/strings.h"
+
+DSN_DECLARE_string(cold_backup_root);
 
 namespace dsn {
+class message_ex;
+
 namespace replication {
 
 replica_backup_server::replica_backup_server(const replica_stub *rs) : _stub(rs)
@@ -35,25 +52,31 @@ replica_backup_server::replica_backup_server(const replica_stub *rs) : _stub(rs)
     });
 }
 
+replica_backup_server::~replica_backup_server()
+{
+    dsn_rpc_unregiser_handler(RPC_COLD_BACKUP);
+    dsn_rpc_unregiser_handler(RPC_CLEAR_COLD_BACKUP);
+}
+
 void replica_backup_server::on_cold_backup(backup_rpc rpc)
 {
     const backup_request &request = rpc.request();
     backup_response &response = rpc.response();
 
-    LOG_INFO("received cold backup request: backup{%s.%s.%" PRId64 "}",
-             request.pid.to_string(),
-             request.policy.policy_name.c_str(),
+    LOG_INFO("received cold backup request: backup[{}.{}.{}]",
+             request.pid,
+             request.policy.policy_name,
              request.backup_id);
     response.pid = request.pid;
     response.policy_name = request.policy.policy_name;
     response.backup_id = request.backup_id;
 
-    if (_stub->options().cold_backup_root.empty()) {
-        LOG_ERROR("backup{%s.%s.%" PRId64
-                  "}: cold_backup_root is empty, response ERR_OPERATION_DISABLED",
-                  request.pid.to_string(),
-                  request.policy.policy_name.c_str(),
-                  request.backup_id);
+    if (utils::is_empty(FLAGS_cold_backup_root)) {
+        LOG_ERROR(
+            "backup[{}.{}.{}]: FLAGS_cold_backup_root is empty, response ERR_OPERATION_DISABLED",
+            request.pid,
+            request.policy.policy_name,
+            request.backup_id);
         response.err = ERR_OPERATION_DISABLED;
         return;
     }
@@ -62,9 +85,9 @@ void replica_backup_server::on_cold_backup(backup_rpc rpc)
     if (rep != nullptr) {
         rep->on_cold_backup(request, response);
     } else {
-        LOG_ERROR("backup{%s.%s.%" PRId64 "}: replica not found, response ERR_OBJECT_NOT_FOUND",
-                  request.pid.to_string(),
-                  request.policy.policy_name.c_str(),
+        LOG_ERROR("backup[{}.{}.{}]: replica not found, response ERR_OBJECT_NOT_FOUND",
+                  request.pid,
+                  request.policy.policy_name,
                   request.backup_id);
         response.err = ERR_OBJECT_NOT_FOUND;
     }
@@ -72,9 +95,9 @@ void replica_backup_server::on_cold_backup(backup_rpc rpc)
 
 void replica_backup_server::on_clear_cold_backup(const backup_clear_request &request)
 {
-    LOG_INFO_F("receive clear cold backup request: backup({}.{})",
-               request.pid.to_string(),
-               request.policy_name.c_str());
+    LOG_INFO("receive clear cold backup request: backup({}.{})",
+             request.pid,
+             request.policy_name.c_str());
 
     replica_ptr rep = _stub->get_replica(request.pid);
     if (rep != nullptr) {

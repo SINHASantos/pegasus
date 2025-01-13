@@ -31,9 +31,13 @@ set(MY_PROJ_LIBS
         dsn_runtime
         dsn_utils
         pegasus_base
+        rocksdb
+        lz4
+        zstd
+        snappy
         gtest)
 
-set(MY_BOOST_LIBS Boost::system Boost::filesystem Boost::regex)
+set(MY_BOOST_LIBS Boost::system Boost::filesystem)
 
 set(MY_BINPLACES config.ini run.sh)
 

@@ -24,18 +24,13 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     Unit-test for semaphore.
- *
- * Revision history:
- *     Nov., 2015, @qinzuoyan (Zuoyan Qin), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #include "utils/hpc_locks/sema.h"
-#include <gtest/gtest.h>
+
+#include <chrono>
+#include <string>
 #include <thread>
+
+#include "gtest/gtest.h"
 
 TEST(core, Semaphore)
 {

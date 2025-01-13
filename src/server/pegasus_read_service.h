@@ -42,11 +42,10 @@ public:
     pegasus_read_service(dsn::replication::replica *r) : dsn::replication::replication_app_base(r)
     {
     }
-    virtual ~pegasus_read_service() {}
-    virtual int on_request(dsn::message_ex *request) override
+
+    int on_request(dsn::message_ex *request) override WARN_UNUSED_RESULT
     {
-        handle_request(request);
-        return 0;
+        return handle_request(request);
     }
 
 protected:

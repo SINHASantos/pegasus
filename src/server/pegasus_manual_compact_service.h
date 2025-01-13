@@ -19,17 +19,19 @@
 
 #pragma once
 
-#include <rocksdb/db.h>
-#include "utils/string_view.h"
-#include "perf_counter/perf_counter_wrapper.h"
+#include <gtest/gtest_prod.h>
+#include <stdint.h>
+#include <atomic>
+#include <map>
+#include <string>
+
+#include "metadata_types.h"
 #include "replica/replica_base.h"
-#include "meta_admin_types.h"
-#include "partition_split_types.h"
-#include "duplication_types.h"
-#include "bulk_load_types.h"
-#include "backup_types.h"
-#include "consensus_types.h"
-#include "replica_admin_types.h"
+#include "utils/metrics.h"
+
+namespace rocksdb {
+struct CompactRangeOptions;
+} // namespace rocksdb
 
 namespace pegasus {
 namespace server {
@@ -83,11 +85,12 @@ private:
     uint64_t now_timestamp();
 
 private:
+    FRIEND_TEST(manual_compact_service_test, extract_manual_compact_opts);
+
     pegasus_server_impl *_app;
 #ifdef PEGASUS_UNIT_TEST
     uint64_t _mock_now_timestamp = 0;
 #endif
-    int32_t _manual_compact_min_interval_seconds;
 
     // manual compact state
     std::atomic<bool> _disabled;
@@ -97,8 +100,8 @@ private:
     std::atomic<uint64_t> _manual_compact_last_finish_time_ms;
     std::atomic<uint64_t> _manual_compact_last_time_used_ms;
 
-    ::dsn::perf_counter_wrapper _pfc_manual_compact_enqueue_count;
-    ::dsn::perf_counter_wrapper _pfc_manual_compact_running_count;
+    METRIC_VAR_DECLARE_gauge_int64(rdb_manual_compact_queued_tasks);
+    METRIC_VAR_DECLARE_gauge_int64(rdb_manual_compact_running_tasks);
 };
 
 } // namespace server

@@ -17,19 +17,49 @@
  * under the License.
  */
 
-#include <algorithm>
+#include <boost/asio.hpp> // IWYU pragma: keep
+#include <boost/asio/buffer.hpp>
+#include <boost/asio/detail/impl/reactive_socket_service_base.ipp>
+#include <boost/asio/detail/impl/scheduler.ipp>
+#include <boost/asio/detail/impl/service_registry.hpp>
+#include <boost/asio/detail/type_traits.hpp>
+#include <boost/asio/impl/io_context.hpp>
+#include <boost/asio/impl/io_context.ipp>
+#include <boost/asio/impl/read.hpp>
+#include <boost/asio/impl/write.hpp>
+#include <boost/asio/io_service.hpp>
+#include <boost/asio/ip/address.hpp>
+#include <boost/asio/ip/address_v4.hpp>
+#include <boost/asio/ip/impl/address.ipp>
+#include <boost/asio/ip/impl/address_v4.ipp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/socket_base.hpp>
+#include <boost/system/detail/error_code.hpp>
+#include <gtest/gtest_prod.h>
+#include <chrono>
+#include <cstring>
 #include <memory>
+#include <set>
 #include <string>
-#include <boost/asio.hpp>
+#include <thread>
+#include <utility>
+#include <vector>
 
-#include "utils/string_conv.h"
-#include "utils/rand.h"
-
-#include <gtest/gtest.h>
-#include <rrdb/rrdb.client.h>
-#include <pegasus_utils.h>
+#include "geo/lib/geo_client.h"
+#include "gtest/gtest.h"
 #include "proxy_layer.h"
 #include "redis_parser.h"
+#include "rpc/rpc_address.h"
+#include "rpc/rpc_message.h"
+#include "rpc/rpc_stream.h"
+#include "runtime/app_model.h"
+#include "runtime/service_app.h"
+#include "task/task_spec.h"
+#include "utils/blob.h"
+#include "utils/error_code.h"
+#include "utils/fmt_logging.h"
+#include "utils/rand.h"
+#include "utils/strings.h"
 
 using namespace boost::asio;
 using namespace ::pegasus::proxy;
@@ -48,7 +78,7 @@ public:
         proxy_session::factory f = [](proxy_stub *p, dsn::message_ex *m) {
             return std::make_shared<redis_parser>(p, m);
         };
-        _proxy = dsn::make_unique<proxy_stub>(f, args[1].c_str(), args[2].c_str());
+        _proxy = std::make_unique<proxy_stub>(f, args[1].c_str(), args[2].c_str());
         return ::dsn::ERR_OK;
     }
     ::dsn::error_code stop(bool) override { return ::dsn::ERR_OK; }
@@ -128,7 +158,8 @@ protected:
             ASSERT_EQ(bs1.length, bs2.length);
             if (bs1.length > 0) {
                 ASSERT_EQ(bs1.data.length(), bs2.data.length());
-                ASSERT_EQ(0, memcmp(bs1.data.data(), bs2.data.data(), bs2.data.length()));
+                ASSERT_TRUE(
+                    dsn::utils::mequals(bs1.data.data(), bs2.data.data(), bs2.data.length()));
             }
         }
 
@@ -160,7 +191,7 @@ public:
     {
         dsn::message_ex *msg = dsn::message_ex::create_received_request(
             RPC_CALL_RAW_MESSAGE, dsn::DSF_THRIFT_BINARY, nullptr, 0);
-        msg->header->from_address = dsn::rpc_address("127.0.0.1", 123);
+        msg->header->from_address = dsn::rpc_address::from_ip_port("127.0.0.1", 123);
         _parser.reset(new redis_test_parser(nullptr, msg));
     }
 
@@ -501,7 +532,7 @@ TEST_F(proxy_test, test_parse_parameters)
 
 TEST(proxy, connection)
 {
-    ::dsn::rpc_address redis_address("127.0.0.1", 12345);
+    const auto redis_address = dsn::rpc_address::from_ip_port("127.0.0.1", 12345);
     ip::tcp::endpoint redis_endpoint(ip::address_v4(redis_address.ip()), redis_address.port());
 
     io_service ios;
@@ -572,8 +603,8 @@ TEST(proxy, connection)
             boost::asio::read(client_socket, boost::asio::buffer(got_reply, strlen(resps1)));
         got_reply[got_length] = 0;
         ASSERT_EQ(got_length, strlen(resps1));
-        ASSERT_TRUE(strncmp(got_reply, resps1, got_length) == 0 ||
-                    strncmp(got_reply, resps2, got_length) == 0);
+        ASSERT_TRUE(dsn::utils::equals(got_reply, resps1, got_length) ||
+                    dsn::utils::equals(got_reply, resps2, got_length));
     }
 
     {

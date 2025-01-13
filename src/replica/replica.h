@@ -24,66 +24,103 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     replica interface, the base object which rdsn replicates
- *
- * Revision history:
- *     Mar., 2015, @imzhenyu (Zhenyu Guo), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 
-//
-// a replica is a replication partition of a serivce,
-// which handles all replication related issues
-// and on_request the app messages to replication_app_base
-// which is binded to this replication partition
-//
+#include <gtest/gtest_prod.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <atomic>
+#include <functional>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
 
-#include "utils/uniq_timestamp_us.h"
-#include "utils/thread_access_checker.h"
-#include "runtime/serverlet.h"
-
-#include "perf_counter/perf_counter_wrapper.h"
-#include "replica/replica_base.h"
-
-#include "common/replication_common.h"
+#include "common/json_helper.h"
+#include "common/replication_other_types.h"
+#include "dsn.layer2_types.h"
+#include "duplication/replica_duplicator_manager.h" // IWYU pragma: keep
+#include "meta_admin_types.h"
+#include "metadata_types.h"
 #include "mutation.h"
 #include "mutation_log.h"
 #include "prepare_list.h"
+#include "ranger/access_type.h"
+#include "replica/backup/cold_backup_context.h"
+#include "replica/replica_base.h"
 #include "replica_context.h"
+#include "rpc/rpc_message.h"
+#include "runtime/api_layer1.h"
+#include "runtime/serverlet.h"
+#include "task/task.h"
+#include "task/task_tracker.h"
+#include "utils/autoref_ptr.h"
+#include "utils/error_code.h"
+#include "utils/metrics.h"
+#include "utils/thread_access_checker.h"
 #include "utils/throttling_controller.h"
+#include "utils/uniq_timestamp_us.h"
+
+namespace pegasus {
+namespace server {
+class pegasus_server_test_base;
+class rocksdb_wrapper_test;
+} // namespace server
+} // namespace pegasus
 
 namespace dsn {
+class gpid;
+class host_port;
+
+namespace dist {
+
+namespace block_service {
+class block_filesystem;
+} // namespace block_service
+} // namespace dist
+
 namespace security {
 class access_controller;
 } // namespace security
 namespace replication {
 
-class replication_app_base;
-class replica_stub;
-class replica_duplicator_manager;
+class backup_request;
+class backup_response;
+
+class configuration_restore_request;
+class detect_hotkey_request;
+class detect_hotkey_response;
+class group_check_request;
+class group_check_response;
+class learn_notify_response;
+class learn_request;
+class learn_response;
+class learn_state;
+class mutation_log_tool;
+class replica;
 class replica_backup_manager;
 class replica_bulk_loader;
-class replica_split_manager;
 class replica_disk_migrator;
 class replica_follower;
-
-class cold_backup_context;
+class replica_split_manager;
+class replica_stub;
+class replication_app_base;
+class replication_options;
+struct dir_node;
 typedef dsn::ref_ptr<cold_backup_context> cold_backup_context_ptr;
-struct cold_backup_metadata;
 
 namespace test {
 class test_checker;
 }
 
 #define CHECK_REQUEST_IF_SPLITTING(op_type)                                                        \
-    if (_validate_partition_hash) {                                                                \
+    do {                                                                                           \
+        if (!_validate_partition_hash) {                                                           \
+            break;                                                                                 \
+        }                                                                                          \
         if (_split_mgr->should_reject_request()) {                                                 \
             response_client_##op_type(request, ERR_SPLITTING);                                     \
-            _counter_recent_##op_type##_splitting_reject_count->increment();                       \
+            METRIC_VAR_INCREMENT(splitting_rejected_##op_type##_requests);                         \
             return;                                                                                \
         }                                                                                          \
         if (!_split_mgr->check_partition_hash(                                                     \
@@ -91,9 +128,7 @@ class test_checker;
             response_client_##op_type(request, ERR_PARENT_PARTITION_MISUSED);                      \
             return;                                                                                \
         }                                                                                          \
-    }
-
-DSN_DECLARE_bool(reject_write_when_disk_insufficient);
+    } while (0)
 
 // get bool envs[name], return false if value is not bool
 bool get_bool_envs(const std::map<std::string, std::string> &envs,
@@ -120,22 +155,15 @@ struct deny_client
     }
 };
 
+// The replica interface, the base object which rdsn replicates.
+//
+// A replica is a replication partition of a serivce, which handles all replication related
+// issues and on_request the app messages to replication_app_base which is binded to this
+// replication partition.
 class replica : public serverlet<replica>, public ref_counter, public replica_base
 {
 public:
     ~replica(void);
-
-    //
-    //    routines for replica stub
-    //
-    static replica *load(replica_stub *stub, const char *dir);
-    // {parent_dir} is used in partition split for get_child_dir in replica_stub
-    static replica *newr(replica_stub *stub,
-                         gpid gpid,
-                         const app_info &app,
-                         bool restore_if_necessary,
-                         bool is_duplication_follower,
-                         const std::string &parent_dir = "");
 
     // return true when the mutation is valid for the current replica
     bool replay_mutation(mutation_ptr &mu, bool is_private);
@@ -161,7 +189,7 @@ public:
     //
     void on_config_proposal(configuration_update_request &proposal);
     void on_config_sync(const app_info &info,
-                        const partition_configuration &config,
+                        const partition_configuration &pc,
                         split_status::type meta_split_status);
     void on_cold_backup(const backup_request &request, /*out*/ backup_response &response);
 
@@ -198,9 +226,38 @@ public:
     const app_info *get_app_info() const { return &_app_info; }
     decree max_prepared_decree() const { return _prepare_list->max_decree(); }
     decree last_committed_decree() const { return _prepare_list->last_committed_decree(); }
+
+    // The last decree that has been applied into rocksdb memtable.
+    decree last_applied_decree() const;
+
+    // The last decree that has been flushed into rocksdb sst.
+    decree last_flushed_decree() const;
+
     decree last_prepared_decree() const;
     decree last_durable_decree() const;
-    decree last_flushed_decree() const;
+
+    // Encode current progress of decrees into json, including both local writes and duplications
+    // of this replica.
+    template <typename TWriter>
+    void encode_progress(TWriter &writer) const
+    {
+        writer.StartObject();
+
+        JSON_ENCODE_OBJ(writer, max_prepared_decree, max_prepared_decree());
+        JSON_ENCODE_OBJ(writer, max_plog_decree, _private_log->max_decree(get_gpid()));
+        JSON_ENCODE_OBJ(writer, max_plog_decree_on_disk, _private_log->max_decree_on_disk());
+        JSON_ENCODE_OBJ(writer, max_plog_commit_on_disk, _private_log->max_commit_on_disk());
+        JSON_ENCODE_OBJ(writer, last_committed_decree, last_committed_decree());
+        JSON_ENCODE_OBJ(writer, last_applied_decree, last_applied_decree());
+        JSON_ENCODE_OBJ(writer, last_flushed_decree, last_flushed_decree());
+        JSON_ENCODE_OBJ(writer, last_durable_decree, last_durable_decree());
+        JSON_ENCODE_OBJ(writer, max_gc_decree, _private_log->max_gced_decree(get_gpid()));
+
+        _duplication_mgr->encode_progress(writer);
+
+        writer.EndObject();
+    }
+
     const std::string &dir() const { return _dir; }
     uint64_t create_time_milliseconds() const { return _create_time_ms; }
     const char *name() const { return replica_name(); }
@@ -213,11 +270,38 @@ public:
     //
     // Duplication
     //
-    error_code trigger_manual_emergency_checkpoint(decree old_decree);
+
+    using trigger_checkpoint_callback = std::function<void(error_code)>;
+
+    // Choose a fixed thread from pool to trigger an emergency checkpoint asynchronously.
+    // A new checkpoint would still be created even if the replica is empty (hasn't received
+    // any write operation).
+    //
+    // Parameters:
+    // - `min_checkpoint_decree`: the min decree that should be covered by the triggered
+    // checkpoint. Should be a number greater than 0 which means a new checkpoint must be
+    // created.
+    // - `delay_ms`: the delayed time in milliseconds that the triggering task is put into
+    // the thread pool.
+    // - `callback`: the callback processor handling the error code of triggering checkpoint.
+    void async_trigger_manual_emergency_checkpoint(decree min_checkpoint_decree,
+                                                   uint32_t delay_ms,
+                                                   trigger_checkpoint_callback callback = {});
+
     void on_query_last_checkpoint(learn_response &response);
-    replica_duplicator_manager *get_duplication_manager() const { return _duplication_mgr.get(); }
+    std::shared_ptr<replica_duplicator_manager> get_duplication_manager() const
+    {
+        return _duplication_mgr;
+    }
     bool is_duplication_master() const { return _is_duplication_master; }
     bool is_duplication_follower() const { return _is_duplication_follower; }
+    bool is_duplication_plog_checking() const { return _is_duplication_plog_checking.load(); }
+    void set_duplication_plog_checking(bool checking)
+    {
+        _is_duplication_plog_checking.store(checking);
+    }
+
+    void update_app_duplication_status(bool duplicating);
 
     //
     // Backup
@@ -249,20 +333,18 @@ public:
 
     replica_follower *get_replica_follower() const { return _replica_follower.get(); };
 
-    //
-    // Statistics
-    //
-    void update_commit_qps(int count);
-
     // routine for get extra envs from replica
     const std::map<std::string, std::string> &get_replica_extra_envs() const { return _extra_envs; }
+    const dir_node *get_dir_node() const { return _dir_node; }
 
-    void set_disk_status(disk_status::type status) { _disk_status = status; }
-    bool disk_space_insufficient() { return _disk_status == disk_status::SPACE_INSUFFICIENT; }
-    disk_status::type get_disk_status() { return _disk_status; }
-    std::string get_replica_disk_tag() const { return _disk_tag; }
-
-    static const std::string kAppInfo;
+    METRIC_DEFINE_VALUE(write_size_exceed_threshold_requests, int64_t)
+    void METRIC_FUNC_NAME_SET(dup_pending_mutations)();
+    METRIC_DEFINE_INCREMENT(backup_failed_count)
+    METRIC_DEFINE_INCREMENT(backup_successful_count)
+    METRIC_DEFINE_INCREMENT(backup_cancelled_count)
+    METRIC_DEFINE_INCREMENT(backup_file_upload_failed_count)
+    METRIC_DEFINE_INCREMENT(backup_file_upload_successful_count)
+    METRIC_DEFINE_INCREMENT_BY(backup_file_upload_total_bytes)
 
 protected:
     // this method is marked protected to enable us to mock it in unit tests.
@@ -280,7 +362,7 @@ private:
     replica(replica_stub *stub,
             gpid gpid,
             const app_info &app,
-            const char *dir,
+            dir_node *dn,
             bool need_restore,
             bool is_duplication_follower = false);
     error_code initialize_on_new();
@@ -294,7 +376,7 @@ private:
     // See more about it in `replica_bulk_loader.cpp`
     void
     init_prepare(mutation_ptr &mu, bool reconciliation, bool pop_all_committed_mutations = false);
-    void send_prepare_message(::dsn::rpc_address addr,
+    void send_prepare_message(const ::dsn::host_port &addr,
                               partition_status::type status,
                               const mutation_ptr &mu,
                               int timeout_milliseconds,
@@ -320,7 +402,7 @@ private:
                                         learn_response &&resp);
     void on_learn_remote_state_completed(error_code err);
     void handle_learning_error(error_code err, bool is_local_error);
-    error_code handle_learning_succeeded_on_primary(::dsn::rpc_address node,
+    error_code handle_learning_succeeded_on_primary(const host_port &node,
                                                     uint64_t learn_signature);
     void notify_learn_completion();
     error_code apply_learned_state_from_private_log(learn_state &state);
@@ -349,21 +431,21 @@ private:
     // failure handling
     void handle_local_failure(error_code error);
     void handle_remote_failure(partition_status::type status,
-                               ::dsn::rpc_address node,
+                               const host_port &node,
                                error_code error,
                                const std::string &caused_by);
 
     /////////////////////////////////////////////////////////////////
     // reconfiguration
     void assign_primary(configuration_update_request &proposal);
-    void add_potential_secondary(configuration_update_request &proposal);
-    void upgrade_to_secondary_on_primary(::dsn::rpc_address node);
+    void add_potential_secondary(const configuration_update_request &proposal);
+    void upgrade_to_secondary_on_primary(const host_port &node);
     void downgrade_to_secondary_on_primary(configuration_update_request &proposal);
     void downgrade_to_inactive_on_primary(configuration_update_request &proposal);
     void remove(configuration_update_request &proposal);
     void update_configuration_on_meta_server(config_type::type type,
-                                             ::dsn::rpc_address node,
-                                             partition_configuration &newConfig);
+                                             const host_port &node,
+                                             partition_configuration &new_pc);
     void
     on_update_configuration_on_meta_server_reply(error_code err,
                                                  dsn::message_ex *request,
@@ -377,7 +459,7 @@ private:
     void update_app_envs_internal(const std::map<std::string, std::string> &envs);
     void query_app_envs(/*out*/ std::map<std::string, std::string> &envs);
 
-    bool update_configuration(const partition_configuration &config);
+    bool update_configuration(const partition_configuration &pc);
     bool update_local_configuration(const replica_configuration &config, bool same_ballot = false);
     error_code update_init_info_ballot_and_decree();
 
@@ -397,13 +479,20 @@ private:
     error_code background_sync_checkpoint();
     void catch_up_with_private_logs(partition_status::type s);
     void on_checkpoint_completed(error_code err);
-    void on_copy_checkpoint_ack(error_code err,
-                                const std::shared_ptr<replica_configuration> &req,
-                                const std::shared_ptr<learn_response> &resp);
-    void on_copy_checkpoint_file_completed(error_code err,
-                                           size_t sz,
-                                           std::shared_ptr<learn_response> resp,
-                                           const std::string &chk_dir);
+
+    // Enable/Disable plog garbage collection to be executed. For example, to duplicate data
+    // to target cluster, we could firstly disable plog garbage collection, then do copy_data.
+    // After copy_data is finished, a duplication with DS_LOG status could be added to continue
+    // to duplicate data in plog to target cluster; at the same time, plog garbage collection
+    // certainly should be enabled again.
+    void init_plog_gc_enabled();
+    void update_plog_gc_enabled(bool enabled);
+    bool is_plog_gc_enabled() const;
+    std::string get_plog_gc_enabled_message() const;
+
+    // Trigger an emergency checkpoint for duplication. Once the replica is empty (hasn't
+    // received any write operation), there would be no checkpoint created.
+    error_code trigger_manual_emergency_checkpoint(decree min_checkpoint_decree);
 
     /////////////////////////////////////////////////////////////////
     // cold backup
@@ -418,7 +507,7 @@ private:
 
     /////////////////////////////////////////////////////////////////
     // replica restore from backup
-    bool read_cold_backup_metadata(const std::string &file, cold_backup_metadata &backup_metadata);
+    bool read_cold_backup_metadata(const std::string &fname, cold_backup_metadata &backup_metadata);
     // checkpoint on cold backup media maybe contain useless file,
     // we should abandon these file base cold_backup_metadata
     bool remove_useless_file_under_chkpt(const std::string &chkpt_dir,
@@ -444,13 +533,11 @@ private:
     void update_restore_progress(uint64_t f_size);
 
     // Used for remote command
-    // TODO: remove this interface and only expose the http interface
-    // now this remote commend will be used by `scripts/pegasus_manual_compact.sh`
+    // TODO(clang-tidy): remove this interface and only expose the http interface
+    // now this remote commend will be used by `admin_tools/pegasus_manual_compact.sh`
     std::string query_manual_compact_state() const;
 
     manual_compaction_status::type get_manual_compact_status() const;
-
-    void init_table_level_latency_counters();
 
     void on_detect_hotkey(const detect_hotkey_request &req, /*out*/ detect_hotkey_response &resp);
 
@@ -469,10 +556,13 @@ private:
     void update_throttle_envs(const std::map<std::string, std::string> &envs);
     void update_throttle_env_internal(const std::map<std::string, std::string> &envs,
                                       const std::string &key,
-                                      throttling_controller &cntl);
+                                      utils::throttling_controller &cntl);
 
     // update allowed users for access controller
     void update_ac_allowed_users(const std::map<std::string, std::string> &envs);
+
+    // update replica access controller Ranger policies
+    void update_ac_ranger_policies(const std::map<std::string, std::string> &envs);
 
     // update bool app envs
     void update_bool_envs(const std::map<std::string, std::string> &envs,
@@ -485,20 +575,24 @@ private:
     // update envs to deny client request
     void update_deny_client(const std::map<std::string, std::string> &envs);
 
-    void init_disk_tag();
-
     // store `info` into a file under `path` directory
     // path = "" means using the default directory (`_dir`/.app_info)
     error_code store_app_info(app_info &info, const std::string &path = "");
 
-    // clear replica if open failed
-    static replica *
-    clear_on_failure(replica_stub *stub, replica *rep, const std::string &path, const gpid &pid);
-
     void update_app_max_replica_count(int32_t max_replica_count);
+    void update_app_name(const std::string &app_name);
+
+    bool is_data_corrupted() const { return _data_corrupted; }
+
+    // use Apache Ranger for replica access control
+    bool access_controller_allowed(message_ex *msg, const ranger::access_type &ac_type) const;
+
+    // Currently only used for unit test to get the count of backup requests.
+    int64_t get_backup_request_count() const;
 
 private:
     friend class ::dsn::replication::test::test_checker;
+    friend class ::dsn::replication::mutation_log_tool;
     friend class ::dsn::replication::mutation_queue;
     friend class ::dsn::replication::replica_stub;
     friend class mock_replica;
@@ -516,7 +610,12 @@ private:
     friend class replica_disk_test;
     friend class replica_disk_migrate_test;
     friend class open_replica_test;
+    friend class mock_load_replica;
     friend class replica_follower;
+    friend class ::pegasus::server::pegasus_server_test_base;
+    friend class ::pegasus::server::rocksdb_wrapper_test;
+    FRIEND_TEST(replica_disk_test, disk_io_error_test);
+    FRIEND_TEST(replica_test, test_auto_trash_of_corruption);
 
     // replica configuration, updated by update_local_configuration ONLY
     replica_configuration _config;
@@ -533,13 +632,14 @@ private:
     // local checkpoint timer for gc, checkpoint, etc.
     dsn::task_ptr _checkpoint_timer;
 
+    std::atomic<bool> _plog_gc_enabled{true};
+
     // application
     std::unique_ptr<replication_app_base> _app;
 
     // constants
     replica_stub *_stub;
     std::string _dir;
-    std::string _disk_tag;
     replication_options *_options;
     app_info _app_info;
     std::map<std::string, std::string> _extra_envs;
@@ -565,11 +665,6 @@ private:
     std::map<std::string, cold_backup_context_ptr> _cold_backup_contexts;
     partition_split_context _split_states;
 
-    // timer task that running in replication-thread
-    std::atomic<uint64_t> _cold_backup_running_count;
-    std::atomic<uint64_t> _cold_backup_max_duration_time_ms;
-    std::atomic<uint64_t> _cold_backup_max_upload_file_size;
-
     // record the progress of restore
     int64_t _chkpt_total_size;
     std::atomic<int64_t> _cur_download_size;
@@ -585,16 +680,21 @@ private:
     bool _inactive_is_transient; // upgrade to P/S is allowed only iff true
     bool _is_initializing;       // when initializing, switching to primary need to update ballot
     deny_client _deny_client;    // if deny requests
-    throttling_controller _write_qps_throttling_controller;  // throttling by requests-per-second
-    throttling_controller _write_size_throttling_controller; // throttling by bytes-per-second
-    throttling_controller _read_qps_throttling_controller;
-    throttling_controller _backup_request_qps_throttling_controller;
+    utils::throttling_controller
+        _write_qps_throttling_controller; // throttling by requests-per-second
+    utils::throttling_controller
+        _write_size_throttling_controller; // throttling by bytes-per-second
+    utils::throttling_controller _read_qps_throttling_controller;
+    utils::throttling_controller _backup_request_qps_throttling_controller;
 
     // duplication
-    std::unique_ptr<replica_duplicator_manager> _duplication_mgr;
+    std::shared_ptr<replica_duplicator_manager> _duplication_mgr;
     bool _is_manual_emergency_checkpointing{false};
     bool _is_duplication_master{false};
     bool _is_duplication_follower{false};
+    // Indicate whether the replica is during finding out some private logs to
+    // load for duplication. It useful to prevent plog GCed unexpectedly.
+    std::atomic<bool> _is_duplication_plog_checking{false};
 
     // backup
     std::unique_ptr<replica_backup_manager> _backup_mgr;
@@ -614,20 +714,46 @@ private:
 
     std::unique_ptr<replica_follower> _replica_follower;
 
-    // perf counters
-    perf_counter_wrapper _counter_private_log_size;
-    perf_counter_wrapper _counter_recent_write_throttling_delay_count;
-    perf_counter_wrapper _counter_recent_write_throttling_reject_count;
-    perf_counter_wrapper _counter_recent_read_throttling_delay_count;
-    perf_counter_wrapper _counter_recent_read_throttling_reject_count;
-    perf_counter_wrapper _counter_recent_backup_request_throttling_delay_count;
-    perf_counter_wrapper _counter_recent_backup_request_throttling_reject_count;
-    perf_counter_wrapper _counter_recent_write_splitting_reject_count;
-    perf_counter_wrapper _counter_recent_read_splitting_reject_count;
-    perf_counter_wrapper _counter_recent_write_bulk_load_ingestion_reject_count;
-    std::vector<perf_counter *> _counters_table_level_latency;
-    perf_counter_wrapper _counter_dup_disabled_non_idempotent_write_count;
-    perf_counter_wrapper _counter_backup_request_qps;
+    METRIC_VAR_DECLARE_gauge_int64(private_log_size_mb);
+    METRIC_VAR_DECLARE_counter(throttling_delayed_write_requests);
+    METRIC_VAR_DECLARE_counter(throttling_rejected_write_requests);
+    METRIC_VAR_DECLARE_counter(throttling_delayed_read_requests);
+    METRIC_VAR_DECLARE_counter(throttling_rejected_read_requests);
+    METRIC_VAR_DECLARE_counter(backup_requests);
+    METRIC_VAR_DECLARE_counter(throttling_delayed_backup_requests);
+    METRIC_VAR_DECLARE_counter(throttling_rejected_backup_requests);
+    METRIC_VAR_DECLARE_counter(splitting_rejected_write_requests);
+    METRIC_VAR_DECLARE_counter(splitting_rejected_read_requests);
+    METRIC_VAR_DECLARE_counter(bulk_load_ingestion_rejected_write_requests);
+    METRIC_VAR_DECLARE_counter(dup_rejected_non_idempotent_write_requests);
+
+    METRIC_VAR_DECLARE_counter(learn_count);
+    METRIC_VAR_DECLARE_counter(learn_rounds);
+    METRIC_VAR_DECLARE_counter(learn_copy_files);
+    METRIC_VAR_DECLARE_counter(learn_copy_file_bytes);
+    METRIC_VAR_DECLARE_counter(learn_copy_buffer_bytes);
+    METRIC_VAR_DECLARE_counter(learn_lt_cache_responses);
+    METRIC_VAR_DECLARE_counter(learn_lt_app_responses);
+    METRIC_VAR_DECLARE_counter(learn_lt_log_responses);
+    METRIC_VAR_DECLARE_counter(learn_resets);
+    METRIC_VAR_DECLARE_counter(learn_failed_count);
+    METRIC_VAR_DECLARE_counter(learn_successful_count);
+
+    METRIC_VAR_DECLARE_counter(prepare_failed_requests);
+
+    METRIC_VAR_DECLARE_counter(group_check_failed_requests);
+
+    METRIC_VAR_DECLARE_counter(emergency_checkpoints);
+
+    METRIC_VAR_DECLARE_counter(write_size_exceed_threshold_requests);
+
+    METRIC_VAR_DECLARE_counter(backup_started_count);
+    METRIC_VAR_DECLARE_counter(backup_failed_count);
+    METRIC_VAR_DECLARE_counter(backup_successful_count);
+    METRIC_VAR_DECLARE_counter(backup_cancelled_count);
+    METRIC_VAR_DECLARE_counter(backup_file_upload_failed_count);
+    METRIC_VAR_DECLARE_counter(backup_file_upload_successful_count);
+    METRIC_VAR_DECLARE_counter(backup_file_upload_total_bytes);
 
     dsn::task_tracker _tracker;
     // the thread access checker
@@ -635,9 +761,12 @@ private:
 
     std::unique_ptr<security::access_controller> _access_controller;
 
-    disk_status::type _disk_status{disk_status::NORMAL};
+    // The dir_node where the replica data is placed.
+    dir_node *_dir_node{nullptr};
 
     bool _allow_ingest_behind{false};
+    // Indicate where the storage engine data is corrupted and unrecoverable.
+    bool _data_corrupted{false};
 };
 typedef dsn::ref_ptr<replica> replica_ptr;
 } // namespace replication

@@ -16,7 +16,11 @@
 // under the License.
 
 #include "backup_common.h"
-#include "replica/backup/cold_backup_context.h"
+
+#include "common/gpid.h"
+#include "fmt/core.h"
+#include "rpc/rpc_host_port.h"
+#include "runtime/api_layer1.h"
 
 namespace dsn {
 namespace replication {
@@ -97,10 +101,8 @@ std::string get_current_chkpt_file(const std::string &root,
 
 std::string get_remote_chkpt_dirname()
 {
-    // here using server address as suffix of remote_chkpt_dirname
-    std::string local_address = dsn_primary_address().ipv4_str();
-    std::string port = std::to_string(dsn_primary_address().port());
-    return "chkpt_" + local_address + "_" + port;
+    return fmt::format(
+        "chkpt_{}_{}", dsn_primary_host_port().host(), dsn_primary_host_port().port());
 }
 
 std::string get_remote_chkpt_dir(const std::string &root,

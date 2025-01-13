@@ -17,11 +17,41 @@
  * under the License.
  */
 
-#include <gtest/gtest.h>
-#include "utils/fail_point.h"
+#include <fmt/core.h>
+#include <unistd.h>
+#include <atomic>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "replica_disk_test_base.h"
+#include "common/fs_manager.h"
+#include "common/gpid.h"
+#include "common/replication.codes.h"
+#include "dsn.layer2_types.h"
+#include "gtest/gtest.h"
+#include "metadata_types.h"
 #include "replica/disk_cleaner.h"
+#include "replica/replica.h"
+#include "replica/replica_stub.h"
+#include "replica/test/mock_utils.h"
+#include "replica_admin_types.h"
+#include "replica_disk_test_base.h"
+#include "runtime/api_layer1.h"
+#include "rpc/rpc_holder.h"
+#include "test_util/test_util.h"
+#include "utils/autoref_ptr.h"
+#include "utils/error_code.h"
+#include "utils/filesystem.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+
+DSN_DECLARE_bool(fd_disabled);
+
+using pegasus::AssertEventually;
 
 namespace dsn {
 namespace replication {
@@ -39,25 +69,27 @@ public:
     void generate_fake_rpc()
     {
         // create RPC_QUERY_DISK_INFO fake request
-        auto query_request = dsn::make_unique<query_disk_info_request>();
+        auto query_request = std::make_unique<query_disk_info_request>();
         fake_query_disk_rpc = query_disk_info_rpc(std::move(query_request), RPC_QUERY_DISK_INFO);
     }
 
     error_code send_add_new_disk_rpc(const std::string disk_str)
     {
-        auto add_disk_request = dsn::make_unique<add_new_disk_request>();
+        auto add_disk_request = std::make_unique<add_new_disk_request>();
         add_disk_request->disk_str = disk_str;
         auto rpc = add_new_disk_rpc(std::move(add_disk_request), RPC_QUERY_DISK_INFO);
         stub->on_add_new_disk(rpc);
         error_code err = rpc.response().err;
         if (err != ERR_OK) {
-            LOG_INFO_F("error msg: {}", rpc.response().err_hint);
+            LOG_INFO("error msg: {}", rpc.response().err_hint);
         }
         return err;
     }
 };
 
-TEST_F(replica_disk_test, on_query_disk_info_all_app)
+INSTANTIATE_TEST_SUITE_P(, replica_disk_test, ::testing::Values(false, true));
+
+TEST_P(replica_disk_test, on_query_disk_info_all_app)
 {
     generate_fake_rpc();
     stub->on_query_disk_info(fake_query_disk_rpc);
@@ -71,18 +103,17 @@ TEST_F(replica_disk_test, on_query_disk_info_all_app)
     ASSERT_EQ(disk_infos.size(), 6);
 
     int info_size = disk_infos.size();
-    int app_id_1_partition_index = 1;
-    int app_id_2_partition_index = 1;
+    int app_id_1_partition_index = 0;
+    int app_id_2_partition_index = 0;
     for (int i = 0; i < info_size; i++) {
-        if (disk_infos[i].tag == "tag_empty_1") {
+        if (disk_infos[i].holding_primary_replicas.empty() &&
+            disk_infos[i].holding_secondary_replicas.empty()) {
             continue;
         }
         ASSERT_EQ(disk_infos[i].tag, "tag_" + std::to_string(i + 1));
         ASSERT_EQ(disk_infos[i].full_dir, "./tag_" + std::to_string(i + 1));
         ASSERT_EQ(disk_infos[i].disk_capacity_mb, 500);
         ASSERT_EQ(disk_infos[i].disk_available_mb, (i + 1) * 50);
-        // `holding_primary_replicas` and `holding_secondary_replicas` is std::map<app_id,
-        // std::set<::dsn::gpid>>
         ASSERT_EQ(disk_infos[i].holding_primary_replicas.size(), 2);
         ASSERT_EQ(disk_infos[i].holding_secondary_replicas.size(), 2);
 
@@ -132,7 +163,7 @@ TEST_F(replica_disk_test, on_query_disk_info_all_app)
     }
 }
 
-TEST_F(replica_disk_test, on_query_disk_info_app_not_existed)
+TEST_P(replica_disk_test, on_query_disk_info_app_not_existed)
 {
     generate_fake_rpc();
     query_disk_info_request &request = *fake_query_disk_rpc.mutable_request();
@@ -141,7 +172,7 @@ TEST_F(replica_disk_test, on_query_disk_info_app_not_existed)
     ASSERT_EQ(fake_query_disk_rpc.response().err, ERR_OBJECT_NOT_FOUND);
 }
 
-TEST_F(replica_disk_test, on_query_disk_info_one_app)
+TEST_P(replica_disk_test, on_query_disk_info_one_app)
 {
     generate_fake_rpc();
     query_disk_info_request &request = *fake_query_disk_rpc.mutable_request();
@@ -149,73 +180,108 @@ TEST_F(replica_disk_test, on_query_disk_info_one_app)
     request.app_name = app_info_1.app_name;
     stub->on_query_disk_info(fake_query_disk_rpc);
 
-    auto &disk_infos_with_app_1 = fake_query_disk_rpc.response().disk_infos;
-    int info_size = disk_infos_with_app_1.size();
-    for (int i = 0; i < info_size; i++) {
-        if (disk_infos_with_app_1[i].tag == "tag_empty_1") {
+    for (auto disk_info : fake_query_disk_rpc.response().disk_infos) {
+        if (disk_info.holding_primary_replicas.empty() &&
+            disk_info.holding_secondary_replicas.empty()) {
             continue;
         }
-        // `holding_primary_replicas` and `holding_secondary_replicas` is std::map<app_id,
-        // std::set<::dsn::gpid>>
-        ASSERT_EQ(disk_infos_with_app_1[i].holding_primary_replicas.size(), 1);
-        ASSERT_EQ(disk_infos_with_app_1[i].holding_secondary_replicas.size(), 1);
-        ASSERT_EQ(disk_infos_with_app_1[i].holding_primary_replicas[app_info_1.app_id].size(),
+        ASSERT_EQ(disk_info.holding_primary_replicas.size(), 1);
+        ASSERT_EQ(disk_info.holding_secondary_replicas.size(), 1);
+        ASSERT_EQ(disk_info.holding_primary_replicas[app_info_1.app_id].size(),
                   app_id_1_primary_count_for_disk);
-        ASSERT_EQ(disk_infos_with_app_1[i].holding_secondary_replicas[app_info_1.app_id].size(),
+        ASSERT_EQ(disk_info.holding_secondary_replicas[app_info_1.app_id].size(),
                   app_id_1_secondary_count_for_disk);
-        ASSERT_TRUE(disk_infos_with_app_1[i].holding_primary_replicas.find(app_info_2.app_id) ==
-                    disk_infos_with_app_1[i].holding_primary_replicas.end());
-        ASSERT_TRUE(disk_infos_with_app_1[i].holding_secondary_replicas.find(app_info_2.app_id) ==
-                    disk_infos_with_app_1[i].holding_secondary_replicas.end());
+        ASSERT_TRUE(disk_info.holding_primary_replicas.find(app_info_2.app_id) ==
+                    disk_info.holding_primary_replicas.end());
+        ASSERT_TRUE(disk_info.holding_secondary_replicas.find(app_info_2.app_id) ==
+                    disk_info.holding_secondary_replicas.end());
     }
 }
 
-TEST_F(replica_disk_test, gc_disk_useless_dir)
+TEST_P(replica_disk_test, check_data_dir_removable)
 {
+    struct test_case
+    {
+        std::string path;
+        bool expected_removable;
+        bool expected_invalid;
+    } tests[] = {{"./replica.0.err", true, true},
+                 {"./replica.1.gar", true, true},
+                 {"./replica.2.tmp", true, true},
+                 {"./replica.3.ori", true, true},
+                 {"./replica.4.bak", false, true},
+                 {"./replica.5.abcde", false, false},
+                 {"./replica.6.x", false, false},
+                 {"./replica.7.8", false, false}};
+
+    for (const auto &test : tests) {
+        EXPECT_EQ(test.expected_removable, is_data_dir_removable(test.path));
+        EXPECT_EQ(test.expected_invalid, is_data_dir_invalid(test.path));
+    }
+}
+
+TEST_P(replica_disk_test, gc_disk_useless_dir)
+{
+    PRESERVE_FLAG(gc_disk_error_replica_interval_seconds);
+    PRESERVE_FLAG(gc_disk_garbage_replica_interval_seconds);
+    PRESERVE_FLAG(gc_disk_migration_origin_replica_interval_seconds);
+    PRESERVE_FLAG(gc_disk_migration_tmp_replica_interval_seconds);
+
     FLAGS_gc_disk_error_replica_interval_seconds = 1;
     FLAGS_gc_disk_garbage_replica_interval_seconds = 1;
     FLAGS_gc_disk_migration_origin_replica_interval_seconds = 1;
     FLAGS_gc_disk_migration_tmp_replica_interval_seconds = 1;
 
-    std::vector<std::string> tests{
-        "./replica1.err",
-        "./replica2.err",
-        "./replica.gar",
-        "./replica.tmp",
-        "./replica.ori",
-        "./replica.bak",
-        "./replica.1.1",
-    };
+    struct test_case
+    {
+        std::string path;
+        bool expected_exists;
+    } tests[] = {{"./replica1.err", false},
+                 {"./replica2.err", false},
+                 {"./replica.gar", false},
+                 {"./replica.tmp", false},
+                 {"./replica.ori", false},
+                 {"./replica.bak", true},
+                 {"./replica.1.1", true},
+                 {"./1.1.pegasus.1234567890.err", false},
+                 {"./1.2.pegasus.0123456789.gar", false},
+                 {"./2.1.pegasus.1234567890123456.err", false},
+                 {"./2.2.pegasus.1234567890abcdef.gar", false},
+                 {fmt::format("./1.1.pegasus.{}.err", dsn_now_us()), false},
+                 {fmt::format("./2.1.pegasus.{}.gar", dsn_now_us()), false},
+                 {fmt::format("./1.2.pegasus.{}.gar", dsn_now_us() + 1000 * 1000 * 1000), true},
+                 {fmt::format("./2.2.pegasus.{}.err", dsn_now_us() + 1000 * 1000 * 1000), true}};
 
     for (const auto &test : tests) {
-        utils::filesystem::create_directory(test);
-        ASSERT_TRUE(utils::filesystem::directory_exists(test));
+        // Ensure that every directory does not exist and should be created.
+        CHECK_TRUE(utils::filesystem::create_directory(test.path));
+        ASSERT_TRUE(utils::filesystem::directory_exists(test.path));
     }
 
     sleep(5);
 
-    std::vector<std::string> data_dirs{"./"};
     disk_cleaning_report report{};
-    dsn::replication::disk_remove_useless_dirs(data_dirs, report);
+    ASSERT_TRUE(dsn::replication::disk_remove_useless_dirs(
+        {std::make_shared<dir_node>("test", "./")}, report));
 
     for (const auto &test : tests) {
-        if (!dsn::replication::is_data_dir_removable(test)) {
-            ASSERT_TRUE(utils::filesystem::directory_exists(test));
-            continue;
+        ASSERT_EQ(test.expected_exists, utils::filesystem::directory_exists(test.path));
+        if (test.expected_exists) {
+            // Delete existing directories, in case that they are mixed with later test cases
+            // to affect test results.
+            CHECK_TRUE(dsn::utils::filesystem::remove_path(test.path));
         }
-        ASSERT_FALSE(utils::filesystem::directory_exists(test));
     }
 
-    ASSERT_EQ(report.remove_dir_count, 5);
+    ASSERT_EQ(report.remove_dir_count, 11);
     ASSERT_EQ(report.disk_migrate_origin_count, 1);
     ASSERT_EQ(report.disk_migrate_tmp_count, 1);
-    ASSERT_EQ(report.garbage_replica_count, 1);
-    ASSERT_EQ(report.error_replica_count, 2);
+    ASSERT_EQ(report.garbage_replica_count, 5);
+    ASSERT_EQ(report.error_replica_count, 6);
 }
 
-TEST_F(replica_disk_test, disk_status_test)
+TEST_P(replica_disk_test, disk_status_test)
 {
-    int32_t node_index = 0;
     struct disk_status_test
     {
         disk_status::type old_status;
@@ -224,40 +290,21 @@ TEST_F(replica_disk_test, disk_status_test)
               {disk_status::NORMAL, disk_status::SPACE_INSUFFICIENT},
               {disk_status::SPACE_INSUFFICIENT, disk_status::SPACE_INSUFFICIENT},
               {disk_status::SPACE_INSUFFICIENT, disk_status::NORMAL}};
+    auto dn = stub->get_fs_manager()->get_dir_nodes()[0];
     for (const auto &test : tests) {
-        auto node = get_dir_nodes()[node_index];
-        mock_node_status(node_index, test.old_status, test.new_status);
-        update_disks_status();
-        for (auto &kv : node->holding_replicas) {
-            for (auto &pid : kv.second) {
-                bool flag;
-                ASSERT_EQ(replica_disk_space_insufficient(pid, flag), ERR_OK);
-                ASSERT_EQ(flag, test.new_status == disk_status::SPACE_INSUFFICIENT);
+        dn->status = test.new_status;
+        for (const auto &pids_of_app : dn->holding_replicas) {
+            for (const auto &pid : pids_of_app.second) {
+                replica_ptr rep = stub->get_replica(pid);
+                ASSERT_NE(nullptr, rep);
+                ASSERT_EQ(test.new_status, rep->get_dir_node()->status);
             }
         }
     }
-    mock_node_status(node_index, disk_status::NORMAL, disk_status::NORMAL);
+    dn->status = disk_status::NORMAL;
 }
 
-TEST_F(replica_disk_test, broken_disk_test)
-{
-    // Test cases:
-    // create: true, check_rw: true
-    // create: true, check_rw: false
-    // create: false
-    struct broken_disk_test
-    {
-        std::string mock_create_dir;
-        std::string mock_rw_flag;
-        int32_t data_dir_size;
-    } tests[]{{"true", "true", 3}, {"true", "false", 2}, {"false", "false", 2}};
-    for (const auto &test : tests) {
-        ASSERT_EQ(test.data_dir_size,
-                  ignore_broken_disk_test(test.mock_create_dir, test.mock_rw_flag));
-    }
-}
-
-TEST_F(replica_disk_test, add_new_disk_test)
+TEST_P(replica_disk_test, add_new_disk_test)
 {
     // Test case:
     // - invalid params
@@ -284,6 +331,32 @@ TEST_F(replica_disk_test, add_new_disk_test)
         prepare_before_add_new_disk_test(test.create_dir, test.rw_flag);
         ASSERT_EQ(send_add_new_disk_rpc(test.disk_str), test.expected_err);
         reset_after_add_new_disk_test();
+    }
+}
+
+TEST_P(replica_disk_test, disk_io_error_test)
+{
+    // Disable failure detector to avoid connecting with meta server which is not started.
+    FLAGS_fd_disabled = true;
+
+    gpid test_pid(app_info_1.app_id, 0);
+    const auto rep = stub->get_replica(test_pid);
+    auto *old_dn = rep->get_dir_node();
+
+    rep->handle_local_failure(ERR_DISK_IO_ERROR);
+    ASSERT_EVENTUALLY([&] { ASSERT_TRUE(!old_dn->has(test_pid)); });
+
+    // The replica will not be located on the old dir_node.
+    auto *new_dn = stub->get_fs_manager()->find_best_dir_for_new_replica(test_pid);
+    ASSERT_NE(old_dn, new_dn);
+
+    // The replicas will not be located on the old dir_node.
+    const int kNewAppId = 3;
+    // Make sure the app with id 'kNewAppId' is not existed.
+    ASSERT_EQ(nullptr, stub->get_replica(gpid(kNewAppId, 0)));
+    for (int i = 0; i < 16; i++) {
+        new_dn = stub->get_fs_manager()->find_best_dir_for_new_replica(gpid(kNewAppId, i));
+        ASSERT_NE(old_dn, new_dn);
     }
 }
 

@@ -15,18 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <chrono>
+#include <fmt/core.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <algorithm>
+#include <atomic>
 #include <cstdlib>
-#include <cstring>
 #include <thread>
 #include <vector>
 
-#include <fmt/ostream.h>
-
-#include "runtime/api_layer1.h"
+#include "test_util/test_util.h"
 #include "utils/long_adder.h"
+#include "utils/ports.h"
 #include "utils/process_utils.h"
 #include "utils/string_conv.h"
+#include "utils/strings.h"
 
 // The simplest implementation of long adder: just wrap std::atomic<int64_t>.
 class simple_long_adder
@@ -129,7 +132,7 @@ void run_bench(int64_t num_operations, int64_t num_threads, const char *name)
 
     std::vector<std::thread> threads;
 
-    uint64_t start = dsn_now_ns();
+    pegasus::stop_watch sw;
     for (int64_t i = 0; i < num_threads; i++) {
         threads.emplace_back([num_operations, &adder]() {
             for (int64_t i = 0; i < num_operations; ++i) {
@@ -140,19 +143,11 @@ void run_bench(int64_t num_operations, int64_t num_threads, const char *name)
     for (auto &t : threads) {
         t.join();
     }
-    uint64_t end = dsn_now_ns();
-
-    auto duration_ns = static_cast<int64_t>(end - start);
-    std::chrono::nanoseconds nano(duration_ns);
-    auto duration_s = std::chrono::duration_cast<std::chrono::duration<double>>(nano).count();
-
-    fmt::print(stdout,
-               "Running {} operations of {} with {} threads took {} seconds, result = {}.\n",
-               num_operations,
-               name,
-               num_threads,
-               duration_s,
-               adder.value());
+    sw.stop_and_output(fmt::format("Running {} operations of {} with {} threads, result = {}",
+                                   num_operations,
+                                   name,
+                                   num_threads,
+                                   adder.value()));
 }
 
 int main(int argc, char **argv)
@@ -179,13 +174,13 @@ int main(int argc, char **argv)
     }
 
     const char *long_adder_type = argv[3];
-    if (strcmp(long_adder_type, "simple_long_adder") == 0) {
+    if (dsn::utils::equals(long_adder_type, "simple_long_adder")) {
         run_bench<simple_long_adder>(num_operations, num_threads, long_adder_type);
-    } else if (strcmp(long_adder_type, "divided_long_adder") == 0) {
+    } else if (dsn::utils::equals(long_adder_type, "divided_long_adder")) {
         run_bench<divided_long_adder>(num_operations, num_threads, long_adder_type);
-    } else if (strcmp(long_adder_type, "striped_long_adder") == 0) {
+    } else if (dsn::utils::equals(long_adder_type, "striped_long_adder")) {
         run_bench<dsn::striped_long_adder>(num_operations, num_threads, long_adder_type);
-    } else if (strcmp(long_adder_type, "concurrent_long_adder") == 0) {
+    } else if (dsn::utils::equals(long_adder_type, "concurrent_long_adder")) {
         run_bench<dsn::concurrent_long_adder>(num_operations, num_threads, long_adder_type);
     } else {
         fmt::print(stderr, "Invalid long_adder_type: {}\n\n", long_adder_type);

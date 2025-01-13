@@ -16,24 +16,24 @@
 // under the License.
 
 #include <gtest/gtest.h>
+#include <stdint.h>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "meta_admin_types.h"
-#include "partition_split_types.h"
-#include "duplication_types.h"
-#include "bulk_load_types.h"
-#include "backup_types.h"
-#include "consensus_types.h"
-#include "replica_admin_types.h"
-
-#include "meta/meta_data.h"
+#include "meta/meta_service.h" // IWYU pragma: keep
 
 namespace dsn {
+class host_port;
+
 namespace replication {
 
-class meta_split_service;
-class meta_duplication_service;
+class app_state;
 class bulk_load_service;
-class meta_service;
+class meta_duplication_service;
+class meta_split_service;
+class node_state;
 class server_state;
 
 class meta_test_base : public testing::Test
@@ -53,23 +53,30 @@ public:
 
     void set_min_live_node_count_for_unfreeze(uint64_t node_count);
 
-    void set_node_live_percentage_threshold_for_update(uint64_t percentage_threshold);
+    void set_node_live_percentage_threshold_for_update(int32_t percentage_threshold);
 
-    std::vector<rpc_address> ensure_enough_alive_nodes(int min_node_count);
+    std::vector<host_port> ensure_enough_alive_nodes(int min_node_count);
 
-    // create an app for test with specified name and specified partition count
-    void create_app(const std::string &name, uint32_t partition_count);
+    // Create an app for test with specified name, partition count and replica count.
+    void create_app(const std::string &name, int32_t partition_count, int32_t replica_count);
+
+    void create_app(const std::string &name, int32_t partition_count)
+    {
+        create_app(name, partition_count, 3);
+    }
 
     void create_app(const std::string &name) { create_app(name, 8); }
 
     // drop an app for test.
     void drop_app(const std::string &name);
 
+    void clear_apps();
+
     configuration_update_app_env_response update_app_envs(const std::string &app_name,
                                                           const std::vector<std::string> &env_keys,
                                                           const std::vector<std::string> &env_vals);
 
-    void mock_node_state(const rpc_address &addr, const node_state &node);
+    void mock_node_state(const host_port &addr, const node_state &node);
 
     std::shared_ptr<app_state> find_app(const std::string &name);
 
@@ -84,7 +91,7 @@ public:
     std::string _app_root;
 
 private:
-    std::vector<rpc_address> get_alive_nodes() const;
+    std::vector<host_port> get_alive_nodes() const;
 };
 
 } // namespace replication

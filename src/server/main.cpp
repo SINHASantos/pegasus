@@ -17,90 +17,42 @@
  * under the License.
  */
 
+#include <unistd.h>
+#include <string>
+
+#include "common/replication_common.h"
+#include "compaction_operation.h"
+#include "info_collector_app.h"
+#include "meta/meta_service_app.h"
 #include "pegasus_server_impl.h"
 #include "pegasus_service_app.h"
-#include "info_collector_app.h"
-#include "compaction_operation.h"
-
-#include <pegasus/version.h>
-#include <pegasus/git_commit.h>
-
-#include "runtime/tool_api.h"
-#include "utils/command_manager.h"
-
-#include "replica/replication_service_app.h"
-#include "meta/meta_service_app.h"
-
-#include <cstdio>
-#include <cstring>
-#include <chrono>
-
-#include <sys/types.h>
-#include <unistd.h>
-
-#define STR_I(var) #var
-#define STR(var) STR_I(var)
-#ifndef DSN_BUILD_TYPE
-#define PEGASUS_BUILD_TYPE ""
-#else
-#define PEGASUS_BUILD_TYPE STR(DSN_BUILD_TYPE)
-#endif
-
-static char const rcsid[] =
-    "$Version: Pegasus Server " PEGASUS_VERSION " (" PEGASUS_GIT_COMMIT ")"
-#if defined(DSN_BUILD_TYPE)
-    " " STR(DSN_BUILD_TYPE)
-#endif
-        ", built by gcc " STR(__GNUC__) "." STR(__GNUC_MINOR__) "." STR(__GNUC_PATCHLEVEL__)
-#if defined(DSN_BUILD_HOSTNAME)
-            ", built on " STR(DSN_BUILD_HOSTNAME)
-#endif
-                ", built at " __DATE__ " " __TIME__ " $";
-
-const char *pegasus_server_rcsid() { return rcsid; }
-
-using namespace dsn;
-using namespace dsn::replication;
-
-void dsn_app_registration_pegasus()
-{
-    dsn::service::meta_service_app::register_components();
-    service_app::register_factory<pegasus::server::pegasus_meta_service_app>("meta");
-    service_app::register_factory<pegasus::server::pegasus_replication_service_app>("replica");
-    service_app::register_factory<pegasus::server::info_collector_app>("collector");
-    pegasus::server::pegasus_server_impl::register_service();
-    pegasus::server::register_compaction_operations();
-}
+#include "runtime/app_model.h"
+#include "runtime/service_app.h"
+#include "server/server_utils.h"
+#include "utils/fmt_logging.h"
 
 int main(int argc, char **argv)
 {
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "-version") == 0 ||
-            strcmp(argv[i], "--version") == 0) {
-            printf("Pegasus Server %s (%s) %s\n",
-                   PEGASUS_VERSION,
-                   PEGASUS_GIT_COMMIT,
-                   PEGASUS_BUILD_TYPE);
-            dsn_exit(0);
-        }
+    static const char server_name[] = "Pegasus server";
+    if (help(argc, argv, server_name)) {
+        dsn_exit(0);
     }
-    LOG_INFO(
-        "pegasus server starting, pid(%d), version(%s)", (int)getpid(), pegasus_server_rcsid());
-    dsn_app_registration_pegasus();
+    LOG_INFO("{} starting, pid({}), version({})", server_name, getpid(), pegasus_server_rcsid());
 
-    std::unique_ptr<command_deregister> server_info_cmd =
-        dsn::command_manager::instance().register_command(
-            {"server-info"},
-            "server-info - query server information",
-            "server-info",
-            [](const std::vector<std::string> &args) {
-                char str[100];
-                ::dsn::utils::time_ms_to_date_time(dsn::utils::process_start_millis(), str, 100);
-                std::ostringstream oss;
-                oss << "Pegasus Server " << PEGASUS_VERSION << " (" << PEGASUS_GIT_COMMIT << ") "
-                    << PEGASUS_BUILD_TYPE << ", Started at " << str;
-                return oss.str();
-            });
+    // Register meta service.
+    dsn::service::meta_service_app::register_components();
+    dsn::service_app::register_factory<pegasus::server::pegasus_meta_service_app>("meta");
+
+    // Register replica service.
+    dsn::service_app::register_factory<pegasus::server::pegasus_replication_service_app>(
+        dsn::replication::replication_options::kReplicaAppType.c_str());
+    pegasus::server::pegasus_server_impl::register_service();
+    pegasus::server::register_compaction_operations();
+
+    // Register collector service.
+    dsn::service_app::register_factory<pegasus::server::info_collector_app>("collector");
+
+    auto server_info_cmd = register_server_info_cmd();
 
     dsn_run(argc, argv, true);
 

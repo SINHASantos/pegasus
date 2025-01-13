@@ -20,12 +20,18 @@
 #pragma once
 
 #include <fstream>
-#include <vector>
-#include <unordered_map>
-#include <string>
 #include <memory>
+#include <vector>
 
-#include "client/replication_ddl_client.h"
+#include "dsn.layer2_types.h"
+#include "rpc/rpc_host_port.h"
+#include "utils/error_code.h"
+
+namespace dsn {
+namespace replication {
+class replication_ddl_client;
+} // namespace replication
+} // namespace dsn
 
 namespace pegasus {
 namespace test {
@@ -58,15 +64,9 @@ protected:
 
 protected:
     shared_ptr<replication_ddl_client> ddl_client;
-    string app_name;
-    string pegasus_cluster_name;
-    vector<dsn::rpc_address> meta_list;
+    vector<dsn::host_port> meta_list;
 
-    std::vector<partition_configuration> partitions;
-
-    int kill_interval_seconds;
-    uint32_t _sleep_time_before_recover_seconds;
-    uint32_t max_seconds_for_partitions_recover;
+    std::vector<partition_configuration> pcs;
 };
 } // namespace test
 } // namespace pegasus

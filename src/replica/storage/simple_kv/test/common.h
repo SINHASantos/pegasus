@@ -24,35 +24,25 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     Replication testing framework.
- *
- * Revision history:
- *     Nov., 2015, @qinzuoyan (Zuoyan Qin), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
+#include <stdint.h>
+#include <algorithm>
+#include <iosfwd>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
-#include "runtime/serverlet.h"
-#include "runtime/service_app.h"
-#include "runtime/rpc/rpc_address.h"
 #include "common/replication_other_types.h"
-#include "common/replication.codes.h"
-#include "common/replication_common.h"
+#include "metadata_types.h"
+#include "rpc/rpc_host_port.h"
+#include "utils/fmt_utils.h"
 
 namespace dsn {
+class partition_configuration;
+
 namespace replication {
 namespace test {
 
@@ -65,14 +55,13 @@ const char *partition_status_to_short_string(partition_status::type s);
 partition_status::type partition_status_from_short_string(const std::string &str);
 
 // transfer primary_address to node_name
-// return "-" if addr.is_invalid()
+// return "-" if addr is invalid
 // return "node@port" if not found
-std::string address_to_node(rpc_address addr);
+std::string address_to_node(host_port addr);
 // transfer node_name to primary_address
 // return invalid addr if not found
-rpc_address node_to_address(const std::string &name);
+host_port node_to_address(const std::string &name);
 
-std::string gpid_to_string(gpid gpid);
 bool gpid_from_string(const std::string &str, gpid &gpid);
 
 struct replica_id
@@ -138,6 +127,10 @@ struct replica_state
     bool operator!=(const replica_state &o) const { return !(*this == o); }
     std::string to_string() const;
     bool from_string(const std::string &str);
+    friend std::ostream &operator<<(std::ostream &os, const replica_state &rs)
+    {
+        return os << rs.to_string();
+    }
 };
 
 struct state_snapshot
@@ -172,6 +165,11 @@ struct state_snapshot
     std::string to_string() const;
     bool from_string(const std::string &str);
     std::string diff_string(const state_snapshot &other) const;
+
+    friend std::ostream &operator<<(std::ostream &os, const state_snapshot &ss)
+    {
+        return os << ss.to_string();
+    }
 };
 
 struct parti_config
@@ -200,8 +198,17 @@ struct parti_config
     bool operator<(const parti_config &o) const { return pid == o.pid && ballot < o.ballot; }
     std::string to_string() const;
     bool from_string(const std::string &str);
-    void convert_from(const partition_configuration &c);
+    void convert_from(const partition_configuration &pc);
+
+    friend std::ostream &operator<<(std::ostream &os, const parti_config &pc)
+    {
+        return os << pc.to_string();
+    }
 };
-}
-}
-}
+} // namespace test
+} // namespace replication
+} // namespace dsn
+
+USER_DEFINED_STRUCTURE_FORMATTER(::dsn::replication::test::parti_config);
+USER_DEFINED_STRUCTURE_FORMATTER(::dsn::replication::test::replica_id);
+USER_DEFINED_STRUCTURE_FORMATTER(::dsn::replication::test::state_snapshot);

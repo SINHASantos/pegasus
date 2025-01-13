@@ -15,7 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
+#include <memory>
+#include <string>
+#include <unordered_map>
+
+#include "gtest/gtest.h"
+#include "utils/TokenBucket.h"
 #include "utils/token_buckets.h"
 
 namespace dsn {

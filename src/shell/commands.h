@@ -29,7 +29,7 @@
 #include "utils/filesystem.h"
 #include "utils/output_utils.h"
 #include "utils/string_conv.h"
-#include "utils/string_view.h"
+#include <string_view>
 #include "client/replication_ddl_client.h"
 #include "tools/mutation_log_tool.h"
 
@@ -145,6 +145,8 @@ bool drop_app(command_executor *e, shell_context *sc, arguments args);
 
 bool recall_app(command_executor *e, shell_context *sc, arguments args);
 
+bool rename_app(command_executor *e, shell_context *sc, arguments args);
+
 bool get_app_envs(command_executor *e, shell_context *sc, arguments args);
 
 bool set_app_envs(command_executor *e, shell_context *sc, arguments args);
@@ -227,6 +229,7 @@ bool ls_backup_policy(command_executor *e, shell_context *sc, arguments args);
 
 bool modify_backup_policy(command_executor *e, shell_context *sc, arguments args);
 
+extern const std::string disable_backup_policy_help;
 bool disable_backup_policy(command_executor *e, shell_context *sc, arguments args);
 
 bool enable_backup_policy(command_executor *e, shell_context *sc, arguments args);
@@ -257,6 +260,8 @@ bool add_dup(command_executor *e, shell_context *sc, arguments args);
 
 bool query_dup(command_executor *e, shell_context *sc, arguments args);
 
+bool ls_dups(command_executor *e, shell_context *sc, arguments args);
+
 bool remove_dup(command_executor *e, shell_context *sc, arguments args);
 
 bool start_dup(command_executor *e, shell_context *sc, arguments args);
@@ -282,3 +287,7 @@ bool clear_bulk_load(command_executor *e, shell_context *sc, arguments args);
 // == detect hotkey (see 'commands/detect_hotkey.cpp') == //
 
 bool detect_hotkey(command_executor *e, shell_context *sc, arguments args);
+
+// == local partition split (see 'commands/local_partition_split.cpp') == //
+extern const std::string local_partition_split_help;
+bool local_partition_split(command_executor *e, shell_context *sc, arguments args);

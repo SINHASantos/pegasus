@@ -26,27 +26,32 @@
 
 #pragma once
 
+// IWYU pragma: no_include <ext/alloc_traits.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <algorithm>
+#include <functional>
+#include <map>
+#include <memory>
+#include <utility>
 #include <vector>
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
-#include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
-#include "runtime/serverlet.h"
-#include "runtime/service_app.h"
-#include "runtime/rpc/rpc_address.h"
-#include "meta/meta_data.h"
-#include "common/fs_manager.h"
 
-typedef std::map<dsn::rpc_address, std::shared_ptr<dsn::replication::fs_manager>> nodes_fs_manager;
+#include "meta/meta_data.h"
+#include "rpc/rpc_host_port.h"
+
+namespace dsn {
+class gpid;
+
+namespace replication {
+class configuration_proposal_action;
+class fs_manager;
+} // namespace replication
+} // namespace dsn
+
+typedef std::map<dsn::host_port, std::shared_ptr<dsn::replication::fs_manager>> nodes_fs_manager;
 
 inline dsn::replication::fs_manager *get_fs_manager(nodes_fs_manager &nfm,
-                                                    const dsn::rpc_address &node)
+                                                    const dsn::host_port &node)
 {
     auto iter = nfm.find(node);
     if (nfm.end() == iter)
@@ -59,17 +64,17 @@ uint32_t random32(uint32_t min, uint32_t max);
 
 // Generates a random number [min_count, max_count] of node addresses
 // each node is given a random port value in range of [min_count, max_count]
-void generate_node_list(/*out*/ std::vector<dsn::rpc_address> &output_list,
-                        int min_count,
-                        int max_count);
+void generate_node_list(
+    /*out*/ std::vector<dsn::host_port> &output_list, int min_count, int max_count);
 
-// Generates `size` of node addresses, each with port value in range [start_port, start_port + size]
-inline std::vector<dsn::rpc_address> generate_node_list(size_t size, int start_port = 12321)
+// Generates `size` of node host_port, each with port value in range [start_port, start_port + size]
+inline std::vector<dsn::host_port> generate_node_list(size_t size, int start_port = 12321)
 {
-    std::vector<dsn::rpc_address> result;
-    result.resize(size);
-    for (int i = 0; i < size; ++i)
-        result[i].assign_ipv4("127.0.0.1", static_cast<uint16_t>(start_port + i + 1));
+    std::vector<dsn::host_port> result;
+    result.reserve(size);
+    for (int i = 0; i < size; ++i) {
+        result.emplace_back(dsn::host_port("localhost", static_cast<uint16_t>(start_port + i + 1)));
+    }
     return result;
 }
 
@@ -78,12 +83,12 @@ inline std::vector<dsn::rpc_address> generate_node_list(size_t size, int start_p
 // REQUIRES: node_list.size() >= 3
 void generate_app(
     /*out*/ std::shared_ptr<dsn::replication::app_state> &app,
-    const std::vector<dsn::rpc_address> &node_list);
+    const std::vector<dsn::host_port> &node_list);
 
 void generate_node_mapper(
     /*out*/ dsn::replication::node_mapper &output_nodes,
     const dsn::replication::app_mapper &input_apps,
-    const std::vector<dsn::rpc_address> &input_node_list);
+    const std::vector<dsn::host_port> &input_node_list);
 
 void generate_app_serving_replica_info(/*out*/ std::shared_ptr<dsn::replication::app_state> &app,
                                        int total_disks);
@@ -94,7 +99,7 @@ void generate_node_fs_manager(const dsn::replication::app_mapper &apps,
                               int total_disks);
 
 void generate_apps(/*out*/ dsn::replication::app_mapper &apps,
-                   const std::vector<dsn::rpc_address> &node_list,
+                   const std::vector<dsn::host_port> &node_list,
                    int apps_count,
                    int disks_per_node,
                    std::pair<uint32_t, uint32_t> partitions_range,
@@ -106,7 +111,7 @@ void generate_apps(/*out*/ dsn::replication::app_mapper &apps,
 void migration_check_and_apply(
     /*in-out*/ dsn::replication::app_mapper &apps,
     /*in-out*/ dsn::replication::node_mapper &nodes,
-    /*in-out*/ dsn::replication::migration_list &ml,
+    /*in*/ const dsn::replication::migration_list &ml,
     /*in-out*/ nodes_fs_manager *manager);
 
 // when the test need to track the disk info, please input the fs_manager of all disks,

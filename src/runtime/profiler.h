@@ -34,8 +34,8 @@
 
 Profiler toollet
 
-This toollet collects many performance counter values for the specified tasks,
-as configed below.
+This toollet collects many performance metrics for the specified tasks,
+as configured below.
 
 <PRE>
 
@@ -53,6 +53,8 @@ is_profile = false
 */
 
 namespace dsn {
+struct service_spec;
+
 namespace tools {
 
 class profiler : public toollet

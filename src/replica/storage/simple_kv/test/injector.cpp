@@ -24,29 +24,24 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     Replication testing framework.
- *
- * Revision history:
- *     Nov., 2015, @qinzuoyan (Zuoyan Qin), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #include "injector.h"
-#include "checker.h"
+
+#include <stdint.h>
+
 #include "case.h"
-
-#include "runtime/fault_injector.h"
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/autoref_ptr.h"
-
-#include <iostream>
+#include "checker.h"
+#include "task/task_code.h"
+#include "task/task_spec.h"
+#include "utils/join_point.h"
 
 namespace dsn {
+class aio_task;
+class message_ex;
+class rpc_request_task;
+class rpc_response_task;
+class task;
+struct service_spec;
+
 namespace replication {
 namespace test {
 
@@ -200,11 +195,9 @@ void test_injector::install(service_spec &svc_spec)
         spec->on_rpc_reply.put_native(inject_on_rpc_reply);
         spec->on_rpc_response_enqueue.put_native(inject_on_rpc_response_enqueue);
     }
-
-    // LOG_INFO("=== test_injector installed");
 }
 
 test_injector::test_injector(const char *name) : toollet(name) {}
-}
-}
-}
+} // namespace test
+} // namespace replication
+} // namespace dsn

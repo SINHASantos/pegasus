@@ -17,12 +17,18 @@
  * under the License.
  */
 
-#include <gtest/gtest.h>
-#include "server/compaction_operation.h"
-#include "server/compaction_filter_rule.h"
-#include "base/pegasus_value_schema.h"
+#include <rocksdb/slice.h>
+#include <stdint.h>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "base/pegasus_utils.h"
-#include "utils/smart_pointers.h"
+#include "base/pegasus_value_schema.h"
+#include "gtest/gtest.h"
+#include "server/compaction_filter_rule.h"
+#include "server/compaction_operation.h"
 
 namespace pegasus {
 namespace server {
@@ -89,9 +95,9 @@ TEST(compaction_filter_operation_test, all_rules_match)
 
     uint32_t data_version = 1;
     filter_rules rules;
-    rules.push_back(dsn::make_unique<hashkey_pattern_rule>());
-    rules.push_back(dsn::make_unique<sortkey_pattern_rule>());
-    rules.push_back(dsn::make_unique<ttl_range_rule>(data_version));
+    rules.push_back(std::make_unique<hashkey_pattern_rule>());
+    rules.push_back(std::make_unique<sortkey_pattern_rule>());
+    rules.push_back(std::make_unique<ttl_range_rule>(data_version));
     delete_key delete_operation(std::move(rules), data_version);
     pegasus_value_generator gen;
     auto now_ts = utils::epoch_now();
@@ -135,7 +141,7 @@ TEST(delete_key_test, filter)
 
     uint32_t data_version = 1;
     filter_rules rules;
-    rules.push_back(dsn::make_unique<hashkey_pattern_rule>());
+    rules.push_back(std::make_unique<hashkey_pattern_rule>());
     delete_key delete_operation(std::move(rules), data_version);
     for (const auto &test : tests) {
         auto hash_rule = static_cast<hashkey_pattern_rule *>(delete_operation.rules.begin()->get());
@@ -183,7 +189,7 @@ TEST(update_ttl_test, filter)
 
     uint32_t data_version = 1;
     filter_rules rules;
-    rules.push_back(dsn::make_unique<hashkey_pattern_rule>());
+    rules.push_back(std::make_unique<hashkey_pattern_rule>());
     update_ttl update_operation(std::move(rules), data_version);
     pegasus_value_generator gen;
     for (const auto &test : tests) {

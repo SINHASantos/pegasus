@@ -1,5 +1,4 @@
 /*
-
  * The MIT License (MIT)
  *
  * Copyright (c) 2015 Microsoft Corporation
@@ -25,40 +24,73 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     the meta server's server_state, impl file
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     2016-04-25, Weijie Sun(sunweijie at xiaomi.com), refactor
- */
+// IWYU pragma: no_include <boost/detail/basic_pointerbuf.hpp>
+#include <boost/algorithm/string/join.hpp>
+#include <boost/lexical_cast.hpp>
+// IWYU pragma: no_include <ext/alloc_traits.h>
+#include <fmt/core.h>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <iterator>
+#include <set>
+#include <sstream> // IWYU pragma: keep
+#include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
 
-#include "utils/fmt_logging.h"
+#include "common/duplication_common.h"
+#include "common/json_helper.h"
 #include "common/replica_envs.h"
-#include "utils/factory_store.h"
+#include "common/replication.codes.h"
+#include "common/replication_common.h"
+#include "common/replication_enums.h"
+#include "common/replication_other_types.h"
+#include "dump_file.h"
+#include "meta/app_env_validator.h"
+#include "meta/meta_data.h"
+#include "meta/meta_service.h"
+#include "meta/meta_state_service.h"
+#include "meta/partition_guardian.h"
+#include "meta/table_metrics.h"
+#include "meta_admin_types.h"
+#include "meta_bulk_load_service.h"
+#include "metadata_types.h"
+#include "replica_admin_types.h"
+#include "rpc/dns_resolver.h"
+#include "rpc/rpc_address.h"
+#include "rpc/rpc_host_port.h"
+#include "rpc/rpc_message.h"
+#include "rpc/serialization.h"
+#include "runtime/api_layer1.h"
+#include "security/access_controller.h"
+#include "server_load_balancer.h"
+#include "server_state.h"
+#include "task/async_calls.h"
+#include "task/task.h"
+#include "task/task_spec.h"
+#include "utils/autoref_ptr.h"
+#include "utils/binary_reader.h"
+#include "utils/binary_writer.h"
+#include "utils/blob.h"
+#include "utils/command_manager.h"
+#include "utils/config_api.h"
+#include "utils/fail_point.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/metrics.h"
 #include "utils/string_conv.h"
 #include "utils/strings.h"
-#include "runtime/task/task.h"
-#include "utils/command_manager.h"
-#include "runtime/task/async_calls.h"
-#include <sstream>
-#include <cinttypes>
-#include <string>
-#include <boost/lexical_cast.hpp>
+#include "utils/utils.h"
 
-#include "server_state.h"
-#include "server_load_balancer.h"
-#include "dump_file.h"
-#include "app_env_validator.h"
-#include "meta_bulk_load_service.h"
-
-using namespace dsn;
-
-namespace dsn {
-namespace replication {
-
-DSN_DEFINE_int32("meta_server",
+DSN_DEFINE_bool(meta_server,
+                add_secondary_enable_flow_control,
+                false,
+                "enable flow control for add secondary proposal");
+DSN_DEFINE_int32(meta_server,
                  max_allowed_replica_count,
                  5,
                  "max replica count allowed for any app of a cluster");
@@ -67,7 +99,7 @@ DSN_DEFINE_validator(max_allowed_replica_count, [](int32_t allowed_replica_count
     return allowed_replica_count > 0;
 });
 
-DSN_DEFINE_int32("meta_server",
+DSN_DEFINE_int32(meta_server,
                  min_allowed_replica_count,
                  1,
                  "min replica count allowed for any app of a cluster");
@@ -87,6 +119,29 @@ DSN_DEFINE_group_validator(min_max_allowed_replica_count, [](std::string &messag
     return true;
 });
 
+DSN_DEFINE_int32(meta_server,
+                 hold_seconds_for_dropped_app,
+                 604800,
+                 "Default time in seconds to reserve the data of deleted tables");
+DSN_DEFINE_int32(meta_server,
+                 add_secondary_max_count_for_one_node,
+                 10,
+                 "add secondary max count for one node when flow control enabled");
+
+DSN_DECLARE_bool(recover_from_replica_server);
+
+namespace dsn::replication {
+
+// Reply to the client with specified response.
+#define REPLY_TO_CLIENT(msg, response)                                                             \
+    _meta_svc->reply_data(msg, response);                                                          \
+    msg->release_ref()
+
+// Reply to the client with specified response, and return from current function.
+#define REPLY_TO_CLIENT_AND_RETURN(msg, response)                                                  \
+    REPLY_TO_CLIENT(msg, response);                                                                \
+    return
+
 static const char *lock_state = "lock";
 static const char *unlock_state = "unlock";
 
@@ -101,107 +156,36 @@ server_state::~server_state() { _tracker.cancel_outstanding_tasks(); }
 
 void server_state::register_cli_commands()
 {
-    _cmds.emplace_back(dsn::command_manager::instance().register_command(
-        {"meta.dump"},
-        "meta.dump - dump app_states of meta server to local file",
-        "meta.dump -t|--target target_file",
+    _cmds.emplace_back(dsn::command_manager::instance().register_single_command(
+        "meta.dump",
+        "Dump app_states of meta server to a local file",
+        "<target_file>",
         [this](const std::vector<std::string> &args) {
-            dsn::error_code err;
-            if (args.size() != 2) {
-                err = ERR_INVALID_PARAMETERS;
-            } else {
-                const char *target_file = nullptr;
-                for (int i = 0; i < args.size(); i += 2) {
-                    if (strcmp(args[i].c_str(), "-t") == 0 ||
-                        strcmp(args[i].c_str(), "--target") == 0)
-                        target_file = args[i + 1].c_str();
-                }
-                if (target_file == nullptr) {
-                    err = ERR_INVALID_PARAMETERS;
-                } else {
-                    err = this->dump_from_remote_storage(target_file, false);
-                }
+            if (args.size() != 1) {
+                return ERR_INVALID_PARAMETERS.to_string();
             }
-            return std::string(err.to_string());
+
+            return dump_from_remote_storage(args[0].c_str(), false).to_string();
         }));
 
-    _cmds.emplace_back(dsn::command_manager::instance().register_command(
-        {"meta.lb.add_secondary_enable_flow_control"},
-        "meta.lb.add_secondary_enable_flow_control <true|false>",
-        "control whether enable add secondary flow control",
-        [this](const std::vector<std::string> &args) {
-            return remote_command_set_bool_flag(
-                _add_secondary_enable_flow_control, "lb.add_secondary_enable_flow_control", args);
-        }));
+    _cmds.emplace_back(dsn::command_manager::instance().register_bool_command(
+        _add_secondary_enable_flow_control,
+        "meta.lb.add_secondary_enable_flow_control",
+        "control whether enable add secondary flow control"));
 
-    _cmds.emplace_back(dsn::command_manager::instance().register_command(
-        {"meta.lb.add_secondary_max_count_for_one_node"},
-        "meta.lb.add_secondary_max_count_for_one_node [num | DEFAULT]",
-        "control the max count to add secondary for one node",
-        [this](const std::vector<std::string> &args) {
-            std::string result("OK");
-            if (args.empty()) {
-                result = std::to_string(_add_secondary_max_count_for_one_node);
-            } else {
-                if (args[0] == "DEFAULT") {
-                    _add_secondary_max_count_for_one_node =
-                        _meta_svc->get_meta_options().add_secondary_max_count_for_one_node;
-                } else {
-                    int32_t v = 0;
-                    if (!dsn::buf2int32(args[0], v) || v < 0) {
-                        result = std::string("ERR: invalid arguments");
-                    } else {
-                        _add_secondary_max_count_for_one_node = v;
-                    }
-                }
-            }
-            return result;
-        }));
+    _cmds.emplace_back(dsn::command_manager::instance().register_int_command(
+        _add_secondary_max_count_for_one_node,
+        FLAGS_add_secondary_max_count_for_one_node,
+        "meta.lb.add_secondary_max_count_for_one_node",
+        "control the max count to add secondary for one node"));
 }
 
 void server_state::initialize(meta_service *meta_svc, const std::string &apps_root)
 {
     _meta_svc = meta_svc;
     _apps_root = apps_root;
-    _add_secondary_enable_flow_control =
-        _meta_svc->get_meta_options().add_secondary_enable_flow_control;
-    _add_secondary_max_count_for_one_node =
-        _meta_svc->get_meta_options().add_secondary_max_count_for_one_node;
-
-    _dead_partition_count.init_app_counter("eon.server_state",
-                                           "dead_partition_count",
-                                           COUNTER_TYPE_NUMBER,
-                                           "current dead partition count");
-    _unreadable_partition_count.init_app_counter("eon.server_state",
-                                                 "unreadable_partition_count",
-                                                 COUNTER_TYPE_NUMBER,
-                                                 "current unreadable partition count");
-    _unwritable_partition_count.init_app_counter("eon.server_state",
-                                                 "unwritable_partition_count",
-                                                 COUNTER_TYPE_NUMBER,
-                                                 "current unwritable partition count");
-    _writable_ill_partition_count.init_app_counter("eon.server_state",
-                                                   "writable_ill_partition_count",
-                                                   COUNTER_TYPE_NUMBER,
-                                                   "current writable ill partition count");
-    _healthy_partition_count.init_app_counter("eon.server_state",
-                                              "healthy_partition_count",
-                                              COUNTER_TYPE_NUMBER,
-                                              "current healthy partition count");
-    _recent_update_config_count.init_app_counter("eon.server_state",
-                                                 "recent_update_config_count",
-                                                 COUNTER_TYPE_VOLATILE_NUMBER,
-                                                 "update configuration count in the recent period");
-    _recent_partition_change_unwritable_count.init_app_counter(
-        "eon.server_state",
-        "recent_partition_change_unwritable_count",
-        COUNTER_TYPE_VOLATILE_NUMBER,
-        "partition change to unwritable count in the recent period");
-    _recent_partition_change_writable_count.init_app_counter(
-        "eon.server_state",
-        "recent_partition_change_writable_count",
-        COUNTER_TYPE_VOLATILE_NUMBER,
-        "partition change to writable count in the recent period");
+    _add_secondary_enable_flow_control = FLAGS_add_secondary_enable_flow_control;
+    _add_secondary_max_count_for_one_node = FLAGS_add_secondary_max_count_for_one_node;
 }
 
 bool server_state::spin_wait_staging(int timeout_seconds)
@@ -215,7 +199,7 @@ bool server_state::spin_wait_staging(int timeout_seconds)
         if (c == 0) {
             return true;
         }
-        LOG_INFO("there are (%d) apps still in staging, just wait...", c);
+        LOG_INFO("there are {} apps still in staging, just wait...", c);
         std::this_thread::sleep_for(std::chrono::seconds(1));
         if (timeout_seconds > 0) {
             --timeout_seconds;
@@ -236,6 +220,31 @@ int server_state::count_staging_app()
     return ans;
 }
 
+// Create a new variable of `configuration_create_app_response` and assign it with specified
+// error code.
+#define INIT_CREATE_APP_RESPONSE_WITH_ERR(response, err_code)                                      \
+    configuration_create_app_response response;                                                    \
+    response.err = err_code
+
+// Create a new variable of `configuration_create_app_response` and assign it with ERR_OK
+// and table id.
+#define INIT_CREATE_APP_RESPONSE_WITH_OK(response, app_id)                                         \
+    configuration_create_app_response response;                                                    \
+    response.err = dsn::ERR_OK;                                                                    \
+    response.appid = app_id;
+
+// Reply to the client with a newly created failed `configuration_create_app_response` and return
+// from current function.
+#define FAIL_CREATE_APP_RESPONSE(msg, response, err_code)                                          \
+    INIT_CREATE_APP_RESPONSE_WITH_ERR(response, err_code);                                         \
+    REPLY_TO_CLIENT_AND_RETURN(msg, response)
+
+// Reply to the client with a newly created successful `configuration_create_app_response` and
+// return from current function.
+#define SUCC_CREATE_APP_RESPONSE(msg, response, app_id)                                            \
+    INIT_CREATE_APP_RESPONSE_WITH_OK(response, app_id);                                            \
+    REPLY_TO_CLIENT_AND_RETURN(msg, response)
+
 void server_state::transition_staging_state(std::shared_ptr<app_state> &app)
 {
 #define send_response(meta, msg, response_data)                                                    \
@@ -250,8 +259,7 @@ void server_state::transition_staging_state(std::shared_ptr<app_state> &app)
     app_status::type old_status = app->status;
     if (app->status == app_status::AS_CREATING) {
         app->status = app_status::AS_AVAILABLE;
-        configuration_create_app_response resp;
-        resp.err = dsn::ERR_OK;
+        INIT_CREATE_APP_RESPONSE_WITH_ERR(resp, dsn::ERR_OK);
         resp.appid = app->app_id;
         send_response(_meta_svc, app->helpers->pending_response, resp);
     } else if (app->status == app_status::AS_DROPPING) {
@@ -272,7 +280,7 @@ void server_state::transition_staging_state(std::shared_ptr<app_state> &app)
               enum_to_string(app->status));
     }
 
-    LOG_INFO("app(%s) transfer from %s to %s",
+    LOG_INFO("app({}) transfer from {} to {}",
              app->get_logname(),
              enum_to_string(old_status),
              enum_to_string(app->status));
@@ -283,7 +291,7 @@ void server_state::process_one_partition(std::shared_ptr<app_state> &app)
 {
     int ans = --app->helpers->partitions_in_progress;
     if (ans > 0) {
-        LOG_DEBUG("app(%s) in status %s, can't transfer to stable state as some partition is in "
+        LOG_DEBUG("app({}) in status {}, can't transfer to stable state as some partition is in "
                   "progressing",
                   app->get_logname(),
                   enum_to_string(app->status));
@@ -300,7 +308,7 @@ error_code server_state::dump_app_states(const char *local_path,
 {
     std::shared_ptr<dump_file> file = dump_file::open_file(local_path, true);
     if (file == nullptr) {
-        LOG_ERROR("open file failed, file(%s)", local_path);
+        LOG_ERROR("open file failed, file({})", local_path);
         return ERR_FILE_OPERATION_FAILED;
     }
 
@@ -312,10 +320,10 @@ error_code server_state::dump_app_states(const char *local_path,
         binary_writer writer;
         dsn::marshall(writer, *app, DSF_THRIFT_BINARY);
         file->append_buffer(writer.get_buffer());
-        for (const partition_configuration &pc : app->partitions) {
-            binary_writer writer;
-            dsn::marshall(writer, pc, DSF_THRIFT_BINARY);
-            file->append_buffer(writer.get_buffer());
+        for (const auto &pc : app->pcs) {
+            binary_writer pc_writer;
+            dsn::marshall(pc_writer, pc, DSF_THRIFT_BINARY);
+            file->append_buffer(pc_writer.get_buffer());
         }
     }
     return ERR_OK;
@@ -331,7 +339,7 @@ error_code server_state::dump_from_remote_storage(const char *local_path, bool s
             LOG_INFO("remote storage is empty, just stop the dump");
             return ERR_OK;
         } else if (ec != ERR_OK) {
-            LOG_ERROR("sync from remote storage failed, err(%s)", ec.to_string());
+            LOG_ERROR("sync from remote storage failed, err({})", ec);
             return ec;
         } else {
             spin_wait_staging();
@@ -374,7 +382,7 @@ error_code server_state::restore_from_local_storage(const char *local_path)
 
     std::shared_ptr<dump_file> file = dump_file::open_file(local_path, false);
     if (file == nullptr) {
-        LOG_ERROR("open file failed, file(%s)", local_path);
+        LOG_ERROR("open file failed, file({})", local_path);
         return ERR_FILE_OPERATION_FAILED;
     }
 
@@ -382,7 +390,7 @@ error_code server_state::restore_from_local_storage(const char *local_path)
     CHECK_EQ_MSG(file->read_next_buffer(data), 1, "read format header failed");
     _all_apps.clear();
 
-    CHECK_EQ(memcmp(data.data(), "binary", 6), 0);
+    CHECK_TRUE(utils::mequals(data.data(), "binary", 6));
     while (true) {
         int ans = file->read_next_buffer(data);
         CHECK_NE_MSG(ans, -1, "read file failed");
@@ -397,10 +405,10 @@ error_code server_state::restore_from_local_storage(const char *local_path)
 
         for (unsigned int i = 0; i != app->partition_count; ++i) {
             ans = file->read_next_buffer(data);
-            binary_reader reader(data);
+            binary_reader pc_reader(data);
             CHECK_EQ_MSG(ans, 1, "unexpect read buffer");
-            unmarshall(reader, app->partitions[i], DSF_THRIFT_BINARY);
-            CHECK_EQ_MSG(app->partitions[i].pid.get_partition_index(),
+            unmarshall(pc_reader, app->pcs[i], DSF_THRIFT_BINARY);
+            CHECK_EQ_MSG(app->pcs[i].pid.get_partition_index(),
                          i,
                          "uncorrect partition data, gpid({}.{}), appname({})",
                          app->app_id,
@@ -427,39 +435,59 @@ error_code server_state::restore_from_local_storage(const char *local_path)
 
 error_code server_state::initialize_default_apps()
 {
-    std::vector<const char *> sections;
+    std::vector<std::string> sections;
     dsn_config_get_all_sections(sections);
     LOG_INFO("start to do initialize");
 
     app_info default_app;
-    for (int i = 0; i < sections.size(); i++) {
-        if (strstr(sections[i], "meta_server.apps") == sections[i] ||
-            strcmp(sections[i], "replication.app") == 0) {
-            const char *s = sections[i];
-
+    for (const auto &section : sections) {
+        // Match a section prefixed by "meta_server.apps" or equal to "replication.app"
+        // TODO(yingchun): Move "replication.app" out of the loop, and define it as flags, then we
+        // can get it by HTTP.
+        if (section.find("meta_server.apps") == 0 || section == "replication.app") {
             default_app.status = app_status::AS_CREATING;
             default_app.app_id = _all_apps.size() + 1;
 
-            default_app.app_name = dsn_config_get_value_string(s, "app_name", "", "app name");
+            // TODO(yingchun): the old configuration launch methods should be kept to launch repeat
+            //  configs.
+            default_app.app_name =
+                dsn_config_get_value_string(section.c_str(), "app_name", "", "Table name");
             if (default_app.app_name.length() == 0) {
-                LOG_WARNING("'[%s] app_name' not specified, ignore this section", s);
+                LOG_WARNING("'[{}] app_name' not specified, ignore this section", section);
                 continue;
             }
 
-            default_app.app_type = dsn_config_get_value_string(s, "app_type", "", "app type name");
-            default_app.partition_count = (int)dsn_config_get_value_uint64(
-                s, "partition_count", 1, "how many partitions the app should have");
-            default_app.is_stateful =
-                dsn_config_get_value_bool(s, "stateful", true, "whether this is a stateful app");
-            default_app.max_replica_count = (int)dsn_config_get_value_uint64(
-                s, "max_replica_count", 3, "max replica count in app");
+            default_app.app_type = dsn_config_get_value_string(
+                section.c_str(),
+                "app_type",
+                "",
+                "The storage engine type, 'pegasus' represents the storage engine based on "
+                "Rocksdb. Currently, only 'pegasus' is available");
+            default_app.partition_count =
+                (int)dsn_config_get_value_uint64(section.c_str(),
+                                                 "partition_count",
+                                                 1,
+                                                 "Partition count, i.e., the shards of the table");
+            // TODO(yingchun): always true, remove it.
+            default_app.is_stateful = dsn_config_get_value_bool(
+                section.c_str(),
+                "stateful",
+                true,
+                "Whether this is a stateful table, it must be true if 'app_type = pegasus'");
+            default_app.max_replica_count =
+                (int)dsn_config_get_value_uint64(section.c_str(),
+                                                 "max_replica_count",
+                                                 3,
+                                                 "The maximum replica count of each partition");
             default_app.create_second = dsn_now_ms() / 1000;
-            std::string envs_str = dsn_config_get_value_string(s, "envs", "", "app envs");
+            std::string envs_str = dsn_config_get_value_string(
+                section.c_str(), "envs", "", "Table environment variables");
             bool parse = dsn::utils::parse_kv_map(envs_str.c_str(), default_app.envs, ',', '=');
 
-            CHECK_GT_MSG(default_app.app_type.length(), 0, "'[{}] app_type' not specified", s);
+            CHECK_GT_MSG(
+                default_app.app_type.length(), 0, "'[{}] app_type' not specified", section);
             CHECK_GT(default_app.partition_count, 0);
-            CHECK(parse, "'[{}] envs' is invalid, envs = {}", s, envs_str);
+            CHECK(parse, "'[{}] envs' is invalid, envs = {}", section, envs_str);
 
             std::shared_ptr<app_state> app = app_state::create(default_app);
             _all_apps.emplace(app->app_id, app);
@@ -478,12 +506,14 @@ error_code server_state::initialize_default_apps()
 error_code server_state::sync_apps_to_remote_storage()
 {
     _exist_apps.clear();
+    _table_metric_entities.clear_entities();
     for (auto &kv_pair : _all_apps) {
         if (kv_pair.second->status == app_status::AS_CREATING) {
             CHECK(_exist_apps.find(kv_pair.second->app_name) == _exist_apps.end(),
                   "invalid app name, name = {}",
                   kv_pair.second->app_name);
             _exist_apps.emplace(kv_pair.second->app_name, kv_pair.second);
+            _table_metric_entities.create_entity(kv_pair.first, kv_pair.second->partition_count);
         }
     }
 
@@ -492,17 +522,18 @@ error_code server_state::sync_apps_to_remote_storage()
     error_code err;
     dist::meta_state_service *storage = _meta_svc->get_remote_storage();
 
-    auto t = storage->create_node(apps_path,
-                                  LPC_META_CALLBACK,
-                                  [&err](error_code ec) { err = ec; },
-                                  blob(lock_state, 0, strlen(lock_state)));
+    auto t = storage->create_node(
+        apps_path,
+        LPC_META_CALLBACK,
+        [&err](error_code ec) { err = ec; },
+        blob(lock_state, 0, strlen(lock_state)));
     t->wait();
 
     if (err != ERR_NODE_ALREADY_EXIST && err != ERR_OK) {
-        LOG_ERROR("create root node /apps in meta store failed, err = %s", err.to_string());
+        LOG_ERROR("create root node /apps in meta store failed, err = {}", err);
         return err;
     } else {
-        LOG_INFO("set %s to lock state in remote storage", _apps_root.c_str());
+        LOG_INFO("set {} to lock state in remote storage", _apps_root);
     }
 
     err = ERR_OK;
@@ -515,35 +546,36 @@ error_code server_state::sync_apps_to_remote_storage()
               "invalid app status");
         blob value = app->to_json(app_status::AS_CREATING == app->status ? app_status::AS_AVAILABLE
                                                                          : app_status::AS_DROPPED);
-        storage->create_node(path,
-                             LPC_META_CALLBACK,
-                             [&err, path](error_code ec) {
-                                 if (ec != ERR_OK && ec != ERR_NODE_ALREADY_EXIST) {
-                                     LOG_WARNING("create app node failed, path(%s) reason(%s)",
-                                                 path.c_str(),
-                                                 ec.to_string());
-                                     err = ec;
-                                 } else {
-                                     LOG_INFO("create app node %s ok", path.c_str());
-                                 }
-                             },
-                             value,
-                             &tracker);
+        storage->create_node(
+            path,
+            LPC_META_CALLBACK,
+            [&err, path](error_code ec) {
+                if (ec != ERR_OK && ec != ERR_NODE_ALREADY_EXIST) {
+                    LOG_WARNING("create app node failed, path({}) reason({})", path, ec);
+                    err = ec;
+                } else {
+                    LOG_INFO("create app node {} ok", path);
+                }
+            },
+            value,
+            &tracker);
     }
     tracker.wait_outstanding_tasks();
 
     if (err != ERR_OK) {
         _exist_apps.clear();
+        _table_metric_entities.clear_entities();
         return err;
     }
     for (auto &kv : _all_apps) {
         std::shared_ptr<app_state> &app = kv.second;
         for (unsigned int i = 0; i != app->partition_count; ++i) {
-            task_ptr init_callback =
-                tasking::create_task(LPC_META_STATE_HIGH, &tracker, [] {}, sStateHash);
+            task_ptr init_callback = tasking::create_task(
+                LPC_META_STATE_HIGH, &tracker, [] {}, sStateHash);
             init_app_partition_node(app, i, init_callback);
         }
     }
+
     tracker.wait_outstanding_tasks();
     t = _meta_svc->get_remote_storage()->set_data(_apps_root,
                                                   blob(unlock_state, 0, strlen(unlock_state)),
@@ -551,12 +583,10 @@ error_code server_state::sync_apps_to_remote_storage()
                                                   [&err](dsn::error_code e) { err = e; });
     t->wait();
     if (dsn::ERR_OK == err) {
-        LOG_INFO("set %s to unlock state in remote storage", _apps_root.c_str());
+        LOG_INFO("set {} to unlock state in remote storage", _apps_root);
         return err;
     } else {
-        LOG_ERROR("set %s to unlock state in remote storage failed, reason(%s)",
-                  _apps_root.c_str(),
-                  err.to_string());
+        LOG_ERROR("set {} to unlock state in remote storage failed, reason({})", _apps_root, err);
         return err;
     }
 }
@@ -567,8 +597,9 @@ dsn::error_code server_state::sync_apps_from_remote_storage()
     dsn::task_tracker tracker;
 
     dist::meta_state_service *storage = _meta_svc->get_remote_storage();
-    auto sync_partition = [this, storage, &err, &tracker](
-        std::shared_ptr<app_state> &app, int partition_id, const std::string &partition_path) {
+    auto sync_partition = [this, storage, &err, &tracker](std::shared_ptr<app_state> &app,
+                                                          int partition_id,
+                                                          const std::string &partition_path) {
         storage->get_data(
             partition_path,
             LPC_META_CALLBACK,
@@ -576,6 +607,12 @@ dsn::error_code server_state::sync_apps_from_remote_storage()
                                                             const blob &value) mutable {
                 if (ec == ERR_OK) {
                     partition_configuration pc;
+                    // TODO(yingchun): when upgrade from old version, check if the fields will be
+                    //  filled.
+                    // TODO(yingchun): check if the fields will be set after decoding.
+                    pc.__isset.hp_secondaries = true;
+                    pc.__isset.hp_last_drops = true;
+                    pc.__isset.hp_primary = true;
                     dsn::json::json_forwarder<partition_configuration>::decode(value, pc);
 
                     CHECK(pc.pid.get_app_id() == app->app_id &&
@@ -583,9 +620,10 @@ dsn::error_code server_state::sync_apps_from_remote_storage()
                           "invalid partition config");
                     {
                         zauto_write_lock l(_lock);
-                        app->partitions[partition_id] = pc;
-                        for (const dsn::rpc_address &addr : pc.last_drops) {
-                            app->helpers->contexts[partition_id].record_drop_history(addr);
+                        app->pcs[partition_id] = pc;
+                        CHECK(pc.__isset.hp_last_drops, "");
+                        for (const auto &last_drop : pc.hp_last_drops) {
+                            app->helpers->contexts[partition_id].record_drop_history(last_drop);
                         }
 
                         if (app->status == app_status::AS_CREATING &&
@@ -610,25 +648,25 @@ dsn::error_code server_state::sync_apps_from_remote_storage()
                                                     ? app->init_partition_count
                                                     : app->partition_count;
                     if (partition_id < init_partition_count) {
-                        LOG_WARNING_F(
+                        LOG_WARNING(
                             "partition node {} not exist on remote storage, may half create before",
                             partition_path);
                         init_app_partition_node(app, partition_id, nullptr);
                     } else if (partition_id >= app->partition_count / 2) {
-                        LOG_WARNING_F(
+                        LOG_WARNING(
                             "partition node {} not exist on remote storage, may half split before",
                             partition_path);
                         zauto_write_lock l(_lock);
                         app->helpers->split_states.status[partition_id - app->partition_count / 2] =
                             split_status::SPLITTING;
                         app->helpers->split_states.splitting_count++;
-                        app->partitions[partition_id].ballot = invalid_ballot;
-                        app->partitions[partition_id].pid = gpid(app->app_id, partition_id);
+                        app->pcs[partition_id].ballot = invalid_ballot;
+                        app->pcs[partition_id].pid = gpid(app->app_id, partition_id);
                         process_one_partition(app);
                     }
 
                 } else {
-                    LOG_ERROR("get partition node failed, reason(%s)", ec.to_string());
+                    LOG_ERROR("get partition node failed, reason({})", ec);
                     err = ec;
                 }
             },
@@ -651,6 +689,7 @@ dsn::error_code server_state::sync_apps_from_remote_storage()
                         if (app->status == app_status::AS_AVAILABLE) {
                             app->status = app_status::AS_CREATING;
                             _exist_apps.emplace(app->app_name, app);
+                            _table_metric_entities.create_entity(app->app_id, app->partition_count);
                         } else if (app->status == app_status::AS_DROPPED) {
                             app->status = app_status::AS_DROPPING;
                         } else {
@@ -667,9 +706,9 @@ dsn::error_code server_state::sync_apps_from_remote_storage()
                         sync_partition(app, i, partition_path);
                     }
                 } else {
-                    LOG_ERROR("get app info from meta state service failed, path = %s, err = %s",
-                              app_path.c_str(),
-                              ec.to_string());
+                    LOG_ERROR("get app info from meta state service failed, path = {}, err = {}",
+                              app_path,
+                              ec);
                     err = ec;
                 }
             },
@@ -678,6 +717,7 @@ dsn::error_code server_state::sync_apps_from_remote_storage()
 
     _all_apps.clear();
     _exist_apps.clear();
+    _table_metric_entities.clear_entities();
 
     std::string transaction_state;
     storage
@@ -707,9 +747,9 @@ dsn::error_code server_state::sync_apps_from_remote_storage()
                     sync_app(_apps_root + "/" + appid_str);
                 }
             } else {
-                LOG_ERROR("get app list from meta state service failed, path = %s, err = %s",
-                          _apps_root.c_str(),
-                          ec.to_string());
+                LOG_ERROR("get app list from meta state service failed, path = {}, err = {}",
+                          _apps_root,
+                          ec);
                 err = ec;
             }
         },
@@ -726,14 +766,15 @@ void server_state::initialize_node_state()
     zauto_write_lock l(_lock);
     for (auto &app_pair : _all_apps) {
         app_state &app = *(app_pair.second);
-        for (partition_configuration &pc : app.partitions) {
-            if (!pc.primary.is_invalid()) {
-                node_state *ns = get_node_state(_nodes, pc.primary, true);
+        for (const auto &pc : app.pcs) {
+            if (pc.hp_primary) {
+                node_state *ns = get_node_state(_nodes, pc.hp_primary, true);
                 ns->put_partition(pc.pid, true);
             }
-            for (auto &ep : pc.secondaries) {
-                CHECK(!ep.is_invalid(), "invalid secondary address, addr = {}", ep);
-                node_state *ns = get_node_state(_nodes, ep, true);
+
+            for (const auto &secondary : pc.hp_secondaries) {
+                CHECK(secondary, "invalid secondary: {}", secondary);
+                node_state *ns = get_node_state(_nodes, secondary, true);
                 ns->put_partition(pc.pid, false);
             }
         }
@@ -743,7 +784,7 @@ void server_state::initialize_node_state()
     }
     for (auto &app_pair : _all_apps) {
         app_state &app = *(app_pair.second);
-        for (const partition_configuration &pc : app.partitions) {
+        for (const auto &pc : app.pcs) {
             check_consistency(pc.pid);
         }
     }
@@ -753,20 +794,20 @@ error_code server_state::initialize_data_structure()
 {
     error_code err = sync_apps_from_remote_storage();
     if (err == ERR_OBJECT_NOT_FOUND) {
-        if (_meta_svc->get_meta_options().recover_from_replica_server) {
+        if (FLAGS_recover_from_replica_server) {
             return ERR_OBJECT_NOT_FOUND;
         } else {
             LOG_INFO("can't find apps from remote storage, start to initialize default apps");
             err = initialize_default_apps();
         }
     } else if (err == ERR_OK) {
-        if (_meta_svc->get_meta_options().recover_from_replica_server) {
+        if (FLAGS_recover_from_replica_server) {
             CHECK(false,
                   "find apps from remote storage, but "
                   "[meta_server].recover_from_replica_server = true");
         } else {
             LOG_INFO(
-                "sync apps from remote storage ok, get %d apps, init the node state accordingly",
+                "sync apps from remote storage ok, get {} apps, init the node state accordingly",
                 _all_apps.size());
             initialize_node_state();
         }
@@ -794,17 +835,20 @@ void server_state::on_config_sync(configuration_query_by_node_rpc rpc)
 
     bool reject_this_request = false;
     response.__isset.gc_replicas = false;
-    LOG_INFO("got config sync request from %s, stored_replicas_count(%d)",
-             request.node.to_string(),
-             (int)request.stored_replicas.size());
+
+    host_port node;
+    GET_HOST_PORT(request, node, node);
+    LOG_INFO("got config sync request from {}, stored_replicas_count({})",
+             node,
+             request.stored_replicas.size());
 
     {
         zauto_read_lock l(_lock);
 
         // sync the partitions to the replica server
-        node_state *ns = get_node_state(_nodes, request.node, false);
+        node_state *ns = get_node_state(_nodes, node, false);
         if (ns == nullptr) {
-            LOG_INFO("node(%s) not found in meta server", request.node.to_string());
+            LOG_INFO("node({}) not found in meta server", node);
             response.err = ERR_OBJECT_NOT_FOUND;
         } else {
             response.err = ERR_OK;
@@ -819,16 +863,23 @@ void server_state::on_config_sync(configuration_query_by_node_rpc rpc)
                 // so if the syncing config is related to the node, we may need to reject this
                 // request
                 if (cc.stage == config_status::pending_remote_sync) {
-                    configuration_update_request *req = cc.pending_sync_request.get();
+                    configuration_update_request *pending_request = cc.pending_sync_request.get();
                     // when register child partition, stage is config_status::pending_remote_sync,
                     // but cc.pending_sync_request is not set, see more in function
                     // 'register_child_on_meta'
-                    if (req == nullptr || req->node == request.node)
+                    if (pending_request == nullptr) {
                         return false;
+                    }
+
+                    host_port target;
+                    GET_HOST_PORT(*pending_request, node, target);
+                    if (target == node) {
+                        return false;
+                    }
                 }
 
                 response.partitions[i].info = *app;
-                response.partitions[i].config = app->partitions[pid.get_partition_index()];
+                response.partitions[i].config = app->pcs[pid.get_partition_index()];
                 response.partitions[i].host_node = request.node;
                 // set meta_split_status
                 const split_state &app_split_states = app->helpers->split_states;
@@ -858,10 +909,7 @@ void server_state::on_config_sync(configuration_query_by_node_rpc rpc)
             // the app is deleted but not expired, we need to ignore it
             // if the app is deleted and expired, we need to gc it
             for (const replica_info &rep : replicas) {
-                LOG_DEBUG("receive stored replica from %s, pid(%d.%d)",
-                          request.node.to_string(),
-                          rep.pid.get_app_id(),
-                          rep.pid.get_partition_index());
+                LOG_DEBUG("receive stored replica from {}, pid({})", node, rep.pid);
                 std::shared_ptr<app_state> app = get_app(rep.pid.get_app_id());
                 if (app == nullptr || rep.pid.get_partition_index() >= app->partition_count) {
                     // This app has garbage partition after cancel split, the canceled child
@@ -870,10 +918,10 @@ void server_state::on_config_sync(configuration_query_by_node_rpc rpc)
                         rep.pid.get_partition_index() < app->partition_count * 2 &&
                         rep.status == partition_status::PS_ERROR) {
                         response.gc_replicas.push_back(rep);
-                        LOG_WARNING_F(
+                        LOG_WARNING(
                             "notify node({}) to gc replica({}) because it is useless partition "
                             "which is caused by cancel split",
-                            request.node.to_string(),
+                            node,
                             rep.pid);
                     } else {
                         // app is not recognized or partition is not recognized
@@ -881,55 +929,46 @@ void server_state::on_config_sync(configuration_query_by_node_rpc rpc)
                               "gpid({}) on node({}) is not exist on meta server, administrator "
                               "should check consistency of meta data",
                               rep.pid,
-                              request.node);
+                              node);
                     }
                 } else if (app->status == app_status::AS_DROPPED) {
                     if (app->expire_second == 0) {
-                        LOG_INFO(
-                            "gpid(%d.%d) on node(%s) is of dropped table, but expire second is "
-                            "not specified, do not delete it for safety reason",
-                            rep.pid.get_app_id(),
-                            rep.pid.get_partition_index(),
-                            request.node.to_string());
+                        LOG_INFO("gpid({}) on node({}) is of dropped table, but expire second is "
+                                 "not specified, do not delete it for safety reason",
+                                 rep.pid,
+                                 node);
                     } else if (has_seconds_expired(app->expire_second)) {
                         // can delete replica only when expire second is explicitely specified and
                         // expired.
                         if (level <= meta_function_level::fl_steady) {
-                            LOG_INFO("gpid(%d.%d) on node(%s) is of dropped and expired table, but "
-                                     "current function level is %s, do not delete it for safety "
+                            LOG_INFO("gpid({}) on node({}) is of dropped and expired table, but "
+                                     "current function level is {}, do not delete it for safety "
                                      "reason",
-                                     rep.pid.get_app_id(),
-                                     rep.pid.get_partition_index(),
-                                     request.node.to_string(),
+                                     rep.pid,
+                                     node,
                                      _meta_function_level_VALUES_TO_NAMES.find(level)->second);
                         } else {
                             response.gc_replicas.push_back(rep);
-                            LOG_WARNING(
-                                "notify node(%s) to gc replica(%d.%d) coz the app is dropped and "
-                                "expired",
-                                request.node.to_string(),
-                                rep.pid.get_app_id(),
-                                rep.pid.get_partition_index());
+                            LOG_WARNING("notify node({}) to gc replica({}) coz the app is "
+                                        "dropped and expired",
+                                        node,
+                                        rep.pid);
                         }
                     }
                 } else if (app->status == app_status::AS_AVAILABLE) {
-                    bool is_useful_replica =
-                        collect_replica({&_all_apps, &_nodes}, request.node, rep);
+                    bool is_useful_replica = collect_replica({&_all_apps, &_nodes}, node, rep);
                     if (!is_useful_replica) {
                         if (level <= meta_function_level::fl_steady) {
-                            LOG_INFO(
-                                "gpid(%d.%d) on node(%s) is useless, but current function level "
-                                "is %s, do not delete it for safety reason",
-                                rep.pid.get_app_id(),
-                                rep.pid.get_partition_index(),
-                                request.node.to_string(),
-                                _meta_function_level_VALUES_TO_NAMES.find(level)->second);
+                            LOG_INFO("gpid({}) on node({}) is useless, but current function "
+                                     "level is {}, do not delete it for safety reason",
+                                     rep.pid,
+                                     node,
+                                     _meta_function_level_VALUES_TO_NAMES.find(level)->second);
                         } else {
                             response.gc_replicas.push_back(rep);
-                            LOG_WARNING("notify node(%s) to gc replica(%d.%d) coz it is useless",
-                                        request.node.to_string(),
-                                        rep.pid.get_app_id(),
-                                        rep.pid.get_partition_index());
+                            LOG_WARNING("notify node({}) to gc replica({}) coz it is useless",
+                                        node,
+                                        rep.pid);
                         }
                     }
                 }
@@ -945,32 +984,31 @@ void server_state::on_config_sync(configuration_query_by_node_rpc rpc)
         response.err = ERR_BUSY;
         response.partitions.clear();
     }
-    LOG_INFO_F("send config sync response to {}, err({}), partitions_count({}), "
-               "gc_replicas_count({})",
-               request.node.to_string(),
-               response.err,
-               response.partitions.size(),
-               response.gc_replicas.size());
+    LOG_INFO("send config sync response to {}, err({}), partitions_count({}), "
+             "gc_replicas_count({})",
+             node,
+             response.err,
+             response.partitions.size(),
+             response.gc_replicas.size());
 }
 
 bool server_state::query_configuration_by_gpid(dsn::gpid id,
-                                               /*out*/ partition_configuration &config)
+                                               /*out*/ partition_configuration &pc)
 {
     zauto_read_lock l(_lock);
-    const partition_configuration *pc = get_config(_all_apps, id);
-    if (pc != nullptr) {
-        config = *pc;
+    const auto *ppc = get_config(_all_apps, id);
+    if (ppc != nullptr) {
+        pc = *ppc;
         return true;
     }
     return false;
 }
 
-void server_state::query_configuration_by_index(
-    const configuration_query_by_index_request &request,
-    /*out*/ configuration_query_by_index_response &response)
+void server_state::query_configuration_by_index(const query_cfg_request &request,
+                                                /*out*/ query_cfg_response &response)
 {
     zauto_read_lock l(_lock);
-    auto iter = _exist_apps.find(request.app_name.c_str());
+    auto iter = _exist_apps.find(request.app_name);
     if (iter == _exist_apps.end()) {
         response.err = ERR_OBJECT_NOT_FOUND;
         return;
@@ -978,9 +1016,9 @@ void server_state::query_configuration_by_index(
 
     std::shared_ptr<app_state> &app = iter->second;
     if (app->status != app_status::AS_AVAILABLE) {
-        LOG_ERROR("invalid status(%s) in exist app(%s), app_id(%d)",
+        LOG_ERROR("invalid status({}) in exist app({}), app_id({})",
                   enum_to_string(app->status),
-                  (app->app_name).c_str(),
+                  app->app_name,
                   app->app_id);
 
         switch (app->status) {
@@ -1003,11 +1041,13 @@ void server_state::query_configuration_by_index(
     response.is_stateful = app->is_stateful;
 
     for (const int32_t &index : request.partition_indices) {
-        if (index >= 0 && index < app->partitions.size())
-            response.partitions.push_back(app->partitions[index]);
+        if (index >= 0 && index < app->pcs.size()) {
+            response.partitions.push_back(app->pcs[index]);
+        }
     }
-    if (response.partitions.empty())
-        response.partitions = app->partitions;
+    if (response.partitions.empty()) {
+        response.partitions = app->pcs;
+    }
 }
 
 void server_state::init_app_partition_node(std::shared_ptr<app_state> &app,
@@ -1015,8 +1055,7 @@ void server_state::init_app_partition_node(std::shared_ptr<app_state> &app,
                                            task_ptr callback)
 {
     auto on_create_app_partition = [this, pidx, app, callback](error_code ec) mutable {
-        LOG_DEBUG(
-            "create partition node: gpid(%d.%d), result: %s", app->app_id, pidx, ec.to_string());
+        LOG_DEBUG("create partition node: gpid({}.{}), result: {}", app->app_id, pidx, ec);
         if (ERR_OK == ec || ERR_NODE_ALREADY_EXIST == ec) {
             {
                 zauto_write_lock l(_lock);
@@ -1027,7 +1066,7 @@ void server_state::init_app_partition_node(std::shared_ptr<app_state> &app,
             }
         } else if (ERR_TIMEOUT == ec) {
             LOG_WARNING(
-                "create partition node failed, gpid(%d.%d), retry later", app->app_id, pidx);
+                "create partition node failed, gpid({}.{}), retry later", app->app_id, pidx);
             // TODO: add parameter of the retry time interval in config file
             tasking::enqueue(
                 LPC_META_STATE_HIGH,
@@ -1045,8 +1084,7 @@ void server_state::init_app_partition_node(std::shared_ptr<app_state> &app,
     };
 
     std::string app_partition_path = get_partition_path(*app, pidx);
-    dsn::blob value =
-        dsn::json::json_forwarder<partition_configuration>::encode(app->partitions[pidx]);
+    dsn::blob value = dsn::json::json_forwarder<partition_configuration>::encode(app->pcs[pidx]);
     _meta_svc->get_remote_storage()->create_node(
         app_partition_path, LPC_META_STATE_HIGH, on_create_app_partition, value);
 }
@@ -1055,7 +1093,7 @@ void server_state::do_app_create(std::shared_ptr<app_state> &app)
 {
     auto on_create_app_root = [this, app](error_code ec) mutable {
         if (ERR_OK == ec || ERR_NODE_ALREADY_EXIST == ec) {
-            LOG_DEBUG("create app(%s) on storage service ok", app->get_logname());
+            LOG_DEBUG("create app({}) on storage service ok", app->get_logname());
             for (unsigned int i = 0; i != app->partition_count; ++i) {
                 init_app_partition_node(app, i, nullptr);
             }
@@ -1080,26 +1118,23 @@ void server_state::do_app_create(std::shared_ptr<app_state> &app)
 void server_state::create_app(dsn::message_ex *msg)
 {
     configuration_create_app_request request;
-    configuration_create_app_response response;
-    std::shared_ptr<app_state> app;
-    bool will_create_app = false;
     dsn::unmarshall(msg, request);
 
-    const auto &duplication_env_iterator =
-        request.options.envs.find(duplication_constants::kDuplicationEnvMasterClusterKey);
-    LOG_INFO_F(
-        "create app request, name({}), type({}), partition_count({}), replica_count({}), "
-        "duplication({})",
-        request.app_name,
-        request.options.app_type,
-        request.options.partition_count,
-        request.options.replica_count,
-        duplication_env_iterator == request.options.envs.end()
-            ? "false"
-            : fmt::format(
-                  "{}.{}",
-                  request.options.envs[duplication_constants::kDuplicationEnvMasterClusterKey],
-                  request.app_name));
+    const auto &master_cluster =
+        request.options.envs.find(duplication_constants::kEnvMasterClusterKey);
+    bool duplicating = master_cluster != request.options.envs.end();
+    LOG_INFO("create app request, name({}), type({}), partition_count({}), replica_count({}), "
+             "duplication({})",
+             request.app_name,
+             request.options.app_type,
+             request.options.partition_count,
+             request.options.replica_count,
+             duplicating
+                 ? fmt::format("master_cluster_name={}, master_app_name={}",
+                               master_cluster->second,
+                               gutil::FindWithDefault(request.options.envs,
+                                                      duplication_constants::kEnvMasterAppNameKey))
+                 : "false");
 
     auto option_match_check = [](const create_app_options &opt, const app_state &exist_app) {
         return opt.partition_count == exist_app.partition_count &&
@@ -1111,67 +1146,234 @@ void server_state::create_app(dsn::message_ex *msg)
     auto level = _meta_svc->get_function_level();
     if (level <= meta_function_level::fl_freezed) {
         LOG_ERROR("current meta function level is freezed, since there are too few alive nodes");
-        response.err = ERR_STATE_FREEZED;
-        will_create_app = false;
-    } else if (request.options.partition_count <= 0 ||
-               !validate_target_max_replica_count(request.options.replica_count)) {
-        response.err = ERR_INVALID_PARAMETERS;
-        will_create_app = false;
-    } else {
-        zauto_write_lock l(_lock);
-        app = get_app(request.app_name);
-        if (nullptr != app) {
-            switch (app->status) {
-            case app_status::AS_AVAILABLE:
-                if (!request.options.success_if_exist) {
-                    response.err = ERR_APP_EXIST;
-                } else if (!option_match_check(request.options, *app)) {
-                    response.err = ERR_INVALID_PARAMETERS;
-                } else {
-                    response.err = ERR_OK;
-                    response.appid = app->app_id;
+        FAIL_CREATE_APP_RESPONSE(msg, response, ERR_STATE_FREEZED);
+    }
+
+    if (request.options.partition_count <= 0) {
+        LOG_ERROR("partition_count({}) is invalid", request.options.partition_count);
+        FAIL_CREATE_APP_RESPONSE(msg, response, ERR_INVALID_PARAMETERS);
+    }
+
+    if (!validate_target_max_replica_count(request.options.replica_count)) {
+        FAIL_CREATE_APP_RESPONSE(msg, response, ERR_INVALID_PARAMETERS);
+    }
+
+    if (!_app_env_validator.validate_app_envs(request.options.envs)) {
+        FAIL_CREATE_APP_RESPONSE(msg, response, ERR_INVALID_PARAMETERS);
+    }
+
+    zauto_write_lock l(_lock);
+
+    auto app = get_app(request.app_name);
+    if (app) {
+        configuration_create_app_response response;
+
+        switch (app->status) {
+        case app_status::AS_AVAILABLE:
+            if (!request.options.success_if_exist) {
+                if (duplicating) {
+                    process_create_follower_app_status(msg, request, master_cluster->second, app);
+                    return;
                 }
-                break;
-            case app_status::AS_CREATING:
-            case app_status::AS_RECALLING:
-                response.err = ERR_BUSY_CREATING;
-                break;
-            case app_status::AS_DROPPING:
-                response.err = ERR_BUSY_DROPPING;
-                break;
-            default:
-                break;
+
+                response.err = ERR_APP_EXIST;
+            } else if (!option_match_check(request.options, *app)) {
+                response.err = ERR_INVALID_PARAMETERS;
+            } else {
+                response.err = ERR_OK;
+                response.appid = app->app_id;
             }
-        } else {
-            will_create_app = true;
-
-            app_info info;
-            info.app_id = next_app_id();
-            info.app_name = request.app_name;
-            info.app_type = request.options.app_type;
-            info.envs = std::move(request.options.envs);
-            info.is_stateful = request.options.is_stateful;
-            info.max_replica_count = request.options.replica_count;
-            info.partition_count = request.options.partition_count;
-            info.status = app_status::AS_CREATING;
-            info.create_second = dsn_now_ms() / 1000;
-            info.init_partition_count = request.options.partition_count;
-
-            app = app_state::create(info);
-            app->helpers->pending_response = msg;
-            app->helpers->partitions_in_progress.store(info.partition_count);
-
-            _all_apps.emplace(app->app_id, app);
-            _exist_apps.emplace(request.app_name, app);
+            break;
+        case app_status::AS_CREATING:
+        case app_status::AS_RECALLING:
+            response.err = ERR_BUSY_CREATING;
+            break;
+        case app_status::AS_DROPPING:
+            response.err = ERR_BUSY_DROPPING;
+            break;
+        default:
+            break;
         }
+
+        REPLY_TO_CLIENT_AND_RETURN(msg, response);
     }
 
-    if (will_create_app) {
-        do_app_create(app);
-    } else {
-        _meta_svc->reply_data(msg, response);
-        msg->release_ref();
+    app_info info;
+    info.app_id = next_app_id();
+    info.app_name = request.app_name;
+    info.app_type = request.options.app_type;
+    info.envs = std::move(request.options.envs);
+    info.is_stateful = request.options.is_stateful;
+    info.max_replica_count = request.options.replica_count;
+    info.partition_count = request.options.partition_count;
+    info.status = app_status::AS_CREATING;
+    info.create_second = static_cast<int64_t>(dsn_now_s());
+    info.init_partition_count = request.options.partition_count;
+
+    app = app_state::create(info);
+    app->helpers->pending_response = msg;
+    app->helpers->partitions_in_progress.store(info.partition_count);
+
+    _all_apps.emplace(app->app_id, app);
+    _exist_apps.emplace(request.app_name, app);
+    _table_metric_entities.create_entity(app->app_id, app->partition_count);
+
+    do_app_create(app);
+}
+
+// It is idempotent for the repeated requests.
+#define SUCC_IDEMPOTENT_CREATE_FOLLOWER_APP_STATUS()                                               \
+    LOG_INFO("repeated request that updates env {} of the follower app from {} to {}, "            \
+             "just ignore: app_name={}, app_id={}",                                                \
+             duplication_constants::kEnvFollowerAppStatusKey,                                      \
+             my_status->second,                                                                    \
+             req_status->second,                                                                   \
+             app->app_name,                                                                        \
+             app->app_id);                                                                         \
+    SUCC_CREATE_APP_RESPONSE(msg, response, app->app_id)
+
+// Failed due to invalid creating status.
+#define FAIL_UNDEFINED_CREATE_FOLLOWER_APP_STATUS(val, desc)                                       \
+    LOG_ERROR("undefined value({}) of env {} in the {}: app_name={}, app_id={}",                   \
+              val,                                                                                 \
+              duplication_constants::kEnvFollowerAppStatusKey,                                     \
+              desc,                                                                                \
+              app->app_name,                                                                       \
+              app->app_id);                                                                        \
+    FAIL_CREATE_APP_RESPONSE(msg, response, ERR_INVALID_PARAMETERS)
+
+void server_state::process_create_follower_app_status(
+    message_ex *msg,
+    const configuration_create_app_request &request,
+    const std::string &req_master_cluster,
+    std::shared_ptr<app_state> &app)
+{
+    const auto &my_master_cluster = app->envs.find(duplication_constants::kEnvMasterClusterKey);
+    if (my_master_cluster == app->envs.end() || my_master_cluster->second != req_master_cluster) {
+        // The source cluster is not matched.
+        LOG_ERROR("env {} are not matched between the request({}) and the follower "
+                  "app({}): app_name={}, app_id={}",
+                  duplication_constants::kEnvMasterClusterKey,
+                  req_master_cluster,
+                  my_master_cluster == app->envs.end() ? "<nil>" : my_master_cluster->second,
+                  app->app_name,
+                  app->app_id);
+        FAIL_CREATE_APP_RESPONSE(msg, response, ERR_APP_EXIST);
     }
+
+    const auto &req_status =
+        request.options.envs.find(duplication_constants::kEnvFollowerAppStatusKey);
+    if (req_status == request.options.envs.end()) {
+        // Still reply with ERR_APP_EXIST to the master cluster of old versions.
+        LOG_ERROR("no env {} in the request: app_name={}, app_id={}",
+                  duplication_constants::kEnvFollowerAppStatusKey,
+                  app->app_name,
+                  app->app_id);
+        FAIL_CREATE_APP_RESPONSE(msg, response, ERR_APP_EXIST);
+    }
+
+    const auto &my_status = app->envs.find(duplication_constants::kEnvFollowerAppStatusKey);
+    if (my_status == app->envs.end()) {
+        // Since currently this table have been AS_AVAILABLE, it should have the env of
+        // creating status.
+        LOG_ERROR("no env {} in the follower app: app_name={}, app_id={}",
+                  duplication_constants::kEnvFollowerAppStatusKey,
+                  app->app_name,
+                  app->app_id);
+        FAIL_CREATE_APP_RESPONSE(msg, response, ERR_INVALID_STATE);
+        return;
+    }
+
+    if (my_status->second == duplication_constants::kEnvFollowerAppStatusCreating) {
+        if (req_status->second == duplication_constants::kEnvFollowerAppStatusCreating) {
+            SUCC_IDEMPOTENT_CREATE_FOLLOWER_APP_STATUS();
+        }
+
+        if (req_status->second == duplication_constants::kEnvFollowerAppStatusCreated) {
+            // Mark the status as created both on the remote storage and local memory.
+            update_create_follower_app_status(msg,
+                                              duplication_constants::kEnvFollowerAppStatusCreating,
+                                              duplication_constants::kEnvFollowerAppStatusCreated,
+                                              app);
+            return;
+        }
+
+        FAIL_UNDEFINED_CREATE_FOLLOWER_APP_STATUS(req_status->second, "request");
+    }
+
+    if (my_status->second == duplication_constants::kEnvFollowerAppStatusCreated) {
+        if (req_status->second == duplication_constants::kEnvFollowerAppStatusCreating) {
+            // The status of the duplication should have been DS_APP since the follower app
+            // has been marked as created. Thus, the master cluster should never send the
+            // request with creating status again.
+            LOG_ERROR("the master cluster should never send the request with env {} valued {} "
+                      "again since it has been {} in the follower app: app_name={}, app_id={}",
+                      duplication_constants::kEnvFollowerAppStatusKey,
+                      req_status->second,
+                      my_status->second,
+                      app->app_name,
+                      app->app_id);
+            FAIL_CREATE_APP_RESPONSE(msg, response, ERR_APP_EXIST);
+        }
+
+        if (req_status->second == duplication_constants::kEnvFollowerAppStatusCreated) {
+            SUCC_IDEMPOTENT_CREATE_FOLLOWER_APP_STATUS();
+        }
+
+        FAIL_UNDEFINED_CREATE_FOLLOWER_APP_STATUS(req_status->second, "request");
+    }
+
+    // Some undefined creating status from the target table.
+    FAIL_UNDEFINED_CREATE_FOLLOWER_APP_STATUS(my_status->second, "follower app");
+}
+
+#undef FAIL_UNDEFINED_CREATE_FOLLOWER_APP_STATUS
+#undef SUCC_IDEMPOTENT_CREATE_FOLLOWER_APP_STATUS
+
+void server_state::update_create_follower_app_status(message_ex *msg,
+                                                     const std::string &old_status,
+                                                     const std::string &new_status,
+                                                     std::shared_ptr<app_state> &app)
+{
+    app_info ainfo = *app;
+    ainfo.envs[duplication_constants::kEnvFollowerAppStatusKey] = new_status;
+    auto app_path = get_app_path(*app);
+
+    LOG_INFO("ready to update env {} of follower app from {} to {}, app_name={}, app_id={}, ",
+             duplication_constants::kEnvFollowerAppStatusKey,
+             old_status,
+             new_status,
+             app->app_name,
+             app->app_id);
+
+    do_update_app_info(
+        app_path, ainfo, [this, msg, old_status, new_status, app](error_code ec) mutable {
+            {
+                zauto_write_lock l(_lock);
+
+                if (ec != ERR_OK) {
+                    LOG_ERROR("failed to update remote env of creating follower app status: "
+                              "error_code={}, app_name={}, app_id={}, {}={} => {}",
+                              ec,
+                              app->app_name,
+                              app->app_id,
+                              duplication_constants::kEnvFollowerAppStatusKey,
+                              old_status,
+                              new_status);
+                    FAIL_CREATE_APP_RESPONSE(msg, response, ec);
+                }
+
+                app->envs[duplication_constants::kEnvFollowerAppStatusKey] = new_status;
+                LOG_INFO("both remote and local env of creating follower app status have been "
+                         "updated successfully: app_name={}, app_id={}, {}={} => {}",
+                         app->app_name,
+                         app->app_id,
+                         duplication_constants::kEnvFollowerAppStatusKey,
+                         old_status,
+                         new_status);
+                SUCC_CREATE_APP_RESPONSE(msg, response, app->app_id);
+            }
+        });
 }
 
 void server_state::do_app_drop(std::shared_ptr<app_state> &app)
@@ -1180,11 +1382,12 @@ void server_state::do_app_drop(std::shared_ptr<app_state> &app)
         if (ERR_OK == ec) {
             zauto_write_lock l(_lock);
             _exist_apps.erase(app->app_name);
+            _table_metric_entities.remove_entity(app->app_id);
             for (int i = 0; i < app->partition_count; ++i) {
                 drop_partition(app, i);
             }
         } else if (ERR_TIMEOUT == ec) {
-            LOG_DEBUG("drop app(%s) prepare timeout, continue to drop later", app->get_logname());
+            LOG_DEBUG("drop app({}) prepare timeout, continue to drop later", app->get_logname());
             tasking::enqueue(LPC_META_STATE_HIGH,
                              tracker(),
                              std::bind(&server_state::do_app_drop, this, app),
@@ -1209,7 +1412,7 @@ void server_state::drop_app(dsn::message_ex *msg)
     bool do_dropping = false;
     std::shared_ptr<app_state> app;
     dsn::unmarshall(msg, request);
-    LOG_INFO("drop app request, name(%s)", request.app_name.c_str());
+    LOG_INFO("drop app request, name({})", request.app_name);
     {
         zauto_write_lock l(_lock);
         app = get_app(request.app_name);
@@ -1230,8 +1433,7 @@ void server_state::drop_app(dsn::message_ex *msg)
                     request.options.reserve_seconds > 0) {
                     app->expire_second = app->drop_second + request.options.reserve_seconds;
                 } else {
-                    app->expire_second = app->drop_second +
-                                         _meta_svc->get_meta_options().hold_seconds_for_dropped_app;
+                    app->expire_second = app->drop_second + FLAGS_hold_seconds_for_dropped_app;
                 }
                 app->helpers->pending_response = msg;
                 CHECK_EQ(app->helpers->partitions_in_progress.load(), 0);
@@ -1251,12 +1453,90 @@ void server_state::drop_app(dsn::message_ex *msg)
             }
         }
     }
-    if (do_dropping) {
-        do_app_drop(app);
-    } else {
-        _meta_svc->reply_data(msg, response);
-        msg->release_ref();
+
+    if (!do_dropping) {
+        REPLY_TO_CLIENT_AND_RETURN(msg, response);
     }
+
+    do_app_drop(app);
+}
+
+void server_state::rename_app(configuration_rename_app_rpc rpc)
+{
+    auto &response = rpc.response();
+    bool do_rename = false;
+
+    const auto &old_app_name = rpc.request().old_app_name;
+    const auto &new_app_name = rpc.request().new_app_name;
+    LOG_INFO("rename app request, old_app_name({}), new_app_name({})", old_app_name, new_app_name);
+
+    zauto_write_lock l(_lock);
+    auto target_app = get_app(old_app_name);
+
+    if (target_app == nullptr) {
+        response.err = ERR_APP_NOT_EXIST;
+        response.hint_message = fmt::format("ERROR: app({}) not exist!", old_app_name);
+        return;
+    }
+
+    switch (target_app->status) {
+    case app_status::AS_AVAILABLE: {
+        if (_exist_apps.find(new_app_name) != _exist_apps.end()) {
+            response.err = ERR_INVALID_PARAMETERS;
+            response.hint_message = fmt::format("ERROR: app({}) already exist!", new_app_name);
+            return;
+        }
+        do_rename = true;
+    } break;
+    case app_status::AS_CREATING:
+    case app_status::AS_RECALLING: {
+        response.err = ERR_BUSY_CREATING;
+    } break;
+    case app_status::AS_DROPPING: {
+        response.err = ERR_BUSY_DROPPING;
+    } break;
+    case app_status::AS_DROPPED: {
+        response.err = ERR_APP_DROPPED;
+    } break;
+    default: {
+        response.err = ERR_INVALID_STATE;
+    } break;
+    }
+
+    if (!do_rename) {
+        response.hint_message =
+            fmt::format("ERROR: app({}) status can't execute rename.", old_app_name);
+        return;
+    }
+
+    auto app_id = target_app->app_id;
+
+    auto ainfo = *(reinterpret_cast<app_info *>(target_app.get()));
+    ainfo.app_name = new_app_name;
+    auto app_path = get_app_path(*target_app);
+
+    target_app->app_name = new_app_name;
+    _exist_apps.emplace(new_app_name, target_app);
+
+    do_update_app_info(
+        app_path, ainfo, [this, app_id, new_app_name, old_app_name](error_code ec) mutable {
+            CHECK_EQ_MSG(
+                ec,
+                ERR_OK,
+                "update remote app info failed: app_id={}, old_app_name={}, new_app_name={}",
+                app_id,
+                old_app_name,
+                new_app_name);
+
+            zauto_write_lock l(_lock);
+            _exist_apps.erase(old_app_name);
+
+            LOG_INFO("both remote and local app info of app_name have been updated "
+                     "successfully: app_id={}, old_app_name={}, new_app_name={}",
+                     app_id,
+                     old_app_name,
+                     new_app_name);
+        });
 }
 
 void server_state::do_app_recall(std::shared_ptr<app_state> &app)
@@ -1281,7 +1561,7 @@ void server_state::recall_app(dsn::message_ex *msg)
     std::shared_ptr<app_state> target_app;
 
     dsn::unmarshall(msg, request);
-    LOG_INFO("recall app request, app_id(%d)", request.app_id);
+    LOG_INFO("recall app request, app_id({})", request.app_id);
 
     bool do_recalling = false;
     {
@@ -1301,8 +1581,8 @@ void server_state::recall_app(dsn::message_ex *msg)
             if (has_seconds_expired(target_app->expire_second)) {
                 response.err = ERR_APP_NOT_EXIST;
             } else {
-                std::string &new_app_name =
-                    (request.new_app_name == "") ? target_app->app_name : request.new_app_name;
+                std::string &new_app_name = (request.new_app_name == "") ? target_app->app_name
+                                                                         : request.new_app_name;
                 if (_exist_apps.find(new_app_name) != _exist_apps.end()) {
                     response.err = ERR_INVALID_PARAMETERS;
                 } else {
@@ -1314,45 +1594,49 @@ void server_state::recall_app(dsn::message_ex *msg)
                     target_app->helpers->pending_response = msg;
 
                     _exist_apps.emplace(target_app->app_name, target_app);
+                    _table_metric_entities.create_entity(target_app->app_id,
+                                                         target_app->partition_count);
                 }
             }
         }
     }
 
     if (!do_recalling) {
-        _meta_svc->reply_data(msg, response);
-        msg->release_ref();
-        return;
+        REPLY_TO_CLIENT_AND_RETURN(msg, response);
     }
+
     do_app_recall(target_app);
 }
 
 void server_state::list_apps(const configuration_list_apps_request &request,
-                             configuration_list_apps_response &response)
+                             configuration_list_apps_response &response,
+                             dsn::message_ex *msg) const
 {
-    LOG_DEBUG("list app request, status(%d)", request.status);
+    LOG_DEBUG("list app request, status({})", request.status);
     zauto_read_lock l(_lock);
-    for (auto &kv : _all_apps) {
+    for (const auto &kv : _all_apps) {
         app_state &app = *(kv.second);
         if (request.status == app_status::AS_INVALID || request.status == app.status) {
-            response.infos.push_back(app);
+            if (nullptr == msg || _meta_svc->get_access_controller()->allowed(msg, app.app_name)) {
+                response.infos.push_back(app);
+            }
         }
     }
     response.err = dsn::ERR_OK;
 }
 
-void server_state::send_proposal(rpc_address target, const configuration_update_request &proposal)
+void server_state::send_proposal(const host_port &target,
+                                 const configuration_update_request &proposal)
 {
-    LOG_INFO("send proposal %s for gpid(%d.%d), ballot = %" PRId64 ", target = %s, node = %s",
+    LOG_INFO("send proposal {} for gpid({}), ballot = {}, target = {}, node = {}",
              ::dsn::enum_to_string(proposal.type),
-             proposal.config.pid.get_app_id(),
-             proposal.config.pid.get_partition_index(),
+             proposal.config.pid,
              proposal.config.ballot,
-             target.to_string(),
-             proposal.node.to_string());
+             target,
+             FMT_HOST_PORT_AND_IP(proposal, node));
     dsn::message_ex *msg =
         dsn::message_ex::create_request(RPC_CONFIG_PROPOSAL, 0, proposal.config.pid.thread_hash());
-    ::marshall(msg, proposal);
+    dsn::marshall(msg, proposal);
     _meta_svc->send_message(target, msg);
 }
 
@@ -1363,52 +1647,76 @@ void server_state::send_proposal(const configuration_proposal_action &action,
     configuration_update_request request;
     request.info = app;
     request.type = action.type;
-    request.node = action.node;
+    SET_OBJ_IP_AND_HOST_PORT(request, node, action, node);
     request.config = pc;
-    send_proposal(action.target, request);
+    host_port target;
+    GET_HOST_PORT(action, target, target);
+    send_proposal(target, request);
 }
 
-void server_state::request_check(const partition_configuration &old,
+void server_state::request_check(const partition_configuration &old_pc,
                                  const configuration_update_request &request)
 {
-    const partition_configuration &new_config = request.config;
-
+    const auto &new_pc = request.config;
     switch (request.type) {
     case config_type::CT_ASSIGN_PRIMARY:
-        CHECK_NE(old.primary, request.node);
-        CHECK(std::find(old.secondaries.begin(), old.secondaries.end(), request.node) ==
-                  old.secondaries.end(),
-              "");
+        if (request.__isset.hp_node) {
+            CHECK_NE(old_pc.hp_primary, request.hp_node);
+            CHECK(!utils::contains(old_pc.hp_secondaries, request.hp_node), "");
+        } else {
+            CHECK_NE(old_pc.primary, request.node);
+            CHECK(!utils::contains(old_pc.secondaries, request.node), "");
+        }
         break;
     case config_type::CT_UPGRADE_TO_PRIMARY:
-        CHECK_NE(old.primary, request.node);
-        CHECK(std::find(old.secondaries.begin(), old.secondaries.end(), request.node) !=
-                  old.secondaries.end(),
-              "");
+        if (request.__isset.hp_node) {
+            CHECK_NE(old_pc.hp_primary, request.hp_node);
+            CHECK(utils::contains(old_pc.hp_secondaries, request.hp_node), "");
+        } else {
+            CHECK_NE(old_pc.primary, request.node);
+            CHECK(utils::contains(old_pc.secondaries, request.node), "");
+        }
         break;
     case config_type::CT_DOWNGRADE_TO_SECONDARY:
-        CHECK_EQ(old.primary, request.node);
-        CHECK(std::find(old.secondaries.begin(), old.secondaries.end(), request.node) ==
-                  old.secondaries.end(),
-              "");
+        if (request.__isset.hp_node) {
+            CHECK_EQ(old_pc.hp_primary, request.hp_node);
+            CHECK(!utils::contains(old_pc.hp_secondaries, request.hp_node), "");
+        } else {
+            CHECK_EQ(old_pc.primary, request.node);
+            CHECK(!utils::contains(old_pc.secondaries, request.node), "");
+        }
         break;
     case config_type::CT_DOWNGRADE_TO_INACTIVE:
     case config_type::CT_REMOVE:
-        CHECK(old.primary == request.node ||
-                  std::find(old.secondaries.begin(), old.secondaries.end(), request.node) !=
-                      old.secondaries.end(),
-              "");
+        if (request.__isset.hp_node) {
+            CHECK(old_pc.hp_primary == request.hp_node ||
+                      utils::contains(old_pc.hp_secondaries, request.hp_node),
+                  "");
+        } else {
+            CHECK(old_pc.primary == request.node ||
+                      utils::contains(old_pc.secondaries, request.node),
+                  "");
+        }
         break;
     case config_type::CT_UPGRADE_TO_SECONDARY:
-        CHECK_NE(old.primary, request.node);
-        CHECK(std::find(old.secondaries.begin(), old.secondaries.end(), request.node) ==
-                  old.secondaries.end(),
-              "");
+        if (request.__isset.hp_node) {
+            CHECK_NE(old_pc.hp_primary, request.hp_node);
+            CHECK(!utils::contains(old_pc.hp_secondaries, request.hp_node), "");
+        } else {
+            CHECK_NE(old_pc.primary, request.node);
+            CHECK(!utils::contains(old_pc.secondaries, request.node), "");
+        }
         break;
-    case config_type::CT_PRIMARY_FORCE_UPDATE_BALLOT:
-        CHECK_EQ(old.primary, new_config.primary);
-        CHECK(old.secondaries == new_config.secondaries, "");
+    case config_type::CT_PRIMARY_FORCE_UPDATE_BALLOT: {
+        if (request.__isset.hp_node) {
+            CHECK_EQ(old_pc.hp_primary, new_pc.hp_primary);
+            CHECK(old_pc.hp_secondaries == new_pc.hp_secondaries, "");
+        } else {
+            CHECK_EQ(old_pc.primary, new_pc.primary);
+            CHECK(old_pc.secondaries == new_pc.secondaries, "");
+        }
         break;
+    }
     default:
         break;
     }
@@ -1418,27 +1726,30 @@ void server_state::update_configuration_locally(
     app_state &app, std::shared_ptr<configuration_update_request> &config_request)
 {
     dsn::gpid &gpid = config_request->config.pid;
-    partition_configuration &old_cfg = app.partitions[gpid.get_partition_index()];
-    partition_configuration &new_cfg = config_request->config;
+    partition_configuration &old_pc = app.pcs[gpid.get_partition_index()];
+    partition_configuration &new_pc = config_request->config;
 
     int min_2pc_count =
         _meta_svc->get_options().app_mutation_2pc_min_replica_count(app.max_replica_count);
-    health_status old_health_status = partition_health_status(old_cfg, min_2pc_count);
-    health_status new_health_status = partition_health_status(new_cfg, min_2pc_count);
+    health_status old_health_status = partition_health_status(old_pc, min_2pc_count);
+    health_status new_health_status = partition_health_status(new_pc, min_2pc_count);
+
+    host_port node;
+    GET_HOST_PORT(*config_request, node, node);
 
     if (app.is_stateful) {
-        CHECK(old_cfg.ballot == invalid_ballot || old_cfg.ballot + 1 == new_cfg.ballot,
+        CHECK(old_pc.ballot == invalid_ballot || old_pc.ballot + 1 == new_pc.ballot,
               "invalid configuration update request, old ballot {}, new ballot {}",
-              old_cfg.ballot,
-              new_cfg.ballot);
+              old_pc.ballot,
+              new_pc.ballot);
 
         node_state *ns = nullptr;
         if (config_request->type != config_type::CT_DROP_PARTITION) {
-            ns = get_node_state(_nodes, config_request->node, false);
-            CHECK_NOTNULL(ns, "invalid node address, address = {}", config_request->node);
+            ns = get_node_state(_nodes, node, false);
+            CHECK_NOTNULL(ns, "invalid node: {}", node);
         }
 #ifndef NDEBUG
-        request_check(old_cfg, *config_request);
+        request_check(old_pc, *config_request);
 #endif
         switch (config_request->type) {
         case config_type::CT_ASSIGN_PRIMARY:
@@ -1462,23 +1773,41 @@ void server_state::update_configuration_locally(
         case config_type::CT_PRIMARY_FORCE_UPDATE_BALLOT:
             break;
 
-        case config_type::CT_DROP_PARTITION:
-            for (const rpc_address &node : new_cfg.last_drops) {
-                ns = get_node_state(_nodes, node, false);
-                if (ns != nullptr)
+        case config_type::CT_DROP_PARTITION: {
+            for (const auto &last_drop : new_pc.hp_last_drops) {
+                ns = get_node_state(_nodes, last_drop, false);
+                if (ns != nullptr) {
                     ns->remove_partition(gpid, false);
+                }
             }
             break;
-
+        }
         case config_type::CT_ADD_SECONDARY:
         case config_type::CT_ADD_SECONDARY_FOR_LB:
             CHECK(false, "invalid execution work flow");
             break;
         case config_type::CT_REGISTER_CHILD: {
             ns->put_partition(gpid, true);
-            for (auto &secondary : config_request->config.secondaries) {
-                auto secondary_node = get_node_state(_nodes, secondary, false);
-                secondary_node->put_partition(gpid, false);
+            // TODO(yingchun): optimize the duplicate loops.
+            if (config_request->config.__isset.hp_secondaries) {
+                for (const auto &secondary : config_request->config.hp_secondaries) {
+                    auto *secondary_node = get_node_state(_nodes, secondary, false);
+                    secondary_node->put_partition(gpid, false);
+                }
+            } else {
+                for (const auto &secondary : config_request->config.secondaries) {
+                    const auto hp = host_port::from_address(secondary);
+                    if (!hp) {
+                        LOG_ERROR("The registering secondary {} for pid {} can no be reverse "
+                                  "resolved, skip registering it, please check the network "
+                                  "configuration",
+                                  secondary,
+                                  config_request->config.pid);
+                        continue;
+                    }
+                    auto secondary_node = get_node_state(_nodes, hp, false);
+                    secondary_node->put_partition(gpid, false);
+                }
             }
             break;
         }
@@ -1487,24 +1816,25 @@ void server_state::update_configuration_locally(
             break;
         }
     } else {
-        CHECK_EQ(old_cfg.ballot, new_cfg.ballot);
-
-        new_cfg = old_cfg;
-        partition_configuration_stateless pcs(new_cfg);
+        CHECK_EQ(old_pc.ballot, new_pc.ballot);
+        const auto host_node = host_port::from_address(config_request->host_node);
+        // The non-stateful app is just for testing, so just check the host_node is resolvable.
+        CHECK(host_node, "'{}' can not be reverse resolved", config_request->host_node);
+        new_pc = old_pc;
+        partition_configuration_stateless pcs(new_pc);
         if (config_request->type == config_type::type::CT_ADD_SECONDARY) {
-            pcs.hosts().emplace_back(config_request->host_node);
-            pcs.workers().emplace_back(config_request->node);
+            pcs.hosts().emplace_back(host_node);
+            pcs.workers().emplace_back(node);
         } else {
-            auto it =
-                std::remove(pcs.hosts().begin(), pcs.hosts().end(), config_request->host_node);
+            auto it = std::remove(pcs.hosts().begin(), pcs.hosts().end(), host_node);
             pcs.hosts().erase(it);
 
-            it = std::remove(pcs.workers().begin(), pcs.workers().end(), config_request->node);
+            it = std::remove(pcs.workers().begin(), pcs.workers().end(), node);
             pcs.workers().erase(it);
         }
 
-        auto it = _nodes.find(config_request->host_node);
-        CHECK(it != _nodes.end(), "invalid node address, address = {}", config_request->host_node);
+        auto it = _nodes.find(host_node);
+        CHECK(it != _nodes.end(), "invalid node: {}", host_node);
         if (config_type::CT_REMOVE == config_request->type) {
             it->second.remove_partition(gpid, false);
         } else {
@@ -1514,19 +1844,19 @@ void server_state::update_configuration_locally(
 
     // we assume config in config_request stores the proper new config
     // as we sync to remote storage according to it
-    std::string old_config_str = boost::lexical_cast<std::string>(old_cfg);
-    old_cfg = config_request->config;
+    std::string old_config_str = boost::lexical_cast<std::string>(old_pc);
+    old_pc = config_request->config;
     auto find_name = _config_type_VALUES_TO_NAMES.find(config_request->type);
     if (find_name != _config_type_VALUES_TO_NAMES.end()) {
-        LOG_INFO("meta update config ok: type(%s), old_config=%s, %s",
+        LOG_INFO("meta update config ok: type({}), old_config={}, {}",
                  find_name->second,
-                 old_config_str.c_str(),
-                 boost::lexical_cast<std::string>(*config_request).c_str());
+                 old_config_str,
+                 boost::lexical_cast<std::string>(*config_request));
     } else {
-        LOG_INFO("meta update config ok: type(%d), old_config=%s, %s",
+        LOG_INFO("meta update config ok: type({}), old_config={}, {}",
                  config_request->type,
-                 old_config_str.c_str(),
-                 boost::lexical_cast<std::string>(*config_request).c_str());
+                 old_config_str,
+                 boost::lexical_cast<std::string>(*config_request));
     }
 
 #ifndef NDEBUG
@@ -1536,12 +1866,12 @@ void server_state::update_configuration_locally(
         _config_change_subscriber(_all_apps);
     }
 
-    _recent_update_config_count->increment();
+    METRIC_INCREMENT(_table_metric_entities, partition_configuration_changes, gpid);
     if (old_health_status >= HS_WRITABLE_ILL && new_health_status < HS_WRITABLE_ILL) {
-        _recent_partition_change_unwritable_count->increment();
+        METRIC_INCREMENT(_table_metric_entities, unwritable_partition_changes, gpid);
     }
     if (old_health_status < HS_WRITABLE_ILL && new_health_status >= HS_WRITABLE_ILL) {
-        _recent_partition_change_writable_count->increment();
+        METRIC_INCREMENT(_table_metric_entities, writable_partition_changes, gpid);
     }
 }
 
@@ -1550,7 +1880,7 @@ task_ptr server_state::update_configuration_on_remote(
 {
     meta_function_level::type l = _meta_svc->get_function_level();
     if (l <= meta_function_level::fl_blind) {
-        LOG_INFO("ignore update configuration on remote due to level is %s",
+        LOG_INFO("ignore update configuration on remote due to level is {}",
                  _meta_function_level_VALUES_TO_NAMES.find(l)->second);
         // NOTICE: pending_sync_task need to be reassigned
         return tasking::enqueue(
@@ -1593,15 +1923,14 @@ void server_state::on_update_configuration_on_remote_reply(
     CHECK(app->status == app_status::AS_AVAILABLE || app->status == app_status::AS_DROPPING,
           "if app removed, this task should be cancelled");
     if (ec == ERR_TIMEOUT) {
-        cc.pending_sync_task =
-            tasking::enqueue(LPC_META_STATE_HIGH,
-                             tracker(),
-                             [this, config_request, &cc]() mutable {
-                                 cc.pending_sync_task =
-                                     update_configuration_on_remote(config_request);
-                             },
-                             0,
-                             std::chrono::seconds(1));
+        cc.pending_sync_task = tasking::enqueue(
+            LPC_META_STATE_HIGH,
+            tracker(),
+            [this, config_request, &cc]() mutable {
+                cc.pending_sync_task = update_configuration_on_remote(config_request);
+            },
+            0,
+            std::chrono::seconds(1));
     } else if (ec == ERR_OK) {
         update_configuration_locally(*app, config_request);
         cc.pending_sync_task = nullptr;
@@ -1611,8 +1940,7 @@ void server_state::on_update_configuration_on_remote_reply(
             configuration_update_response resp;
             resp.err = ERR_OK;
             resp.config = config_request->config;
-            _meta_svc->reply_data(cc.msg, resp);
-            cc.msg->release_ref();
+            REPLY_TO_CLIENT(cc.msg, resp);
             cc.msg = nullptr;
         }
 
@@ -1629,9 +1957,11 @@ void server_state::on_update_configuration_on_remote_reply(
                     // ignore adding secondary if add_secondary_enable_flow_control = true
                 } else {
                     config_request->type = action.type;
-                    config_request->node = action.node;
+                    SET_OBJ_IP_AND_HOST_PORT(*config_request, node, action, node);
                     config_request->info = *app;
-                    send_proposal(action.target, *config_request);
+                    host_port target;
+                    GET_HOST_PORT(action, target, target);
+                    send_proposal(target, *config_request);
                 }
             }
         }
@@ -1645,7 +1975,7 @@ void server_state::recall_partition(std::shared_ptr<app_state> &app, int pidx)
     auto on_recall_partition = [this, app, pidx](dsn::error_code error) mutable {
         if (error == dsn::ERR_OK) {
             zauto_write_lock l(_lock);
-            app->partitions[pidx].partition_flags &= (~pc_flags::dropped);
+            app->pcs[pidx].partition_flags &= (~pc_flags::dropped);
             process_one_partition(app);
         } else if (error == dsn::ERR_TIMEOUT) {
             tasking::enqueue(LPC_META_STATE_HIGH,
@@ -1658,7 +1988,7 @@ void server_state::recall_partition(std::shared_ptr<app_state> &app, int pidx)
         }
     };
 
-    partition_configuration &pc = app->partitions[pidx];
+    partition_configuration &pc = app->pcs[pidx];
     CHECK((pc.partition_flags & pc_flags::dropped), "");
 
     pc.partition_flags = 0;
@@ -1670,7 +2000,7 @@ void server_state::recall_partition(std::shared_ptr<app_state> &app, int pidx)
 
 void server_state::drop_partition(std::shared_ptr<app_state> &app, int pidx)
 {
-    partition_configuration &pc = app->partitions[pidx];
+    partition_configuration &pc = app->pcs[pidx];
     config_context &cc = app->helpers->contexts[pidx];
 
     std::shared_ptr<configuration_update_request> req =
@@ -1679,17 +2009,23 @@ void server_state::drop_partition(std::shared_ptr<app_state> &app, int pidx)
 
     request.info = *app;
     request.type = config_type::CT_DROP_PARTITION;
-    request.node = pc.primary;
+    SET_OBJ_IP_AND_HOST_PORT(request, node, pc, primary);
 
     request.config = pc;
-    for (auto &node : pc.secondaries) {
-        maintain_drops(request.config.last_drops, node, request.type);
+    for (const auto &secondary : pc.hp_secondaries) {
+        maintain_drops(request.config.hp_last_drops, secondary, request.type);
     }
-    if (!pc.primary.is_invalid()) {
+    for (const auto &secondary : pc.secondaries) {
+        maintain_drops(request.config.last_drops, secondary, request.type);
+    }
+    if (pc.hp_primary) {
+        maintain_drops(request.config.hp_last_drops, pc.hp_primary, request.type);
+    }
+    if (pc.primary) {
         maintain_drops(request.config.last_drops, pc.primary, request.type);
     }
-    request.config.primary.set_invalid();
-    request.config.secondaries.clear();
+    RESET_IP_AND_HOST_PORT(request.config, primary);
+    CLEAR_IP_AND_HOST_PORT(request.config, secondaries);
 
     CHECK_EQ((pc.partition_flags & pc_flags::dropped), 0);
     request.config.partition_flags |= pc_flags::dropped;
@@ -1702,11 +2038,10 @@ void server_state::drop_partition(std::shared_ptr<app_state> &app, int pidx)
     request.config.ballot++;
 
     if (config_status::pending_remote_sync == cc.stage) {
-        LOG_WARNING(
-            "gpid(%d.%d) is syncing another request with remote, cancel it due to partition is "
-            "dropped",
-            app->app_id,
-            pidx);
+        LOG_WARNING("gpid({}.{}) is syncing another request with remote, cancel it due to "
+                    "partition is dropped",
+                    app->app_id,
+                    pidx);
         cc.cancel_sync();
     }
     cc.stage = config_status::pending_remote_sync;
@@ -1718,7 +2053,7 @@ void server_state::drop_partition(std::shared_ptr<app_state> &app, int pidx)
 
 void server_state::downgrade_primary_to_inactive(std::shared_ptr<app_state> &app, int pidx)
 {
-    partition_configuration &pc = app->partitions[pidx];
+    partition_configuration &pc = app->pcs[pidx];
     config_context &cc = app->helpers->contexts[pidx];
 
     if (config_status::pending_remote_sync == cc.stage) {
@@ -1729,14 +2064,13 @@ void server_state::downgrade_primary_to_inactive(std::shared_ptr<app_state> &app
                          app->get_logname(),
                          enum_to_string(app->status));
             LOG_WARNING(
-                "stop downgrade primary as the partitions(%d.%d) is dropping", app->app_id, pidx);
+                "stop downgrade primary as the partitions({}.{}) is dropping", app->app_id, pidx);
             return;
         } else {
-            LOG_WARNING("gpid(%d.%d) is syncing another request with remote, cancel it due to the "
-                        "primary(%s) is down",
-                        pc.pid.get_app_id(),
-                        pc.pid.get_partition_index(),
-                        pc.primary.to_string());
+            LOG_WARNING("gpid({}) is syncing another request with remote, cancel it due to the "
+                        "primary({}) is down",
+                        pc.pid,
+                        FMT_HOST_PORT_AND_IP(pc, primary));
             cc.cancel_sync();
         }
     }
@@ -1747,9 +2081,10 @@ void server_state::downgrade_primary_to_inactive(std::shared_ptr<app_state> &app
     request.info = *app;
     request.config = pc;
     request.type = config_type::CT_DOWNGRADE_TO_INACTIVE;
-    request.node = pc.primary;
+    SET_OBJ_IP_AND_HOST_PORT(request, node, pc, primary);
     request.config.ballot++;
-    request.config.primary.set_invalid();
+    RESET_IP_AND_HOST_PORT(request.config, primary);
+    maintain_drops(request.config.hp_last_drops, pc.hp_primary, request.type);
     maintain_drops(request.config.last_drops, pc.primary, request.type);
 
     cc.stage = config_status::pending_remote_sync;
@@ -1761,65 +2096,73 @@ void server_state::downgrade_primary_to_inactive(std::shared_ptr<app_state> &app
 
 void server_state::downgrade_secondary_to_inactive(std::shared_ptr<app_state> &app,
                                                    int pidx,
-                                                   const rpc_address &node)
+                                                   const host_port &node)
 {
-    partition_configuration &pc = app->partitions[pidx];
+    partition_configuration &pc = app->pcs[pidx];
     config_context &cc = app->helpers->contexts[pidx];
 
-    CHECK(!pc.primary.is_invalid(), "this shouldn't be called if the primary is invalid");
+    CHECK(pc.hp_primary, "this shouldn't be called if the primary is invalid");
     if (config_status::pending_remote_sync != cc.stage) {
         configuration_update_request request;
         request.info = *app;
         request.config = pc;
         request.type = config_type::CT_DOWNGRADE_TO_INACTIVE;
-        request.node = node;
-        send_proposal(pc.primary, request);
+        SET_IP_AND_HOST_PORT_BY_DNS(request, node, node);
+        host_port primary;
+        GET_HOST_PORT(pc, primary, primary);
+        send_proposal(primary, request);
     } else {
-        LOG_INFO("gpid(%d.%d) is syncing with remote storage, ignore the remove seconary(%s)",
+        LOG_INFO("gpid({}.{}) is syncing with remote storage, ignore the remove seconary({})",
                  app->app_id,
                  pidx,
-                 node.to_string());
+                 node);
     }
 }
 
 void server_state::downgrade_stateless_nodes(std::shared_ptr<app_state> &app,
                                              int pidx,
-                                             const rpc_address &address)
+                                             const host_port &node)
 {
-    std::shared_ptr<configuration_update_request> req =
-        std::make_shared<configuration_update_request>();
+    auto req = std::make_shared<configuration_update_request>();
     req->info = *app;
     req->type = config_type::CT_REMOVE;
-    req->host_node = address;
-    req->node.set_invalid();
-    req->config = app->partitions[pidx];
+    req->host_node = dsn::dns_resolver::instance().resolve_address(node);
+    RESET_IP_AND_HOST_PORT(*req, node);
+    req->config = app->pcs[pidx];
 
     config_context &cc = app->helpers->contexts[pidx];
     partition_configuration &pc = req->config;
 
     unsigned i = 0;
-    for (; i < pc.secondaries.size(); ++i) {
-        if (pc.secondaries[i] == address) {
-            req->node = pc.last_drops[i];
+    for (; i < pc.hp_secondaries.size(); ++i) {
+        if (pc.hp_secondaries[i] == node) {
+            SET_OBJ_IP_AND_HOST_PORT(*req, node, pc, last_drops[i]);
             break;
         }
     }
-    CHECK(!req->node.is_invalid(), "invalid node address, address = {}", req->node);
-    // remove host_node & node from secondaries/last_drops, as it will be sync to remote storage
-    for (++i; i < pc.secondaries.size(); ++i) {
+    host_port req_node;
+    GET_HOST_PORT(*req, node, req_node);
+    CHECK(req_node, "invalid node: {}", req_node);
+    // remove host_node & node from secondaries/last_drops, as it will be sync to remote
+    // storage
+    CHECK(pc.__isset.hp_secondaries, "hp_secondaries not set");
+    for (++i; i < pc.hp_secondaries.size(); ++i) {
         pc.secondaries[i - 1] = pc.secondaries[i];
         pc.last_drops[i - 1] = pc.last_drops[i];
+        pc.hp_secondaries[i - 1] = pc.hp_secondaries[i];
+        pc.hp_last_drops[i - 1] = pc.hp_last_drops[i];
     }
     pc.secondaries.pop_back();
     pc.last_drops.pop_back();
+    pc.hp_secondaries.pop_back();
+    pc.hp_last_drops.pop_back();
 
     if (config_status::pending_remote_sync == cc.stage) {
-        LOG_WARNING("gpid(%d.%d) is syncing another request with remote, cancel it due to meta is "
-                    "removing host(%s) worker(%s)",
-                    pc.pid.get_app_id(),
-                    pc.pid.get_partition_index(),
-                    req->host_node.to_string(),
-                    req->node.to_string());
+        LOG_WARNING("gpid({}) is syncing another request with remote, cancel it due to meta is "
+                    "removing host({}) worker({})",
+                    pc.pid,
+                    req->host_node,
+                    req_node);
         cc.cancel_sync();
     }
     cc.stage = config_status::pending_remote_sync;
@@ -1835,7 +2178,7 @@ void server_state::on_update_configuration(
     zauto_write_lock l(_lock);
     dsn::gpid &gpid = cfg_request->config.pid;
     std::shared_ptr<app_state> app = get_app(gpid.get_app_id());
-    partition_configuration &pc = app->partitions[gpid.get_partition_index()];
+    partition_configuration &pc = app->pcs[gpid.get_partition_index()];
     config_context &cc = app->helpers->contexts[gpid.get_partition_index()];
     configuration_update_response response;
     response.err = ERR_IO_PENDING;
@@ -1844,20 +2187,17 @@ void server_state::on_update_configuration(
     CHECK(app->is_stateful, "don't support stateless apps currently, id({})", gpid.get_app_id());
     auto find_name = _config_type_VALUES_TO_NAMES.find(cfg_request->type);
     if (find_name != _config_type_VALUES_TO_NAMES.end()) {
-        LOG_INFO("recv update config request: type(%s), %s",
+        LOG_INFO("recv update config request: type({}), {}",
                  find_name->second,
-                 boost::lexical_cast<std::string>(*cfg_request).c_str());
+                 boost::lexical_cast<std::string>(*cfg_request));
     } else {
-        LOG_INFO("recv update config request: type(%d), %s",
+        LOG_INFO("recv update config request: type({}), {}",
                  cfg_request->type,
-                 boost::lexical_cast<std::string>(*cfg_request).c_str());
+                 boost::lexical_cast<std::string>(*cfg_request));
     }
 
     if (is_partition_config_equal(pc, cfg_request->config)) {
-        LOG_INFO("duplicated update request for gpid(%d.%d), ballot: %" PRId64 "",
-                 gpid.get_app_id(),
-                 gpid.get_partition_index(),
-                 pc.ballot);
+        LOG_INFO("duplicated update request for gpid({}), ballot: {}", gpid, pc.ballot);
         response.err = ERR_OK;
         //
         // NOTICE:
@@ -1866,93 +2206,96 @@ void server_state::on_update_configuration(
         //
         response.config = pc;
     } else if (pc.ballot + 1 != cfg_request->config.ballot) {
-        LOG_INFO(
-            "update configuration for gpid(%d.%d) reject coz ballot not match, request ballot: "
-            "%" PRId64 ", meta ballot: %" PRId64 "",
-            gpid.get_app_id(),
-            gpid.get_partition_index(),
-            cfg_request->config.ballot,
-            pc.ballot);
+        LOG_INFO("update configuration for gpid({}) reject coz ballot not match, request ballot: "
+                 "{}, meta ballot: {}",
+                 gpid,
+                 cfg_request->config.ballot,
+                 pc.ballot);
         response.err = ERR_INVALID_VERSION;
         response.config = pc;
     } else if (config_status::pending_remote_sync == cc.stage) {
         LOG_INFO("another request is syncing with remote storage, ignore current request, "
-                 "gpid(%d.%d), request ballot(%" PRId64 ")",
-                 gpid.get_app_id(),
-                 gpid.get_partition_index(),
+                 "gpid({}), request ballot({})",
+                 gpid,
                  cfg_request->config.ballot);
         // we don't reply the replica server, expect it to retry
         msg->release_ref();
         return;
     } else {
+        maintain_drops(cfg_request->config.hp_last_drops, cfg_request->hp_node, cfg_request->type);
         maintain_drops(cfg_request->config.last_drops, cfg_request->node, cfg_request->type);
     }
 
     if (response.err != ERR_IO_PENDING) {
-        _meta_svc->reply_data(msg, response);
-        msg->release_ref();
-    } else {
-        CHECK(config_status::not_pending == cc.stage,
-              "invalid config status, cc.stage = {}",
-              enum_to_string(cc.stage));
-        cc.stage = config_status::pending_remote_sync;
-        cc.pending_sync_request = cfg_request;
-        cc.msg = msg;
-        cc.pending_sync_task = update_configuration_on_remote(cfg_request);
+        REPLY_TO_CLIENT_AND_RETURN(msg, response);
     }
+
+    CHECK(config_status::not_pending == cc.stage,
+          "invalid config status, cc.stage = {}",
+          enum_to_string(cc.stage));
+    cc.stage = config_status::pending_remote_sync;
+    cc.pending_sync_request = cfg_request;
+    cc.msg = msg;
+    cc.pending_sync_task = update_configuration_on_remote(cfg_request);
 }
 
 void server_state::on_partition_node_dead(std::shared_ptr<app_state> &app,
                                           int pidx,
-                                          const dsn::rpc_address &address)
+                                          const dsn::host_port &node)
 {
-    partition_configuration &pc = app->partitions[pidx];
-    if (app->is_stateful) {
-        if (is_primary(pc, address))
-            downgrade_primary_to_inactive(app, pidx);
-        else if (is_secondary(pc, address)) {
-            if (!pc.primary.is_invalid())
-                downgrade_secondary_to_inactive(app, pidx, address);
-            else if (is_secondary(pc, address)) {
-                LOG_INFO(
-                    "gpid(%d.%d): secondary(%s) is down, ignored it due to no primary for this "
-                    "partition available",
-                    pc.pid.get_app_id(),
-                    pc.pid.get_partition_index(),
-                    address.to_string());
-            } else {
-                CHECK(false, "no primary/secondary on this node, node address = {}", address);
-            }
-        }
-    } else {
-        downgrade_stateless_nodes(app, pidx, address);
+    const auto &pc = app->pcs[pidx];
+    if (!app->is_stateful) {
+        downgrade_stateless_nodes(app, pidx, node);
+        return;
     }
+
+    if (is_primary(pc, node)) {
+        downgrade_primary_to_inactive(app, pidx);
+        return;
+    }
+
+    if (!is_secondary(pc, node)) {
+        return;
+    }
+
+    if (pc.hp_primary) {
+        downgrade_secondary_to_inactive(app, pidx, node);
+        return;
+    }
+
+    CHECK(is_secondary(pc, node), "");
+    LOG_INFO("gpid({}): secondary({}) is down, ignored it due to no primary for this partition "
+             "available",
+             pc.pid,
+             node);
 }
 
-void server_state::on_change_node_state(rpc_address node, bool is_alive)
+void server_state::on_change_node_state(const host_port &node, bool is_alive)
 {
-    LOG_DEBUG("change node(%s) state to %s", node.to_string(), is_alive ? "alive" : "dead");
+    LOG_DEBUG("change node({}) state to {}", node, is_alive ? "alive" : "dead");
     zauto_write_lock l(_lock);
-    if (!is_alive) {
-        auto iter = _nodes.find(node);
-        if (iter == _nodes.end()) {
-            LOG_INFO("node(%s) doesn't exist in the node state, just ignore", node.to_string());
-        } else {
-            node_state &ns = iter->second;
-            ns.set_alive(false);
-            ns.set_replicas_collect_flag(false);
-            ns.for_each_partition([&, this](const dsn::gpid &pid) {
-                std::shared_ptr<app_state> app = get_app(pid.get_app_id());
-                CHECK(app != nullptr && app->status != app_status::AS_DROPPED,
-                      "invalid app, app_id = {}",
-                      pid.get_app_id());
-                on_partition_node_dead(app, pid.get_partition_index(), node);
-                return true;
-            });
-        }
-    } else {
+    if (is_alive) {
         get_node_state(_nodes, node, true)->set_alive(true);
+        return;
     }
+
+    auto iter = _nodes.find(node);
+    if (iter == _nodes.end()) {
+        LOG_INFO("node({}) doesn't exist in the node state, just ignore", node);
+        return;
+    }
+
+    node_state &ns = iter->second;
+    ns.set_alive(false);
+    ns.set_replicas_collect_flag(false);
+    ns.for_each_partition([&, this](const dsn::gpid &pid) {
+        std::shared_ptr<app_state> app = get_app(pid.get_app_id());
+        CHECK(app != nullptr && app->status != app_status::AS_DROPPED,
+              "invalid app, app_id = {}",
+              pid.get_app_id());
+        on_partition_node_dead(app, pid.get_partition_index(), node);
+        return true;
+    });
 }
 
 void server_state::on_propose_balancer(const configuration_balancer_request &request,
@@ -1962,24 +2305,26 @@ void server_state::on_propose_balancer(const configuration_balancer_request &req
     std::shared_ptr<app_state> app = get_app(request.gpid.get_app_id());
     if (app == nullptr || app->status != app_status::AS_AVAILABLE ||
         request.gpid.get_partition_index() < 0 ||
-        request.gpid.get_partition_index() >= app->partition_count)
+        request.gpid.get_partition_index() >= app->partition_count) {
         response.err = ERR_INVALID_PARAMETERS;
-    else {
-        if (request.force) {
-            partition_configuration &pc = *get_config(_all_apps, request.gpid);
-            for (const configuration_proposal_action &act : request.action_list) {
-                send_proposal(act, pc, *app);
-            }
-            response.err = ERR_OK;
-        } else {
-            _meta_svc->get_balancer()->register_proposals({&_all_apps, &_nodes}, request, response);
-        }
+        return;
     }
+
+    if (request.force) {
+        const auto &pc = *get_config(_all_apps, request.gpid);
+        for (const auto &act : request.action_list) {
+            send_proposal(act, pc, *app);
+        }
+        response.err = ERR_OK;
+        return;
+    }
+
+    _meta_svc->get_balancer()->register_proposals({&_all_apps, &_nodes}, request, response);
 }
 
 error_code
 server_state::construct_apps(const std::vector<query_app_info_response> &query_app_responses,
-                             const std::vector<dsn::rpc_address> &replica_nodes,
+                             const std::vector<dsn::host_port> &replica_nodes,
                              std::string &hint_message)
 {
     int max_app_id = 0;
@@ -1993,10 +2338,10 @@ server_state::construct_apps(const std::vector<query_app_info_response> &query_a
             auto iter = _all_apps.find(info.app_id);
             if (iter == _all_apps.end()) {
                 std::shared_ptr<app_state> app = app_state::create(info);
-                LOG_INFO("create app info from (%s) for id(%d): %s",
-                         replica_nodes[i].to_string(),
+                LOG_INFO("create app info from ({}) for id({}): {}",
+                         replica_nodes[i],
                          info.app_id,
-                         boost::lexical_cast<std::string>(info).c_str());
+                         boost::lexical_cast<std::string>(info));
                 _all_apps.emplace(app->app_id, app);
                 max_app_id = std::max(app->app_id, max_app_id);
             } else {
@@ -2054,10 +2399,10 @@ server_state::construct_apps(const std::vector<query_app_info_response> &query_a
             app->app_name = app->app_name + "__" + boost::lexical_cast<std::string>(app_id);
         }
         if (app->app_name != old_name) {
-            LOG_WARNING("app(%d)'s old name(%s) is conflict with others, rename it to (%s)",
+            LOG_WARNING("app({})'s old name({}) is conflict with others, rename it to ({})",
                         app_id,
-                        old_name.c_str(),
-                        app->app_name.c_str());
+                        old_name,
+                        app->app_name);
             std::ostringstream oss;
             oss << "WARNING: app(" << app_id << ")'s old name(" << old_name
                 << ") is conflict with others, rename it to (" << app->app_name << ")" << std::endl;
@@ -2066,14 +2411,14 @@ server_state::construct_apps(const std::vector<query_app_info_response> &query_a
         checked_names.emplace(app->app_name, app_id);
     }
 
-    LOG_INFO("construct apps done, max_app_id = %d", max_app_id);
+    LOG_INFO("construct apps done, max_app_id = {}", max_app_id);
 
     return dsn::ERR_OK;
 }
 
 error_code server_state::construct_partitions(
     const std::vector<query_replica_info_response> &query_replica_responses,
-    const std::vector<dsn::rpc_address> &replica_nodes,
+    const std::vector<dsn::host_port> &replica_nodes,
     bool skip_lost_partitions,
     std::string &hint_message)
 {
@@ -2086,13 +2431,13 @@ error_code server_state::construct_partitions(
             CHECK(_all_apps.find(r.pid.get_app_id()) != _all_apps.end(), "");
             bool is_accepted = collect_replica({&_all_apps, &_nodes}, replica_nodes[i], r);
             if (is_accepted) {
-                LOG_INFO("accept replica(%s) from node(%s)",
-                         boost::lexical_cast<std::string>(r).c_str(),
-                         replica_nodes[i].to_string());
+                LOG_INFO("accept replica({}) from node({})",
+                         boost::lexical_cast<std::string>(r),
+                         replica_nodes[i]);
             } else {
-                LOG_INFO("ignore replica(%s) from node(%s)",
-                         boost::lexical_cast<std::string>(r).c_str(),
-                         replica_nodes[i].to_string());
+                LOG_INFO("ignore replica({}) from node({})",
+                         boost::lexical_cast<std::string>(r),
+                         replica_nodes[i]);
             }
         }
     }
@@ -2105,34 +2450,35 @@ error_code server_state::construct_partitions(
               "invalid app status, status = {}",
               enum_to_string(app->status));
         if (app->status == app_status::AS_DROPPING) {
-            LOG_INFO("ignore constructing partitions for dropping app(%d)", app->app_id);
+            LOG_INFO("ignore constructing partitions for dropping app({})", app->app_id);
         } else {
-            for (partition_configuration &pc : app->partitions) {
+            for (const auto &pc : app->pcs) {
                 bool is_succeed =
                     construct_replica({&_all_apps, &_nodes}, pc.pid, app->max_replica_count);
                 if (is_succeed) {
-                    LOG_INFO("construct partition(%d.%d) succeed: %s",
+                    LOG_INFO("construct partition({}.{}) succeed: {}",
                              app->app_id,
                              pc.pid.get_partition_index(),
-                             boost::lexical_cast<std::string>(pc).c_str());
-                    if (pc.last_drops.size() + 1 < pc.max_replica_count) {
-                        std::ostringstream oss;
-                        oss << "WARNING: partition(" << app->app_id << "."
-                            << pc.pid.get_partition_index() << ") only collects "
-                            << (pc.last_drops.size() + 1) << "/" << pc.max_replica_count
-                            << " of replicas, may lost data" << std::endl;
-                        hint_message += oss.str();
+                             boost::lexical_cast<std::string>(pc));
+                    if (pc.hp_last_drops.size() + 1 < pc.max_replica_count) {
+                        hint_message += fmt::format("WARNING: partition({}.{}) only collects {}/{} "
+                                                    "of replicas, may lost data",
+                                                    app->app_id,
+                                                    pc.pid.get_partition_index(),
+                                                    pc.hp_last_drops.size() + 1,
+                                                    pc.max_replica_count);
                     }
                     succeed_count++;
                 } else {
-                    LOG_WARNING("construct partition(%d.%d) failed",
+                    LOG_WARNING("construct partition({}.{}) failed",
                                 app->app_id,
                                 pc.pid.get_partition_index());
                     std::ostringstream oss;
                     if (skip_lost_partitions) {
                         oss << "WARNING: partition(" << app->app_id << "."
-                            << pc.pid.get_partition_index() << ") has no replica collected, force "
-                                                               "recover the lost partition to empty"
+                            << pc.pid.get_partition_index()
+                            << ") has no replica collected, force "
+                               "recover the lost partition to empty"
                             << std::endl;
                     } else {
                         oss << "ERROR: partition(" << app->app_id << "."
@@ -2148,12 +2494,11 @@ error_code server_state::construct_partitions(
         }
     }
 
-    LOG_INFO(
-        "construct partition done, succeed_count = %d, failed_count = %d, skip_lost_partitions "
-        "= %s",
-        succeed_count,
-        failed_count,
-        (skip_lost_partitions ? "true" : "false"));
+    LOG_INFO("construct partition done, succeed_count = {}, failed_count = {}, "
+             "skip_lost_partitions = {}",
+             succeed_count,
+             failed_count,
+             skip_lost_partitions ? "true" : "false");
 
     if (failed_count > 0 && !skip_lost_partitions) {
         return dsn::ERR_TRY_AGAIN;
@@ -2163,7 +2508,7 @@ error_code server_state::construct_partitions(
 }
 
 dsn::error_code
-server_state::sync_apps_from_replica_nodes(const std::vector<dsn::rpc_address> &replica_nodes,
+server_state::sync_apps_from_replica_nodes(const std::vector<dsn::host_port> &replica_nodes,
                                            bool skip_bad_nodes,
                                            bool skip_lost_partitions,
                                            std::string &hint_message)
@@ -2176,21 +2521,23 @@ server_state::sync_apps_from_replica_nodes(const std::vector<dsn::rpc_address> &
 
     dsn::task_tracker tracker;
     for (int i = 0; i < n_replicas; ++i) {
-        LOG_INFO("send query app and replica request to node(%s)", replica_nodes[i].to_string());
+        LOG_INFO("send query app and replica request to node({})", replica_nodes[i]);
 
         auto app_query_req = std::make_unique<query_app_info_request>();
-        app_query_req->meta_server = dsn_primary_address();
+        SET_IP_AND_HOST_PORT(
+            *app_query_req, meta_server, dsn_primary_address(), dsn_primary_host_port());
         query_app_info_rpc app_rpc(std::move(app_query_req), RPC_QUERY_APP_INFO);
-        app_rpc.call(replica_nodes[i],
+        const auto addr = dsn::dns_resolver::instance().resolve_address(replica_nodes[i]);
+        app_rpc.call(addr,
                      &tracker,
                      [app_rpc, i, &replica_nodes, &query_app_errors, &query_app_responses](
                          error_code err) mutable {
                          auto resp = app_rpc.response();
                          LOG_INFO(
-                             "received query app response from node(%s), err(%s), apps_count(%d)",
-                             replica_nodes[i].to_string(),
-                             err.to_string(),
-                             (int)resp.apps.size());
+                             "received query app response from node({}), err({}), apps_count({})",
+                             replica_nodes[i],
+                             err,
+                             resp.apps.size());
                          query_app_errors[i] = err;
                          if (err == dsn::ERR_OK) {
                              query_app_responses[i] = std::move(resp);
@@ -2198,19 +2545,19 @@ server_state::sync_apps_from_replica_nodes(const std::vector<dsn::rpc_address> &
                      });
 
         auto replica_query_req = std::make_unique<query_replica_info_request>();
-        replica_query_req->node = replica_nodes[i];
+        SET_IP_AND_HOST_PORT_BY_DNS(*replica_query_req, node1, replica_nodes[i]);
         query_replica_info_rpc replica_rpc(std::move(replica_query_req), RPC_QUERY_REPLICA_INFO);
         replica_rpc.call(
-            replica_nodes[i],
+            addr,
             &tracker,
             [replica_rpc, i, &replica_nodes, &query_replica_errors, &query_replica_responses](
                 error_code err) mutable {
                 auto resp = replica_rpc.response();
                 LOG_INFO(
-                    "received query replica response from node(%s), err(%s), replicas_count(%d)",
-                    replica_nodes[i].to_string(),
-                    err.to_string(),
-                    (int)resp.replicas.size());
+                    "received query replica response from node({}), err({}), replicas_count({})",
+                    replica_nodes[i],
+                    err,
+                    resp.replicas.size());
                 query_replica_errors[i] = err;
                 if (err == dsn::ERR_OK) {
                     query_replica_responses[i] = std::move(resp);
@@ -2224,43 +2571,43 @@ server_state::sync_apps_from_replica_nodes(const std::vector<dsn::rpc_address> &
     for (int i = 0; i < n_replicas; ++i) {
         error_code err = dsn::ERR_OK;
         if (query_app_errors[i] != dsn::ERR_OK) {
-            LOG_WARNING("query app info from node(%s) failed, reason: %s",
-                        replica_nodes[i].to_string(),
-                        query_app_errors[i].to_string());
+            LOG_WARNING("query app info from node({}) failed, reason: {}",
+                        replica_nodes[i],
+                        query_app_errors[i]);
             err = query_app_errors[i];
         }
         if (query_replica_errors[i] != dsn::ERR_OK) {
-            LOG_WARNING("query replica info from node(%s) failed, reason: %s",
-                        replica_nodes[i].to_string(),
-                        query_replica_errors[i].to_string());
+            LOG_WARNING("query replica info from node({}) failed, reason: {}",
+                        replica_nodes[i],
+                        query_replica_errors[i]);
             err = query_replica_errors[i];
         }
         if (err != dsn::ERR_OK) {
             failed_count++;
             query_app_errors[i] = err;
             query_replica_errors[i] = err;
-            std::ostringstream oss;
             if (skip_bad_nodes) {
-                oss << "WARNING: collect app and replica info from node("
-                    << replica_nodes[i].to_string() << ") failed with err(" << err.to_string()
-                    << "), skip the bad node" << std::endl;
+                hint_message += fmt::format("WARNING: collect app and replica info from node({}) "
+                                            "failed with err({}), skip the bad node",
+                                            replica_nodes[i],
+                                            err);
             } else {
-                oss << "ERROR: collect app and replica info from node("
-                    << replica_nodes[i].to_string() << ") failed with err(" << err.to_string()
-                    << "), you can skip it by set skip_bad_nodes option" << std::endl;
+                hint_message +=
+                    fmt::format("ERROR: collect app and replica info from node({}) failed with "
+                                "err({}), you can skip it by set skip_bad_nodes option",
+                                replica_nodes[i],
+                                err);
             }
-            hint_message += oss.str();
         } else {
             succeed_count++;
         }
     }
 
-    LOG_INFO(
-        "sync apps and replicas from replica nodes done, succeed_count = %d, failed_count = %d, "
-        "skip_bad_nodes = %s",
-        succeed_count,
-        failed_count,
-        (skip_bad_nodes ? "true" : "false"));
+    LOG_INFO("sync apps and replicas from replica nodes done, succeed_count = {}, failed_count = "
+             "{}, skip_bad_nodes = {}",
+             succeed_count,
+             failed_count,
+             skip_bad_nodes ? "true" : "false");
 
     if (failed_count > 0 && !skip_bad_nodes) {
         return dsn::ERR_TRY_AGAIN;
@@ -2270,14 +2617,14 @@ server_state::sync_apps_from_replica_nodes(const std::vector<dsn::rpc_address> &
 
     dsn::error_code err = construct_apps(query_app_responses, replica_nodes, hint_message);
     if (err != dsn::ERR_OK) {
-        LOG_ERROR("construct apps failed, err = %s", err.to_string());
+        LOG_ERROR("construct apps failed, err = {}", err);
         return err;
     }
 
     err = construct_partitions(
         query_replica_responses, replica_nodes, skip_lost_partitions, hint_message);
     if (err != dsn::ERR_OK) {
-        LOG_ERROR("construct partitions failed, err = %s", err.to_string());
+        LOG_ERROR("construct partitions failed, err = {}", err);
         return err;
     }
 
@@ -2287,16 +2634,18 @@ server_state::sync_apps_from_replica_nodes(const std::vector<dsn::rpc_address> &
 void server_state::on_start_recovery(const configuration_recovery_request &req,
                                      configuration_recovery_response &resp)
 {
-    LOG_INFO("start recovery, node_count = %d, skip_bad_nodes = %s, skip_lost_partitions = %s",
-             (int)req.recovery_set.size(),
+    LOG_INFO("start recovery, node_count = {}, skip_bad_nodes = {}, skip_lost_partitions = {}",
+             req.recovery_nodes.size(),
              req.skip_bad_nodes ? "true" : "false",
              req.skip_lost_partitions ? "true" : "false");
 
+    std::vector<host_port> recovery_nodes;
+    GET_HOST_PORTS(req, recovery_nodes, recovery_nodes);
     resp.err = sync_apps_from_replica_nodes(
-        req.recovery_set, req.skip_bad_nodes, req.skip_lost_partitions, resp.hint_message);
+        recovery_nodes, req.skip_bad_nodes, req.skip_lost_partitions, resp.hint_message);
+
     if (resp.err != dsn::ERR_OK) {
-        LOG_ERROR("sync apps from replica nodes failed when do recovery, err = %s",
-                  resp.err.to_string());
+        LOG_ERROR("sync apps from replica nodes failed when do recovery, err = {}", resp.err);
         _all_apps.clear();
         return;
     }
@@ -2328,8 +2677,8 @@ bool server_state::can_run_balancer()
         if (!iter->second.alive()) {
             if (iter->second.partition_count() != 0) {
                 LOG_INFO(
-                    "don't do replica migration coz dead node(%s) has %d partitions not removed",
-                    iter->second.addr().to_string(),
+                    "don't do replica migration coz dead node({}) has {} partitions not removed",
+                    iter->second.host_port(),
                     iter->second.partition_count());
                 return false;
             }
@@ -2341,31 +2690,37 @@ bool server_state::can_run_balancer()
     // table stability check
     int c = count_staging_app();
     if (c != 0) {
-        LOG_INFO("don't do replica migration coz %d table(s) is(are) in staging state", c);
+        LOG_INFO("don't do replica migration coz {} table(s) is(are) in staging state", c);
         return false;
     }
     return true;
 }
 
-void server_state::update_partition_perf_counter()
+void server_state::update_partition_metrics()
 {
-    int counters[HS_MAX_VALUE];
-    ::memset(counters, 0, sizeof(counters));
     auto func = [&](const std::shared_ptr<app_state> &app) {
+        int counters[HS_MAX_VALUE] = {0};
+
         int min_2pc_count =
             _meta_svc->get_options().app_mutation_2pc_min_replica_count(app->max_replica_count);
-        for (unsigned int i = 0; i != app->partition_count; ++i) {
-            health_status st = partition_health_status(app->partitions[i], min_2pc_count);
+        CHECK_EQ(app->partition_count, app->pcs.size());
+        for (const auto &pc : app->pcs) {
+            health_status st = partition_health_status(pc, min_2pc_count);
             counters[st]++;
         }
+
+        METRIC_SET_TABLE_HEALTH_STATS(_table_metric_entities,
+                                      app->app_id,
+                                      counters[HS_DEAD],
+                                      counters[HS_UNREADABLE],
+                                      counters[HS_UNWRITABLE],
+                                      counters[HS_WRITABLE_ILL],
+                                      counters[HS_HEALTHY]);
+
         return true;
     };
+
     for_each_available_app(_all_apps, func);
-    _dead_partition_count->set(counters[HS_DEAD]);
-    _unreadable_partition_count->set(counters[HS_UNREADABLE]);
-    _unwritable_partition_count->set(counters[HS_UNWRITABLE]);
-    _writable_ill_partition_count->set(counters[HS_WRITABLE_ILL]);
-    _healthy_partition_count->set(counters[HS_HEALTHY]);
 }
 
 bool server_state::check_all_partitions()
@@ -2376,16 +2731,16 @@ bool server_state::check_all_partitions()
 
     zauto_write_lock l(_lock);
 
-    update_partition_perf_counter();
+    update_partition_metrics();
 
     // first the cure stage
     if (level <= meta_function_level::fl_freezed) {
-        LOG_INFO("service is in level(%s), don't do any cure or balancer actions",
+        LOG_INFO("service is in level({}), don't do any cure or balancer actions",
                  _meta_function_level_VALUES_TO_NAMES.find(level)->second);
         return false;
     }
-    LOG_INFO("start to check all partitions, add_secondary_enable_flow_control = %s, "
-             "add_secondary_max_count_for_one_node = %d",
+    LOG_INFO("start to check all partitions, add_secondary_enable_flow_control = {}, "
+             "add_secondary_max_count_for_one_node = {}",
              _add_secondary_enable_flow_control ? "true" : "false",
              _add_secondary_max_count_for_one_node);
     _meta_svc->get_partition_guardian()->clear_ddd_partitions();
@@ -2393,28 +2748,25 @@ bool server_state::check_all_partitions()
     std::vector<configuration_proposal_action> add_secondary_actions;
     std::vector<gpid> add_secondary_gpids;
     std::vector<bool> add_secondary_proposed;
-    std::map<rpc_address, int> add_secondary_running_nodes; // node --> running_count
+    std::map<host_port, int> add_secondary_running_nodes; // node --> running_count
     for (auto &app_pair : _exist_apps) {
         std::shared_ptr<app_state> &app = app_pair.second;
         if (app->status == app_status::AS_CREATING || app->status == app_status::AS_DROPPING) {
-            LOG_INFO("ignore app(%s)(%d) because it's status is %s",
-                     app->app_name.c_str(),
+            LOG_INFO("ignore app({})({}) because it's status is {}",
+                     app->app_name,
                      app->app_id,
                      ::dsn::enum_to_string(app->status));
             continue;
         }
         for (unsigned int i = 0; i != app->partition_count; ++i) {
-            partition_configuration &pc = app->partitions[i];
-            config_context &cc = app->helpers->contexts[i];
+            const auto &pc = app->pcs[i];
+            const auto &cc = app->helpers->contexts[i];
             // partition is under re-configuration or is child partition
             if (cc.stage != config_status::pending_remote_sync && pc.ballot != invalid_ballot) {
                 configuration_proposal_action action;
                 pc_status s = _meta_svc->get_partition_guardian()->cure(
                     {&_all_apps, &_nodes}, pc.pid, action);
-                LOG_DEBUG("gpid(%d.%d) is in status(%s)",
-                          pc.pid.get_app_id(),
-                          pc.pid.get_partition_index(),
-                          enum_to_string(s));
+                LOG_DEBUG("gpid({}) is in status({})", pc.pid, enum_to_string(s));
                 if (pc_status::healthy != s) {
                     if (action.type != config_type::CT_INVALID) {
                         if (action.type == config_type::CT_ADD_SECONDARY ||
@@ -2431,9 +2783,7 @@ bool server_state::check_all_partitions()
                     healthy_partitions++;
                 }
             } else {
-                LOG_INFO("ignore gpid(%d.%d) as it's stage is pending_remote_sync",
-                         pc.pid.get_app_id(),
-                         pc.pid.get_partition_index());
+                LOG_INFO("ignore gpid({}) as it's stage is pending_remote_sync", pc.pid);
             }
         }
         total_partitions += app->partition_count;
@@ -2442,45 +2792,45 @@ bool server_state::check_all_partitions()
     // assign secondary for urgent
     for (int i = 0; i < add_secondary_actions.size(); ++i) {
         gpid &pid = add_secondary_gpids[i];
-        partition_configuration &pc = *get_config(_all_apps, pid);
-        if (!add_secondary_proposed[i] && pc.secondaries.empty()) {
-            configuration_proposal_action &action = add_secondary_actions[i];
-            if (_add_secondary_enable_flow_control &&
-                add_secondary_running_nodes[action.node] >= _add_secondary_max_count_for_one_node) {
+        const auto *pc = get_config(_all_apps, pid);
+        if (!add_secondary_proposed[i] && pc->hp_secondaries.empty()) {
+            const auto &action = add_secondary_actions[i];
+            CHECK(action.hp_node, "");
+            if (_add_secondary_enable_flow_control && add_secondary_running_nodes[action.hp_node] >=
+                                                          _add_secondary_max_count_for_one_node) {
                 // ignore
                 continue;
             }
             std::shared_ptr<app_state> app = get_app(pid.get_app_id());
-            send_proposal(action, pc, *app);
+            send_proposal(action, *pc, *app);
             send_proposal_count++;
             add_secondary_proposed[i] = true;
-            add_secondary_running_nodes[action.node]++;
+            add_secondary_running_nodes[action.hp_node]++;
         }
     }
 
     // assign secondary for all
     for (int i = 0; i < add_secondary_actions.size(); ++i) {
         if (!add_secondary_proposed[i]) {
-            configuration_proposal_action &action = add_secondary_actions[i];
+            const auto &action = add_secondary_actions[i];
+            CHECK(action.hp_node, "");
             gpid pid = add_secondary_gpids[i];
-            partition_configuration &pc = *get_config(_all_apps, pid);
-            if (_add_secondary_enable_flow_control &&
-                add_secondary_running_nodes[action.node] >= _add_secondary_max_count_for_one_node) {
-                LOG_INFO(
-                    "do not send %s proposal for gpid(%d.%d) for flow control reason, target = "
-                    "%s, node = %s",
-                    ::dsn::enum_to_string(action.type),
-                    pc.pid.get_app_id(),
-                    pc.pid.get_partition_index(),
-                    action.target.to_string(),
-                    action.node.to_string());
+            const auto *pc = get_config(_all_apps, pid);
+            if (_add_secondary_enable_flow_control && add_secondary_running_nodes[action.hp_node] >=
+                                                          _add_secondary_max_count_for_one_node) {
+                LOG_INFO("do not send {} proposal for gpid({}) for flow control reason, target = "
+                         "{}, node = {}",
+                         ::dsn::enum_to_string(action.type),
+                         pc->pid,
+                         FMT_HOST_PORT_AND_IP(action, target),
+                         FMT_HOST_PORT_AND_IP(action, node));
                 continue;
             }
             std::shared_ptr<app_state> app = get_app(pid.get_app_id());
-            send_proposal(action, pc, *app);
+            send_proposal(action, *pc, *app);
             send_proposal_count++;
             add_secondary_proposed[i] = true;
-            add_secondary_running_nodes[action.node]++;
+            add_secondary_running_nodes[action.hp_node]++;
         }
     }
 
@@ -2494,21 +2844,21 @@ bool server_state::check_all_partitions()
         }
     }
 
-    LOG_INFO("check all partitions done, send_proposal_count = %d, add_secondary_count = %d, "
-             "ignored_add_secondary_count = %d",
+    LOG_INFO("check all partitions done, send_proposal_count = {}, add_secondary_count = {}, "
+             "ignored_add_secondary_count = {}",
              send_proposal_count,
              add_secondary_count,
              ignored_add_secondary_count);
 
     // then the balancer stage
     if (level < meta_function_level::fl_steady) {
-        LOG_INFO("don't do replica migration coz meta server is in level(%s)",
+        LOG_INFO("don't do replica migration coz meta server is in level({})",
                  _meta_function_level_VALUES_TO_NAMES.find(level)->second);
         return false;
     }
 
     if (healthy_partitions != total_partitions) {
-        LOG_INFO("don't do replica migration coz %d of %d partitions aren't healthy",
+        LOG_INFO("don't do replica migration coz {}/{} partitions aren't healthy",
                  total_partitions - healthy_partitions,
                  total_partitions);
         return false;
@@ -2520,10 +2870,10 @@ bool server_state::check_all_partitions()
     }
 
     if (level == meta_function_level::fl_steady) {
-        LOG_INFO("check if any replica migration can be done when meta server is in level(%s)",
+        LOG_INFO("check if any replica migration can be done when meta server is in level({})",
                  _meta_function_level_VALUES_TO_NAMES.find(level)->second);
         _meta_svc->get_balancer()->check({&_all_apps, &_nodes}, _temporary_list);
-        LOG_INFO("balance checker operation count = %d", _temporary_list.size());
+        LOG_INFO("balance checker operation count = {}", _temporary_list.size());
         // update balance checker operation count
         _meta_svc->get_balancer()->report(_temporary_list, true);
         return false;
@@ -2544,7 +2894,7 @@ bool server_state::check_all_partitions()
 
     LOG_INFO("check if any replica migration left");
     _meta_svc->get_balancer()->check({&_all_apps, &_nodes}, _temporary_list);
-    LOG_INFO("balance checker operation count = %d", _temporary_list.size());
+    LOG_INFO("balance checker operation count = {}", _temporary_list.size());
     // update balance checker operation count
     _meta_svc->get_balancer()->report(_temporary_list, true);
 
@@ -2562,35 +2912,33 @@ void server_state::check_consistency(const dsn::gpid &gpid)
     auto iter = _all_apps.find(gpid.get_app_id());
     CHECK(iter != _all_apps.end(), "invalid gpid({})", gpid);
 
-    app_state &app = *(iter->second);
-    partition_configuration &config = app.partitions[gpid.get_partition_index()];
+    auto &app = *(iter->second);
+    auto &pc = app.pcs[gpid.get_partition_index()];
 
     if (app.is_stateful) {
-        if (config.primary.is_invalid() == false) {
-            auto it = _nodes.find(config.primary);
-            CHECK(it != _nodes.end(), "invalid primary address, address = {}", config.primary);
+        if (pc.hp_primary) {
+            const auto it = _nodes.find(pc.hp_primary);
+            CHECK(it != _nodes.end(), "invalid primary: {}", pc.hp_primary);
             CHECK_EQ(it->second.served_as(gpid), partition_status::PS_PRIMARY);
-            CHECK(std::find(config.last_drops.begin(), config.last_drops.end(), config.primary) ==
-                      config.last_drops.end(),
-                  "primary shouldn't appear in last_drops, address = {}",
-                  config.primary);
+            CHECK(!utils::contains(pc.hp_last_drops, pc.hp_primary),
+                  "primary({}) shouldn't appear in last_drops",
+                  pc.hp_primary);
         }
 
-        for (auto &ep : config.secondaries) {
-            auto it = _nodes.find(ep);
-            CHECK(it != _nodes.end(), "invalid secondary address, address = {}", ep);
+        for (const auto &secondary : pc.hp_secondaries) {
+            const auto it = _nodes.find(secondary);
+            CHECK(it != _nodes.end(), "invalid secondary: {}", secondary);
             CHECK_EQ(it->second.served_as(gpid), partition_status::PS_SECONDARY);
-            CHECK(std::find(config.last_drops.begin(), config.last_drops.end(), ep) ==
-                      config.last_drops.end(),
-                  "secondary shouldn't appear in last_drops, address = {}",
-                  ep);
+            CHECK(!utils::contains(pc.hp_last_drops, secondary),
+                  "secondary({}) shouldn't appear in last_drops",
+                  secondary);
         }
     } else {
-        partition_configuration_stateless pcs(config);
+        partition_configuration_stateless pcs(pc);
         CHECK_EQ(pcs.hosts().size(), pcs.workers().size());
-        for (auto &ep : pcs.hosts()) {
-            auto it = _nodes.find(ep);
-            CHECK(it != _nodes.end(), "invalid host, address = {}", ep);
+        for (const auto &secondary : pcs.hosts()) {
+            auto it = _nodes.find(secondary);
+            CHECK(it != _nodes.end(), "invalid secondary: {}", secondary);
             CHECK_EQ(it->second.served_as(gpid), partition_status::PS_SECONDARY);
         }
     }
@@ -2614,14 +2962,13 @@ void server_state::do_update_app_info(const std::string &app_path,
 {
     // persistent envs to zookeeper
     blob value = dsn::json::json_forwarder<app_info>::encode(info);
-    auto new_cb = [ this, app_path, info, user_cb = std::move(cb) ](error_code ec)
-    {
+    auto new_cb = [this, app_path, info, user_cb = std::move(cb)](error_code ec) {
         if (ec == ERR_OK) {
             user_cb(ec);
         } else if (ec == ERR_TIMEOUT) {
             LOG_WARNING(
-                "update app_info(app = %s) to remote storage timeout, continue to update later",
-                info.app_name.c_str());
+                "update app_info(app = {}) to remote storage timeout, continue to update later",
+                info.app_name);
             tasking::enqueue(
                 LPC_META_STATE_NORMAL,
                 tracker(),
@@ -2641,137 +2988,245 @@ void server_state::do_update_app_info(const std::string &app_path,
 
 void server_state::set_app_envs(const app_env_rpc &env_rpc)
 {
-    const configuration_update_app_env_request &request = env_rpc.request();
+    const auto &request = env_rpc.request();
     if (!request.__isset.keys || !request.__isset.values ||
-        request.keys.size() != request.values.size() || request.keys.size() <= 0) {
+        request.keys.size() != request.values.size() || request.keys.empty()) {
         env_rpc.response().err = ERR_INVALID_PARAMETERS;
         LOG_WARNING("set app envs failed with invalid request");
         return;
     }
-    const std::vector<std::string> &keys = request.keys;
-    const std::vector<std::string> &values = request.values;
-    const std::string &app_name = request.app_name;
+
+    const auto &keys = request.keys;
+    const auto &values = request.values;
+    const auto &app_name = request.app_name;
 
     std::ostringstream os;
-    for (int i = 0; i < keys.size(); i++) {
-        if (i != 0)
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i != 0) {
             os << ", ";
+        }
 
-        if (!validate_app_env(keys[i], values[i], env_rpc.response().hint_message)) {
+        if (!_app_env_validator.validate_app_env(
+                keys[i], values[i], env_rpc.response().hint_message)) {
+            LOG_WARNING("app env '{}={}' is invalid, hint_message: {}",
+                        keys[i],
+                        values[i],
+                        env_rpc.response().hint_message);
             env_rpc.response().err = ERR_INVALID_PARAMETERS;
             return;
         }
 
         os << keys[i] << "=" << values[i];
     }
-    LOG_INFO("set app envs for app(%s) from remote(%s): kvs = {%s}",
-             app_name.c_str(),
-             env_rpc.remote_address().to_string(),
-             os.str().c_str());
+
+    LOG_INFO("set app envs for app({}) from remote({}): kvs = {}",
+             app_name,
+             env_rpc.remote_address(),
+             os.str());
 
     app_info ainfo;
     std::string app_path;
     {
+        FAIL_POINT_INJECT_NOT_RETURN_F("set_app_envs_failed", [app_name, this](std::string_view s) {
+            zauto_write_lock l(_lock);
+
+            if (s == "not_found") {
+                CHECK_EQ(_exist_apps.erase(app_name), 1);
+                return;
+            }
+
+            if (s == "dropping") {
+                gutil::FindOrDie(_exist_apps, app_name)->status = app_status::AS_DROPPING;
+                return;
+            }
+        });
+
         zauto_read_lock l(_lock);
-        std::shared_ptr<app_state> app = get_app(app_name);
-        if (app == nullptr) {
-            LOG_WARNING("set app envs failed with invalid app_name(%s)", app_name.c_str());
-            env_rpc.response().err = ERR_INVALID_PARAMETERS;
-            env_rpc.response().hint_message = "invalid app name";
+
+        const auto &app = get_app(app_name);
+        if (!app) {
+            LOG_WARNING("set app envs failed since app_name({}) cannot be found", app_name);
+            env_rpc.response().err = ERR_APP_NOT_EXIST;
+            env_rpc.response().hint_message = "app cannot be found";
             return;
-        } else {
-            ainfo = *(reinterpret_cast<app_info *>(app.get()));
-            app_path = get_app_path(*app);
         }
+
+        if (app->status == app_status::AS_DROPPING) {
+            LOG_WARNING("set app envs failed since app(name={}, id={}) is being dropped",
+                        app_name,
+                        app->app_id);
+            env_rpc.response().err = ERR_BUSY_DROPPING;
+            env_rpc.response().hint_message = "app is being dropped";
+            return;
+        }
+
+        ainfo = *app;
+        app_path = get_app_path(*app);
     }
-    for (int idx = 0; idx < keys.size(); idx++) {
+
+    for (size_t idx = 0; idx < keys.size(); ++idx) {
         ainfo.envs[keys[idx]] = values[idx];
     }
+
     do_update_app_info(app_path, ainfo, [this, app_name, keys, values, env_rpc](error_code ec) {
-        CHECK_EQ_MSG(ec, ERR_OK, "update app info to remote storage failed");
+        CHECK_EQ_MSG(ec, ERR_OK, "update app({}) info to remote storage failed", app_name);
 
         zauto_write_lock l(_lock);
-        std::shared_ptr<app_state> app = get_app(app_name);
-        std::string old_envs = dsn::utils::kv_map_to_string(app->envs, ',', '=');
-        for (int idx = 0; idx < keys.size(); idx++) {
+
+        FAIL_POINT_INJECT_NOT_RETURN_F("set_app_envs_failed", [app_name, this](std::string_view s) {
+            if (s == "dropped_after") {
+                CHECK_EQ(_exist_apps.erase(app_name), 1);
+                return;
+            }
+        });
+
+        auto app = get_app(app_name);
+
+        // The table might be removed just before the callback function is invoked, thus we must
+        // check if this table still exists.
+        //
+        // TODO(wangdan): should make updates to remote storage sequential by supporting atomic
+        // set, otherwise update might be missing. For example, an update is setting the envs
+        // while another is dropping a table. The update setting the envs does not contain the
+        // dropped state. Once it is applied by remote storage after another update dropping
+        // the table, the state of the table would always be non-dropped on remote storage.
+        if (!app) {
+            LOG_ERROR("set app envs failed since app({}) has just been dropped", app_name);
+            env_rpc.response().err = ERR_APP_DROPPED;
+            env_rpc.response().hint_message = "app has just been dropped";
+            return;
+        }
+
+        env_rpc.response().err = ERR_OK;
+
+        const auto &old_envs = dsn::utils::kv_map_to_string(app->envs, ',', '=');
+
+        // Update envs of local memory.
+        for (size_t idx = 0; idx < keys.size(); ++idx) {
             app->envs[keys[idx]] = values[idx];
         }
-        std::string new_envs = dsn::utils::kv_map_to_string(app->envs, ',', '=');
-        LOG_INFO("app envs changed: old_envs = {%s}, new_envs = {%s}",
-                 old_envs.c_str(),
-                 new_envs.c_str());
+
+        const auto &new_envs = dsn::utils::kv_map_to_string(app->envs, ',', '=');
+        LOG_INFO("app envs changed: old_envs = {}, new_envs = {}", old_envs, new_envs);
     });
 }
 
 void server_state::del_app_envs(const app_env_rpc &env_rpc)
 {
-    const configuration_update_app_env_request &request = env_rpc.request();
-    if (!request.__isset.keys || request.keys.size() <= 0) {
+    const auto &request = env_rpc.request();
+    if (!request.__isset.keys || request.keys.empty()) {
         env_rpc.response().err = ERR_INVALID_PARAMETERS;
         LOG_WARNING("del app envs failed with invalid request");
         return;
     }
-    const std::vector<std::string> &keys = request.keys;
-    const std::string &app_name = request.app_name;
 
-    std::ostringstream os;
-    for (int i = 0; i < keys.size(); i++) {
-        if (i != 0)
-            os << ",";
-        os << keys[i];
-    }
-    LOG_INFO("del app envs for app(%s) from remote(%s): keys = {%s}",
-             app_name.c_str(),
-             env_rpc.remote_address().to_string(),
-             os.str().c_str());
+    const auto &keys = request.keys;
+    const auto &app_name = request.app_name;
+
+    LOG_INFO("del app envs for app({}) from remote({}): keys = {}",
+             app_name,
+             env_rpc.remote_address(),
+             boost::join(keys, ","));
 
     app_info ainfo;
     std::string app_path;
     {
+        FAIL_POINT_INJECT_NOT_RETURN_F("del_app_envs_failed", [app_name, this](std::string_view s) {
+            zauto_write_lock l(_lock);
+
+            if (s == "not_found") {
+                CHECK_EQ(_exist_apps.erase(app_name), 1);
+                return;
+            }
+
+            if (s == "dropping") {
+                gutil::FindOrDie(_exist_apps, app_name)->status = app_status::AS_DROPPING;
+                return;
+            }
+        });
+
         zauto_read_lock l(_lock);
-        std::shared_ptr<app_state> app = get_app(app_name);
-        if (app == nullptr) {
-            LOG_WARNING("del app envs failed with invalid app_name(%s)", app_name.c_str());
-            env_rpc.response().err = ERR_INVALID_PARAMETERS;
-            env_rpc.response().hint_message = "invalid app name";
+
+        const auto &app = get_app(app_name);
+        if (!app) {
+            LOG_WARNING("del app envs failed since app_name({}) cannot be found", app_name);
+            env_rpc.response().err = ERR_APP_NOT_EXIST;
+            env_rpc.response().hint_message = "app cannot be found";
             return;
-        } else {
-            ainfo = *(reinterpret_cast<app_info *>(app.get()));
-            app_path = get_app_path(*app);
         }
+
+        if (app->status == app_status::AS_DROPPING) {
+            LOG_WARNING("del app envs failed since app(name={}, id={}) is being dropped",
+                        app_name,
+                        app->app_id);
+            env_rpc.response().err = ERR_BUSY_DROPPING;
+            env_rpc.response().hint_message = "app is being dropped";
+            return;
+        }
+
+        ainfo = *app;
+        app_path = get_app_path(*app);
     }
 
-    std::ostringstream oss;
-    oss << "deleted keys:";
-    int deleted = 0;
+    std::string deleted_keys_info("deleted keys:");
+    size_t deleted_count = 0;
     for (const auto &key : keys) {
-        if (ainfo.envs.erase(key) > 0) {
-            oss << std::endl << "    " << key;
-            deleted++;
+        if (ainfo.envs.erase(key) == 0) {
+            continue;
         }
+
+        fmt::format_to(std::back_inserter(deleted_keys_info), "\n    {}", key);
+        ++deleted_count;
     }
 
-    if (deleted == 0) {
-        LOG_INFO("no key need to delete");
-        env_rpc.response().hint_message = "no key need to delete";
+    if (deleted_count == 0) {
+        LOG_INFO("no key needs to be deleted for app({})", app_name);
+        env_rpc.response().err = ERR_OK;
+        env_rpc.response().hint_message = "no key needs to be deleted";
         return;
-    } else {
-        env_rpc.response().hint_message = oss.str();
     }
+
+    env_rpc.response().hint_message = std::move(deleted_keys_info);
 
     do_update_app_info(app_path, ainfo, [this, app_name, keys, env_rpc](error_code ec) {
-        CHECK_EQ_MSG(ec, ERR_OK, "update app info to remote storage failed");
+        CHECK_EQ_MSG(ec, ERR_OK, "update app({}) info to remote storage failed", app_name);
 
         zauto_write_lock l(_lock);
-        std::shared_ptr<app_state> app = get_app(app_name);
-        std::string old_envs = dsn::utils::kv_map_to_string(app->envs, ',', '=');
+
+        FAIL_POINT_INJECT_NOT_RETURN_F("del_app_envs_failed", [app_name, this](std::string_view s) {
+            if (s == "dropped_after") {
+                CHECK_EQ(_exist_apps.erase(app_name), 1);
+                return;
+            }
+        });
+
+        auto app = get_app(app_name);
+
+        // The table might be removed just before the callback function is invoked, thus we must
+        // check if this table still exists.
+        //
+        // TODO(wangdan): should make updates to remote storage sequential by supporting atomic
+        // set, otherwise update might be missing. For example, an update is setting the envs
+        // while another is dropping a table. The update setting the envs does not contain the
+        // dropped state. Once it is applied by remote storage after another update dropping
+        // the table, the state of the table would always be non-dropped on remote storage.
+        if (!app) {
+            LOG_ERROR("del app envs failed since app({}) has just been dropped", app_name);
+            env_rpc.response().err = ERR_APP_DROPPED;
+            env_rpc.response().hint_message = "app has just been dropped";
+            return;
+        }
+
+        env_rpc.response().err = ERR_OK;
+
+        const auto &old_envs = dsn::utils::kv_map_to_string(app->envs, ',', '=');
+
         for (const auto &key : keys) {
             app->envs.erase(key);
         }
-        std::string new_envs = dsn::utils::kv_map_to_string(app->envs, ',', '=');
-        LOG_INFO("app envs changed: old_envs = {%s}, new_envs = {%s}",
-                 old_envs.c_str(),
-                 new_envs.c_str());
+
+        const auto &new_envs = dsn::utils::kv_map_to_string(app->envs, ',', '=');
+        LOG_INFO("app envs changed: old_envs = {}, new_envs = {}", old_envs, new_envs);
     });
 }
 
@@ -2786,10 +3241,10 @@ void server_state::clear_app_envs(const app_env_rpc &env_rpc)
 
     const std::string &prefix = request.clear_prefix;
     const std::string &app_name = request.app_name;
-    LOG_INFO("clear app envs for app(%s) from remote(%s): prefix = {%s}",
-             app_name.c_str(),
-             env_rpc.remote_address().to_string(),
-             prefix.c_str());
+    LOG_INFO("clear app envs for app({}) from remote({}): prefix = {}",
+             app_name,
+             env_rpc.remote_address(),
+             prefix);
 
     app_info ainfo;
     std::string app_path;
@@ -2797,7 +3252,7 @@ void server_state::clear_app_envs(const app_env_rpc &env_rpc)
         zauto_read_lock l(_lock);
         std::shared_ptr<app_state> app = get_app(app_name);
         if (app == nullptr) {
-            LOG_WARNING("clear app envs failed with invalid app_name(%s)", app_name.c_str());
+            LOG_WARNING("clear app envs failed with invalid app_name({})", app_name);
             env_rpc.response().err = ERR_INVALID_PARAMETERS;
             env_rpc.response().hint_message = "invalid app name";
             return;
@@ -2865,9 +3320,7 @@ void server_state::clear_app_envs(const app_env_rpc &env_rpc)
                 }
             }
             std::string new_envs = dsn::utils::kv_map_to_string(app->envs, ',', '=');
-            LOG_INFO("app envs changed: old_envs = {%s}, new_envs = {%s}",
-                     old_envs.c_str(),
-                     new_envs.c_str());
+            LOG_INFO("app envs changed: old_envs = {}, new_envs = {}", old_envs, new_envs);
         });
 }
 
@@ -2914,7 +3367,7 @@ bool server_state::validate_target_max_replica_count(int32_t max_replica_count) 
     std::string hint_message;
     const auto valid = validate_target_max_replica_count(max_replica_count, hint_message);
     if (!valid) {
-        LOG_ERROR_F("target max replica count is invalid: message={}", hint_message);
+        LOG_ERROR("target max replica count is invalid: message={}", hint_message);
     }
 
     return valid;
@@ -2935,7 +3388,7 @@ void server_state::on_start_manual_compact(start_manual_compact_rpc rpc)
                 fmt::format("app {} is {}",
                             app_name,
                             response.err == ERR_APP_NOT_EXIST ? "not existed" : "not available");
-            LOG_ERROR_F("{}", response.hint_msg);
+            LOG_ERROR("{}", response.hint_msg);
             return;
         }
         envs = app->envs;
@@ -2945,7 +3398,7 @@ void server_state::on_start_manual_compact(start_manual_compact_rpc rpc)
     if (iter != envs.end() && iter->second == "true") {
         response.err = ERR_OPERATION_DISABLED;
         response.hint_msg = fmt::format("app {} disable manual compaction", app_name);
-        LOG_ERROR_F("{}", response.hint_msg);
+        LOG_ERROR("{}", response.hint_msg);
         return;
     }
 
@@ -2979,7 +3432,7 @@ bool server_state::parse_compaction_envs(start_manual_compact_rpc rpc,
             response.err = ERR_INVALID_PARAMETERS;
             response.hint_msg = fmt::format(
                 "invalid target_level({}), should in range of [-1, num_levels]", target_level);
-            LOG_ERROR_F("{}", response.hint_msg);
+            LOG_ERROR("{}", response.hint_msg);
             return false;
         }
     }
@@ -2992,7 +3445,7 @@ bool server_state::parse_compaction_envs(start_manual_compact_rpc rpc,
             response.hint_msg =
                 fmt::format("invalid max_running_count({}), should be greater than 0",
                             request.max_running_count);
-            LOG_ERROR_F("{}", response.hint_msg);
+            LOG_ERROR("{}", response.hint_msg);
             return false;
         }
         if (request.max_running_count > 0) {
@@ -3001,9 +3454,9 @@ bool server_state::parse_compaction_envs(start_manual_compact_rpc rpc,
         }
     }
 
-    std::string bottommost = "skip";
+    std::string bottommost = replica_envs::MANUAL_COMPACT_BOTTOMMOST_LEVEL_COMPACTION_SKIP;
     if (request.__isset.bottommost && request.bottommost) {
-        bottommost = "force";
+        bottommost = replica_envs::MANUAL_COMPACT_BOTTOMMOST_LEVEL_COMPACTION_FORCE;
     }
     keys.emplace_back(replica_envs::MANUAL_COMPACT_ONCE_BOTTOMMOST_LEVEL_COMPACTION);
     values.emplace_back(bottommost);
@@ -3044,9 +3497,9 @@ void server_state::update_compaction_envs_on_remote_storage(start_manual_compact
             app->envs[keys[idx]] = values[idx];
         }
         std::string new_envs = dsn::utils::kv_map_to_string(app->envs, ',', '=');
-        LOG_INFO_F("update manual compaction envs succeed: old_envs = {}, new_envs = {}",
-                   old_envs,
-                   new_envs);
+        LOG_INFO("update manual compaction envs succeed: old_envs = {}, new_envs = {}",
+                 old_envs,
+                 new_envs);
 
         rpc.response().err = ERR_OK;
         rpc.response().hint_msg = "succeed";
@@ -3070,7 +3523,7 @@ void server_state::on_query_manual_compact_status(query_manual_compact_rpc rpc)
             fmt::format("app {} is {}",
                         app_name,
                         response.err == ERR_APP_NOT_EXIST ? "not existed" : "not available");
-        LOG_ERROR_F("{}", response.hint_msg);
+        LOG_ERROR("{}", response.hint_msg);
         return;
     }
 
@@ -3078,12 +3531,11 @@ void server_state::on_query_manual_compact_status(query_manual_compact_rpc rpc)
     if (!app->helpers->get_manual_compact_progress(total_progress)) {
         response.err = ERR_INVALID_STATE;
         response.hint_msg = fmt::format("app {} is not manual compaction", app_name);
-        LOG_WARNING_F("{}", response.hint_msg);
+        LOG_WARNING("{}", response.hint_msg);
         return;
     }
 
-    LOG_INFO_F(
-        "query app {} manual compact succeed, total_progress = {}", app_name, total_progress);
+    LOG_INFO("query app {} manual compact succeed, total_progress = {}", app_name, total_progress);
     response.err = ERR_OK;
     response.hint_msg = "succeed";
     response.__set_progress(total_progress);
@@ -3106,18 +3558,17 @@ template <typename Response>
 bool server_state::check_max_replica_count_consistent(const std::shared_ptr<app_state> &app,
                                                       Response &response) const
 {
-    for (int i = 0; i < static_cast<int>(app->partitions.size()); ++i) {
-        const auto &partition_config = app->partitions[i];
-        if (partition_config.max_replica_count == app->max_replica_count) {
+    for (const auto &pc : app->pcs) {
+        if (pc.max_replica_count == app->max_replica_count) {
             continue;
         }
 
         response.err = ERR_INCONSISTENT_STATE;
         response.hint_message = fmt::format("partition_max_replica_count({}) != "
                                             "app_max_replica_count({}) for partition {}",
-                                            partition_config.max_replica_count,
+                                            pc.max_replica_count,
                                             app->max_replica_count,
-                                            i);
+                                            pc.pid);
         return false;
     }
 
@@ -3135,33 +3586,32 @@ void server_state::get_max_replica_count(configuration_get_max_replica_count_rpc
     auto app = get_app_and_check_exist(app_name, response);
     if (app == nullptr) {
         response.max_replica_count = 0;
-        LOG_WARNING_F(
-            "failed to get max_replica_count: app_name={}, error_code={}, hint_message={}",
-            app_name,
-            response.err.to_string(),
-            response.hint_message);
+        LOG_WARNING("failed to get max_replica_count: app_name={}, error_code={}, hint_message={}",
+                    app_name,
+                    response.err,
+                    response.hint_message);
         return;
     }
 
     if (!check_max_replica_count_consistent(app, response)) {
         response.max_replica_count = 0;
-        LOG_ERROR_F("failed to get max_replica_count: app_name={}, app_id={}, error_code={}, "
-                    "hint_message={}",
-                    app_name,
-                    app->app_id,
-                    response.err.to_string(),
-                    response.hint_message);
+        LOG_ERROR("failed to get max_replica_count: app_name={}, app_id={}, error_code={}, "
+                  "hint_message={}",
+                  app_name,
+                  app->app_id,
+                  response.err,
+                  response.hint_message);
         return;
     }
 
     response.err = ERR_OK;
     response.max_replica_count = app->max_replica_count;
 
-    LOG_INFO_F("get max_replica_count successfully: app_name={}, app_id={}, "
-               "max_replica_count={}",
-               app_name,
-               app->app_id,
-               response.max_replica_count);
+    LOG_INFO("get max_replica_count successfully: app_name={}, app_id={}, "
+             "max_replica_count={}",
+             app_name,
+             app->app_id,
+             response.max_replica_count);
 }
 
 // ThreadPool: THREAD_POOL_META_STATE
@@ -3180,10 +3630,10 @@ void server_state::set_max_replica_count(configuration_set_max_replica_count_rpc
         app = get_app_and_check_exist(app_name, response);
         if (app == nullptr) {
             response.old_max_replica_count = 0;
-            LOG_WARNING_F(
+            LOG_WARNING(
                 "failed to set max_replica_count: app_name={}, error_code={}, hint_message={}",
                 app_name,
-                response.err.to_string(),
+                response.err,
                 response.hint_message);
             return;
         }
@@ -3192,12 +3642,12 @@ void server_state::set_max_replica_count(configuration_set_max_replica_count_rpc
 
         if (!check_max_replica_count_consistent(app, response)) {
             response.old_max_replica_count = 0;
-            LOG_ERROR_F("failed to set max_replica_count: app_name={}, app_id={}, error_code={}, "
-                        "hint_message={}",
-                        app_name,
-                        app_id,
-                        response.err.to_string(),
-                        response.hint_message);
+            LOG_ERROR("failed to set max_replica_count: app_name={}, app_id={}, error_code={}, "
+                      "hint_message={}",
+                      app_name,
+                      app_id,
+                      response.err,
+                      response.hint_message);
             return;
         }
 
@@ -3206,12 +3656,12 @@ void server_state::set_max_replica_count(configuration_set_max_replica_count_rpc
         if (app->status != app_status::AS_AVAILABLE) {
             response.err = ERR_INVALID_PARAMETERS;
             response.hint_message = fmt::format("app({}) is not in available status", app_name);
-            LOG_ERROR_F("failed to set max_replica_count: app_name={}, app_id={}, error_code={}, "
-                        "hint_message={}",
-                        app_name,
-                        app_id,
-                        response.err.to_string(),
-                        response.hint_message);
+            LOG_ERROR("failed to set max_replica_count: app_name={}, app_id={}, error_code={}, "
+                      "hint_message={}",
+                      app_name,
+                      app_id,
+                      response.err,
+                      response.hint_message);
             return;
         }
     }
@@ -3221,22 +3671,22 @@ void server_state::set_max_replica_count(configuration_set_max_replica_count_rpc
         response.err = ERR_STATE_FREEZED;
         response.hint_message =
             "current meta function level is freezed, since there are too few alive nodes";
-        LOG_ERROR_F(
+        LOG_ERROR(
             "failed to set max_replica_count: app_name={}, app_id={}, error_code={}, message={}",
             app_name,
             app_id,
-            response.err.to_string(),
+            response.err,
             response.hint_message);
         return;
     }
 
     if (!validate_target_max_replica_count(new_max_replica_count, response.hint_message)) {
         response.err = ERR_INVALID_PARAMETERS;
-        LOG_WARNING_F(
+        LOG_WARNING(
             "failed to set max_replica_count: app_name={}, app_id={}, error_code={}, message={}",
             app_name,
             app_id,
-            response.err.to_string(),
+            response.err,
             response.hint_message);
         return;
     }
@@ -3244,17 +3694,17 @@ void server_state::set_max_replica_count(configuration_set_max_replica_count_rpc
     if (new_max_replica_count == response.old_max_replica_count) {
         response.err = ERR_OK;
         response.hint_message = "no need to update max_replica_count since it's not changed";
-        LOG_WARNING_F("{}: app_name={}, app_id={}", response.hint_message, app_name, app_id);
+        LOG_WARNING("{}: app_name={}, app_id={}", response.hint_message, app_name, app_id);
         return;
     }
 
-    LOG_INFO_F("request for {} max_replica_count: app_name={}, app_id={}, "
-               "old_max_replica_count={}, new_max_replica_count={}",
-               new_max_replica_count > response.old_max_replica_count ? "increasing" : "decreasing",
-               app_name,
-               app_id,
-               response.old_max_replica_count,
-               new_max_replica_count);
+    LOG_INFO("request for {} max_replica_count: app_name={}, app_id={}, "
+             "old_max_replica_count={}, new_max_replica_count={}",
+             new_max_replica_count > response.old_max_replica_count ? "increasing" : "decreasing",
+             app_name,
+             app_id,
+             response.old_max_replica_count,
+             new_max_replica_count);
 
     set_max_replica_count_env_updating(app, rpc);
 }
@@ -3275,12 +3725,12 @@ void server_state::set_max_replica_count_env_updating(std::shared_ptr<app_state>
             response.hint_message = fmt::format("max_replica_count of app({}) is being updated, "
                                                 "thus this request would be rejected",
                                                 app->app_name);
-            LOG_ERROR_F("failed to set max_replica_count: app_name={}, app_id={}, error_code={}, "
-                        "hint_message={}",
-                        app->app_name,
-                        app->app_id,
-                        response.err.to_string(),
-                        response.hint_message);
+            LOG_ERROR("failed to set max_replica_count: app_name={}, app_id={}, error_code={}, "
+                      "hint_message={}",
+                      app->app_name,
+                      app->app_id,
+                      response.err,
+                      response.hint_message);
             return;
         }
     }
@@ -3288,14 +3738,14 @@ void server_state::set_max_replica_count_env_updating(std::shared_ptr<app_state>
     const auto new_max_replica_count = rpc.request().max_replica_count;
     const auto old_max_replica_count = rpc.response().old_max_replica_count;
 
-    LOG_INFO_F("ready to update remote env of max_replica_count: app_name={}, app_id={}, "
-               "old_max_replica_count={}, new_max_replica_count={}, {}={}",
-               app->app_name,
-               app->app_id,
-               old_max_replica_count,
-               new_max_replica_count,
-               replica_envs::UPDATE_MAX_REPLICA_COUNT,
-               app->envs[replica_envs::UPDATE_MAX_REPLICA_COUNT]);
+    LOG_INFO("ready to update remote env of max_replica_count: app_name={}, app_id={}, "
+             "old_max_replica_count={}, new_max_replica_count={}, {}={}",
+             app->app_name,
+             app->app_id,
+             old_max_replica_count,
+             new_max_replica_count,
+             replica_envs::UPDATE_MAX_REPLICA_COUNT,
+             app->envs[replica_envs::UPDATE_MAX_REPLICA_COUNT]);
 
     auto ainfo = *(reinterpret_cast<app_info *>(app.get()));
     ainfo.envs[replica_envs::UPDATE_MAX_REPLICA_COUNT] =
@@ -3321,13 +3771,13 @@ void server_state::set_max_replica_count_env_updating(std::shared_ptr<app_state>
 
             app->envs[replica_envs::UPDATE_MAX_REPLICA_COUNT] =
                 fmt::format("updating;{}", new_max_replica_count);
-            LOG_INFO_F("both remote and local env of max_replica_count have been updated "
-                       "successfully: app_name={}, app_id={}, new_max_replica_count={}, {}={}",
-                       app->app_name,
-                       app->app_id,
-                       new_max_replica_count,
-                       replica_envs::UPDATE_MAX_REPLICA_COUNT,
-                       app->envs[replica_envs::UPDATE_MAX_REPLICA_COUNT]);
+            LOG_INFO("both remote and local env of max_replica_count have been updated "
+                     "successfully: app_name={}, app_id={}, new_max_replica_count={}, {}={}",
+                     app->app_name,
+                     app->app_id,
+                     new_max_replica_count,
+                     replica_envs::UPDATE_MAX_REPLICA_COUNT,
+                     app->envs[replica_envs::UPDATE_MAX_REPLICA_COUNT]);
         }
 
         do_update_max_replica_count(app, rpc);
@@ -3379,7 +3829,7 @@ void server_state::do_update_max_replica_count(std::shared_ptr<app_state> &app,
                   "An error that can't be handled occurs while updating partition-level"
                   "max_replica_count: error_code={}, app_name={}, app_id={}, "
                   "partition_index={}, partition_count={}, new_max_replica_count={}",
-                  ec.to_string(),
+                  ec,
                   app_name,
                   app->app_id,
                   i,
@@ -3387,13 +3837,13 @@ void server_state::do_update_max_replica_count(std::shared_ptr<app_state> &app,
                   new_max_replica_count);
         }
 
-        LOG_INFO_F("all partitions have been changed to the new max_replica_count, ready to update "
-                   "the app-level max_replica_count: app_name={}, app_id={}, partition_count={}, "
-                   "new_max_replica_count={}",
-                   app_name,
-                   app->app_id,
-                   app->partition_count,
-                   new_max_replica_count);
+        LOG_INFO("all partitions have been changed to the new max_replica_count, ready to update "
+                 "the app-level max_replica_count: app_name={}, app_id={}, partition_count={}, "
+                 "new_max_replica_count={}",
+                 app_name,
+                 app->app_id,
+                 app->partition_count,
+                 new_max_replica_count);
 
         update_app_max_replica_count(app, rpc);
     };
@@ -3415,14 +3865,14 @@ void server_state::update_app_max_replica_count(std::shared_ptr<app_state> &app,
     const auto new_max_replica_count = rpc.request().max_replica_count;
     const auto old_max_replica_count = rpc.response().old_max_replica_count;
 
-    LOG_INFO_F("ready to update remote app-level max_replica_count: app_name={}, app_id={}, "
-               "old_max_replica_count={}, new_max_replica_count={}, {}={}",
-               app->app_name,
-               app->app_id,
-               old_max_replica_count,
-               new_max_replica_count,
-               replica_envs::UPDATE_MAX_REPLICA_COUNT,
-               app->envs[replica_envs::UPDATE_MAX_REPLICA_COUNT]);
+    LOG_INFO("ready to update remote app-level max_replica_count: app_name={}, app_id={}, "
+             "old_max_replica_count={}, new_max_replica_count={}, {}={}",
+             app->app_name,
+             app->app_id,
+             old_max_replica_count,
+             new_max_replica_count,
+             replica_envs::UPDATE_MAX_REPLICA_COUNT,
+             app->envs[replica_envs::UPDATE_MAX_REPLICA_COUNT]);
 
     auto ainfo = *(reinterpret_cast<app_info *>(app.get()));
     ainfo.max_replica_count = new_max_replica_count;
@@ -3461,13 +3911,13 @@ void server_state::update_app_max_replica_count(std::shared_ptr<app_state> &app,
 
         app->max_replica_count = new_max_replica_count;
         app->envs.erase(replica_envs::UPDATE_MAX_REPLICA_COUNT);
-        LOG_INFO_F("both remote and local app-level max_replica_count have been updated "
-                   "successfully: app_name={}, app_id={}, old_max_replica_count={}, "
-                   "new_max_replica_count={}",
-                   app->app_name,
-                   app->app_id,
-                   old_max_replica_count,
-                   new_max_replica_count);
+        LOG_INFO("both remote and local app-level max_replica_count have been updated "
+                 "successfully: app_name={}, app_id={}, old_max_replica_count={}, "
+                 "new_max_replica_count={}",
+                 app->app_name,
+                 app->app_id,
+                 old_max_replica_count,
+                 new_max_replica_count);
 
         auto &response = rpc.response();
         response.err = ERR_OK;
@@ -3490,28 +3940,28 @@ void server_state::update_partition_max_replica_count(std::shared_ptr<app_state>
                  app->partition_count,
                  new_max_replica_count);
 
-    const auto &old_partition_config = app->partitions[partition_index];
-    const auto old_max_replica_count = old_partition_config.max_replica_count;
+    const auto &old_pc = app->pcs[partition_index];
+    const auto old_max_replica_count = old_pc.max_replica_count;
 
     if (new_max_replica_count == old_max_replica_count) {
-        LOG_WARNING_F("partition-level max_replica_count has been updated: app_name={}, "
-                      "app_id={}, partition_index={}, new_max_replica_count={}",
-                      app->app_name,
-                      app->app_id,
-                      partition_index,
-                      new_max_replica_count);
+        LOG_WARNING("partition-level max_replica_count has been updated: app_name={}, "
+                    "app_id={}, partition_index={}, new_max_replica_count={}",
+                    app->app_name,
+                    app->app_id,
+                    partition_index,
+                    new_max_replica_count);
         return;
     }
 
     auto &context = app->helpers->contexts[partition_index];
     if (context.stage == config_status::pending_remote_sync) {
-        LOG_INFO_F("have to wait until another request which is syncing with remote storage "
-                   "is finished, then process the current request of updating max_replica_count: "
-                   "app_name={}, app_id={}, partition_index={}, new_max_replica_count={}",
-                   app->app_name,
-                   app->app_id,
-                   partition_index,
-                   new_max_replica_count);
+        LOG_INFO("have to wait until another request which is syncing with remote storage "
+                 "is finished, then process the current request of updating max_replica_count: "
+                 "app_name={}, app_id={}, partition_index={}, new_max_replica_count={}",
+                 app->app_name,
+                 app->app_id,
+                 partition_index,
+                 new_max_replica_count);
 
         tasking::enqueue(
             LPC_META_STATE_HIGH,
@@ -3538,66 +3988,65 @@ void server_state::update_partition_max_replica_count(std::shared_ptr<app_state>
     context.pending_sync_request.reset();
     context.msg = nullptr;
 
-    auto new_partition_config = old_partition_config;
-    new_partition_config.max_replica_count = new_max_replica_count;
-    ++(new_partition_config.ballot);
-    context.pending_sync_task = update_partition_max_replica_count_on_remote(
-        app, new_partition_config, on_partition_updated);
+    auto new_pc = old_pc;
+    new_pc.max_replica_count = new_max_replica_count;
+    ++(new_pc.ballot);
+    context.pending_sync_task =
+        update_partition_max_replica_count_on_remote(app, new_pc, on_partition_updated);
 }
 
 // ThreadPool: THREAD_POOL_META_STATE
-task_ptr server_state::update_partition_max_replica_count_on_remote(
-    std::shared_ptr<app_state> &app,
-    const partition_configuration &new_partition_config,
-    partition_callback on_partition_updated)
+task_ptr
+server_state::update_partition_max_replica_count_on_remote(std::shared_ptr<app_state> &app,
+                                                           const partition_configuration &new_pc,
+                                                           partition_callback on_partition_updated)
 {
-    const auto &gpid = new_partition_config.pid;
+    const auto &gpid = new_pc.pid;
     const auto partition_index = gpid.get_partition_index();
-    const auto new_max_replica_count = new_partition_config.max_replica_count;
-    const auto new_ballot = new_partition_config.ballot;
+    const auto new_max_replica_count = new_pc.max_replica_count;
+    const auto new_ballot = new_pc.ballot;
 
     const auto level = _meta_svc->get_function_level();
     if (level <= meta_function_level::fl_blind) {
-        LOG_WARNING_F("have to wait until meta level becomes more than fl_blind, then process the "
-                      "current request of updating max_replica_count: current_meta_level={}, "
-                      "app_name={}, app_id={}, partition_index={}, new_max_replica_count={}, "
-                      "new_ballot={}",
-                      _meta_function_level_VALUES_TO_NAMES.find(level)->second,
-                      app->app_name,
-                      app->app_id,
-                      partition_index,
-                      new_max_replica_count,
-                      new_ballot);
+        LOG_WARNING("have to wait until meta level becomes more than fl_blind, then process the "
+                    "current request of updating max_replica_count: current_meta_level={}, "
+                    "app_name={}, app_id={}, partition_index={}, new_max_replica_count={}, "
+                    "new_ballot={}",
+                    _meta_function_level_VALUES_TO_NAMES.find(level)->second,
+                    app->app_name,
+                    app->app_id,
+                    partition_index,
+                    new_max_replica_count,
+                    new_ballot);
 
         // NOTICE: pending_sync_task should be reassigned
-        return tasking::enqueue(LPC_META_STATE_HIGH,
-                                tracker(),
-                                [this, app, new_partition_config, on_partition_updated]() mutable {
-                                    const auto &gpid = new_partition_config.pid;
-                                    const auto partition_index = gpid.get_partition_index();
+        return tasking::enqueue(
+            LPC_META_STATE_HIGH,
+            tracker(),
+            [this, app, new_pc, on_partition_updated]() mutable {
+                const auto &gpid = new_pc.pid;
+                const auto partition_index = gpid.get_partition_index();
 
-                                    zauto_write_lock l(_lock);
+                zauto_write_lock l(_lock);
 
-                                    auto &context = app->helpers->contexts[partition_index];
-                                    context.pending_sync_task =
-                                        update_partition_max_replica_count_on_remote(
-                                            app, new_partition_config, on_partition_updated);
-                                },
-                                server_state::sStateHash,
-                                std::chrono::seconds(1));
+                auto &context = app->helpers->contexts[partition_index];
+                context.pending_sync_task =
+                    update_partition_max_replica_count_on_remote(app, new_pc, on_partition_updated);
+            },
+            server_state::sStateHash,
+            std::chrono::seconds(1));
     }
 
-    LOG_INFO_F("request for updating partition-level max_replica_count on remote storage: "
-               "app_name={}, app_id={}, partition_id={}, new_max_replica_count={}, new_ballot={}",
-               app->app_name,
-               app->app_id,
-               partition_index,
-               new_max_replica_count,
-               new_ballot);
+    LOG_INFO("request for updating partition-level max_replica_count on remote storage: "
+             "app_name={}, app_id={}, partition_id={}, new_max_replica_count={}, new_ballot={}",
+             app->app_name,
+             app->app_id,
+             partition_index,
+             new_max_replica_count,
+             new_ballot);
 
     auto partition_path = get_partition_path(gpid);
-    auto json_config =
-        dsn::json::json_forwarder<partition_configuration>::encode(new_partition_config);
+    auto json_config = dsn::json::json_forwarder<partition_configuration>::encode(new_pc);
     return _meta_svc->get_remote_storage()->set_data(
         partition_path,
         json_config,
@@ -3606,7 +4055,7 @@ task_ptr server_state::update_partition_max_replica_count_on_remote(
                   this,
                   std::placeholders::_1,
                   app,
-                  new_partition_config,
+                  new_pc,
                   on_partition_updated),
         tracker());
 }
@@ -3615,45 +4064,44 @@ task_ptr server_state::update_partition_max_replica_count_on_remote(
 void server_state::on_update_partition_max_replica_count_on_remote_reply(
     error_code ec,
     std::shared_ptr<app_state> &app,
-    const partition_configuration &new_partition_config,
+    const partition_configuration &new_pc,
     partition_callback on_partition_updated)
 {
-    const auto &gpid = new_partition_config.pid;
+    const auto &gpid = new_pc.pid;
     const auto partition_index = gpid.get_partition_index();
-    const auto new_max_replica_count = new_partition_config.max_replica_count;
-    const auto new_ballot = new_partition_config.ballot;
+    const auto new_max_replica_count = new_pc.max_replica_count;
+    const auto new_ballot = new_pc.ballot;
 
     zauto_write_lock l(_lock);
 
-    LOG_INFO_F("reply for updating partition-level max_replica_count on remote storage: "
-               "error_code={}, app_name={}, app_id={}, partition_id={}, new_max_replica_count={}, "
-               "new_ballot={}",
-               ec.to_string(),
-               app->app_name,
-               app->app_id,
-               partition_index,
-               new_max_replica_count,
-               new_ballot);
+    LOG_INFO("reply for updating partition-level max_replica_count on remote storage: "
+             "error_code={}, app_name={}, app_id={}, partition_id={}, new_max_replica_count={}, "
+             "new_ballot={}",
+             ec,
+             app->app_name,
+             app->app_id,
+             partition_index,
+             new_max_replica_count,
+             new_ballot);
 
     auto &context = app->helpers->contexts[partition_index];
     if (ec == ERR_TIMEOUT) {
         // NOTICE: pending_sync_task need to be reassigned
-        context.pending_sync_task =
-            tasking::enqueue(LPC_META_STATE_HIGH,
-                             tracker(),
-                             [this, app, new_partition_config, on_partition_updated]() mutable {
-                                 const auto &gpid = new_partition_config.pid;
-                                 const auto partition_index = gpid.get_partition_index();
+        context.pending_sync_task = tasking::enqueue(
+            LPC_META_STATE_HIGH,
+            tracker(),
+            [this, app, new_pc, on_partition_updated]() mutable {
+                const auto &gpid = new_pc.pid;
+                const auto partition_index = gpid.get_partition_index();
 
-                                 zauto_write_lock l(_lock);
+                zauto_write_lock l(_lock);
 
-                                 auto &context = app->helpers->contexts[partition_index];
-                                 context.pending_sync_task =
-                                     update_partition_max_replica_count_on_remote(
-                                         app, new_partition_config, on_partition_updated);
-                             },
-                             server_state::sStateHash,
-                             std::chrono::seconds(1));
+                auto &context = app->helpers->contexts[partition_index];
+                context.pending_sync_task =
+                    update_partition_max_replica_count_on_remote(app, new_pc, on_partition_updated);
+            },
+            server_state::sStateHash,
+            std::chrono::seconds(1));
         return;
     }
 
@@ -3662,7 +4110,7 @@ void server_state::on_update_partition_max_replica_count_on_remote_reply(
         return;
     }
 
-    update_partition_max_replica_count_locally(app, new_partition_config);
+    update_partition_max_replica_count_locally(app, new_pc);
 
     context.pending_sync_task = nullptr;
     context.pending_sync_request.reset();
@@ -3673,17 +4121,17 @@ void server_state::on_update_partition_max_replica_count_on_remote_reply(
 }
 
 // ThreadPool: THREAD_POOL_META_STATE
-void server_state::update_partition_max_replica_count_locally(
-    std::shared_ptr<app_state> &app, const partition_configuration &new_partition_config)
+void server_state::update_partition_max_replica_count_locally(std::shared_ptr<app_state> &app,
+                                                              const partition_configuration &new_pc)
 {
-    const auto &gpid = new_partition_config.pid;
+    const auto &gpid = new_pc.pid;
     const auto partition_index = gpid.get_partition_index();
-    const auto new_max_replica_count = new_partition_config.max_replica_count;
-    const auto new_ballot = new_partition_config.ballot;
+    const auto new_max_replica_count = new_pc.max_replica_count;
+    const auto new_ballot = new_pc.ballot;
 
-    auto &old_partition_config = app->partitions[gpid.get_partition_index()];
-    const auto old_max_replica_count = old_partition_config.max_replica_count;
-    const auto old_ballot = old_partition_config.ballot;
+    auto &old_pc = app->pcs[gpid.get_partition_index()];
+    const auto old_max_replica_count = old_pc.max_replica_count;
+    const auto old_ballot = old_pc.ballot;
 
     CHECK_EQ_MSG(old_ballot + 1,
                  new_ballot,
@@ -3698,19 +4146,19 @@ void server_state::update_partition_max_replica_count_locally(
                  old_ballot,
                  new_ballot);
 
-    std::string old_config_str(boost::lexical_cast<std::string>(old_partition_config));
-    std::string new_config_str(boost::lexical_cast<std::string>(new_partition_config));
+    std::string old_config_str(boost::lexical_cast<std::string>(old_pc));
+    std::string new_config_str(boost::lexical_cast<std::string>(new_pc));
 
-    old_partition_config = new_partition_config;
+    old_pc = new_pc;
 
-    LOG_INFO_F("local partition-level max_replica_count has been changed successfully: ",
-               "app_name={}, app_id={}, partition_id={}, old_partition_config={}, "
-               "new_partition_config={}",
-               app->app_name,
-               app->app_id,
-               partition_index,
-               old_config_str,
-               new_config_str);
+    LOG_INFO("local partition-level max_replica_count has been changed successfully: ",
+             "app_name={}, app_id={}, partition_id={}, old_pc={}, "
+             "new_pc={}",
+             app->app_name,
+             app->app_id,
+             partition_index,
+             old_config_str,
+             new_config_str);
 }
 
 // ThreadPool: THREAD_POOL_META_SERVER
@@ -3774,28 +4222,28 @@ void server_state::recover_all_partitions_max_replica_count(std::shared_ptr<app_
     for (int i = 0; i < app->partition_count; ++i) {
         zauto_read_lock l(_lock);
 
-        auto new_pc = app->partitions[i];
+        auto new_pc = app->pcs[i];
         if (new_pc.max_replica_count == new_max_replica_count) {
-            LOG_WARNING_F("no need to recover partition-level max_replica_count since it has been "
-                          "updated before: app_name={}, app_id={}, partition_index={}, "
-                          "partition_count={}, new_max_replica_count={}",
-                          app->app_name,
-                          app->app_id,
-                          i,
-                          app->partition_count,
-                          new_max_replica_count);
+            LOG_WARNING("no need to recover partition-level max_replica_count since it has been "
+                        "updated before: app_name={}, app_id={}, partition_index={}, "
+                        "partition_count={}, new_max_replica_count={}",
+                        app->app_name,
+                        app->app_id,
+                        i,
+                        app->partition_count,
+                        new_max_replica_count);
             continue;
         }
 
-        LOG_INFO_F("ready to recover partition-level max_replica_count: app_name={}, app_id={}, "
-                   "partition_index={}, partition_count={}, old_max_replica_count={}, "
-                   "new_max_replica_count={}",
-                   app->app_name,
-                   app->app_id,
-                   i,
-                   app->partition_count,
-                   app->max_replica_count,
-                   new_max_replica_count);
+        LOG_INFO("ready to recover partition-level max_replica_count: app_name={}, app_id={}, "
+                 "partition_index={}, partition_count={}, old_max_replica_count={}, "
+                 "new_max_replica_count={}",
+                 app->app_name,
+                 app->app_id,
+                 i,
+                 app->partition_count,
+                 app->max_replica_count,
+                 new_max_replica_count);
 
         new_pc.max_replica_count = new_max_replica_count;
         ++(new_pc.ballot);
@@ -3808,7 +4256,7 @@ void server_state::recover_all_partitions_max_replica_count(std::shared_ptr<app_
             [this, app, i, new_pc](error_code ec) mutable {
                 zauto_write_lock l(_lock);
 
-                auto &old_pc = app->partitions[i];
+                auto &old_pc = app->pcs[i];
                 std::string old_pc_str(boost::lexical_cast<std::string>(old_pc));
                 std::string new_pc_str(boost::lexical_cast<std::string>(new_pc));
 
@@ -3840,15 +4288,15 @@ void server_state::recover_all_partitions_max_replica_count(std::shared_ptr<app_
 
                 old_pc = new_pc;
 
-                LOG_INFO_F("partition-level max_replica_count has been recovered successfully: "
-                           "app_name={}, app_id={}, partition_index={}, partition_count={}, "
-                           "old_partition_config={}, new_partition_config={}",
-                           app->app_name,
-                           app->app_id,
-                           i,
-                           app->partition_count,
-                           old_pc_str,
-                           new_pc_str);
+                LOG_INFO("partition-level max_replica_count has been recovered successfully: "
+                         "app_name={}, app_id={}, partition_index={}, partition_count={}, "
+                         "old_partition_config={}, new_partition_config={}",
+                         app->app_name,
+                         app->app_id,
+                         i,
+                         app->partition_count,
+                         old_pc_str,
+                         new_pc_str);
             },
             &tracker);
     }
@@ -3861,14 +4309,14 @@ void server_state::recover_app_max_replica_count(std::shared_ptr<app_state> &app
 {
     zauto_read_lock l(_lock);
 
-    LOG_INFO_F("ready to recover app-level max_replica_count: app_name={}, app_id={}, "
-               "old_max_replica_count={}, new_max_replica_count={}, {}={}",
-               app->app_name,
-               app->app_id,
-               app->max_replica_count,
-               new_max_replica_count,
-               replica_envs::UPDATE_MAX_REPLICA_COUNT,
-               app->envs[replica_envs::UPDATE_MAX_REPLICA_COUNT]);
+    LOG_INFO("ready to recover app-level max_replica_count: app_name={}, app_id={}, "
+             "old_max_replica_count={}, new_max_replica_count={}, {}={}",
+             app->app_name,
+             app->app_id,
+             app->max_replica_count,
+             new_max_replica_count,
+             replica_envs::UPDATE_MAX_REPLICA_COUNT,
+             app->envs[replica_envs::UPDATE_MAX_REPLICA_COUNT]);
 
     auto ainfo = *(reinterpret_cast<app_info *>(app.get()));
     ainfo.max_replica_count = new_max_replica_count;
@@ -3897,16 +4345,23 @@ void server_state::recover_app_max_replica_count(std::shared_ptr<app_state> &app
             app->max_replica_count = new_max_replica_count;
             app->envs.erase(replica_envs::UPDATE_MAX_REPLICA_COUNT);
 
-            LOG_INFO_F("app-level max_replica_count has been recovered successfully: "
-                       "app_name={}, app_id={}, old_max_replica_count={}, "
-                       "new_max_replica_count={}",
-                       app->app_name,
-                       app->app_id,
-                       old_max_replica_count,
-                       app->max_replica_count);
+            LOG_INFO("app-level max_replica_count has been recovered successfully: "
+                     "app_name={}, app_id={}, old_max_replica_count={}, "
+                     "new_max_replica_count={}",
+                     app->app_name,
+                     app->app_id,
+                     old_max_replica_count,
+                     app->max_replica_count);
         },
         &tracker);
 }
 
-} // namespace replication
-} // namespace dsn
+#undef SUCC_CREATE_APP_RESPONSE
+#undef FAIL_CREATE_APP_RESPONSE
+#undef INIT_CREATE_APP_RESPONSE_WITH_OK
+#undef INIT_CREATE_APP_RESPONSE_WITH_ERR
+
+#undef REPLY_TO_CLIENT_AND_RETURN
+#undef REPLY_TO_CLIENT
+
+} // namespace dsn::replication

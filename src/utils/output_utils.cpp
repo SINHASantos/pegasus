@@ -17,7 +17,12 @@
 
 #include "utils/output_utils.h"
 
-#include "utils/api_utilities.h"
+#include <cstdlib>
+// IWYU pragma: no_include <ext/alloc_traits.h>
+#include <memory>
+
+#include "common/json_helper.h"
+#include "utils/fmt_logging.h"
 
 namespace dsn {
 namespace utils {

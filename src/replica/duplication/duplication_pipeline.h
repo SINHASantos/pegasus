@@ -17,14 +17,21 @@
 
 #pragma once
 
-#include "replica/replica_base.h"
-#include "replica/replica.h"
-#include "replica_duplicator.h"
+#include <memory>
+
+#include "common/replication_other_types.h"
 #include "replica/duplication/mutation_duplicator.h"
+#include "replica/replica_base.h"
 #include "runtime/pipeline.h"
+#include "utils/chrono_literals.h"
+#include "utils/metrics.h"
 
 namespace dsn {
 namespace replication {
+class load_from_private_log;
+class replica;
+class replica_duplicator;
+class replica_stub;
 
 using namespace literals::chrono_literals;
 
@@ -83,7 +90,7 @@ private:
 
     decree _last_decree{invalid_decree};
 
-    perf_counter_wrapper _counter_dup_shipped_bytes_rate;
+    METRIC_VAR_DECLARE_counter(dup_shipped_bytes);
 };
 
 } // namespace replication

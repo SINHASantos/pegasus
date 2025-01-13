@@ -18,11 +18,14 @@
  */
 
 #include "utils/time_utils.h"
-#include <fmt/chrono.h>
-#if FMT_VERSION < 60000
-#include <fmt/time.h> // time.h was removed from fmtlib >=6.x
-#endif
-#include <fmt/printf.h>
+
+// TODO(yingchun): refactor this after libfmt upgraded
+#include <fmt/chrono.h> // IWYU pragma: keep
+// IWYU pragma: no_include <fmt/core.h>
+// IWYU pragma: no_include <fmt/format.h>
+#include <fmt/printf.h> // IWYU pragma: keep
+// IWYU pragma: no_include <algorithm>
+// IWYU pragma: no_include <iterator>
 
 namespace dsn {
 namespace utils {
@@ -31,7 +34,9 @@ namespace utils {
 {
     struct tm tmp;
     auto ret = get_localtime(ts_ms, &tmp);
-    fmt::format_to(str, "{:%Y-%m-%d %H:%M:%S}.{}", *ret, static_cast<uint32_t>(ts_ms % 1000));
+    // NOTE: format_to() does not append a terminating null character, so remember to initialize
+    // str's memory as zero before.
+    fmt::format_to(str, "{:%Y-%m-%d %H:%M:%S}.{:03}", *ret, static_cast<uint32_t>(ts_ms % 1000));
 }
 
 /*extern*/ void time_ms_to_string(uint64_t ts_ms, std::string &str)
@@ -40,7 +45,18 @@ namespace utils {
     struct tm tmp;
     auto ret = get_localtime(ts_ms, &tmp);
     fmt::format_to(std::back_inserter(str),
-                   "{:%Y-%m-%d %H:%M:%S}.{}",
+                   "{:%Y-%m-%d %H:%M:%S}.{:03}",
+                   *ret,
+                   static_cast<uint32_t>(ts_ms % 1000));
+}
+
+/*extern*/ void time_ms_to_sequent_string(uint64_t ts_ms, std::string &str)
+{
+    str.clear();
+    struct tm tmp;
+    auto ret = get_localtime(ts_ms, &tmp);
+    fmt::format_to(std::back_inserter(str),
+                   "{:%Y%m%d_%H%M%S}_{:03}",
                    *ret,
                    static_cast<uint32_t>(ts_ms % 1000));
 }

@@ -24,20 +24,13 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     Replication testing framework.
- *
- * Revision history:
- *     Nov., 2015, @qinzuoyan (Zuoyan Qin), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 
 #include "runtime/tool_api.h"
 
 namespace dsn {
+struct service_spec;
+
 namespace replication {
 namespace test {
 
@@ -47,6 +40,6 @@ public:
     test_injector(const char *name);
     virtual void install(service_spec &spec);
 };
-}
-}
-}
+} // namespace test
+} // namespace replication
+} // namespace dsn

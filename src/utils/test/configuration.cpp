@@ -24,11 +24,19 @@
  * THE SOFTWARE.
  */
 
+#include <stdint.h>
+#include <string.h>
 #include <algorithm>
 #include <fstream>
-#include <gtest/gtest.h>
+#include <limits>
+#include <list>
+#include <memory>
+#include <string>
+#include <vector>
 
+#include "gtest/gtest.h"
 #include "utils/configuration.h"
+#include "utils/string_conv.h"
 
 using namespace ::dsn;
 

@@ -15,15 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <array>
-#include <iostream>
-#include <fstream>
-#include <unistd.h>
+#include <stdio.h>
+#if defined(__linux__)
+#include <syscall.h>
+#else
 #include <sys/syscall.h>
-#include "utils/utils.h"
+#endif
+#include <unistd.h>
+#include <array>
+#include <fstream> // IWYU pragma: keep
+#include <iostream>
+#include <memory>
+#include <string>
+
 #include "utils/preloadable.h"
 #include "utils/process_utils.h"
 #include "utils/time_utils.h"
+
+using std::ifstream;
+using std::ios_base;
+using std::string;
 
 namespace dsn {
 namespace utils {
@@ -49,10 +60,6 @@ int pipe_execute(const char *command, std::ostream &output)
 
 void process_mem_usage(double &vm_usage, double &resident_set)
 {
-    using std::ios_base;
-    using std::ifstream;
-    using std::string;
-
     vm_usage = 0.0;
     resident_set = 0.0;
 
@@ -92,8 +99,8 @@ public:
         mills = get_current_physical_time_ns() / 1000000;
         time_ms_to_string(mills, date_time_mills);
     }
-    uint64_t mills;
-    char date_time_mills[64];
+    uint64_t mills = 0;
+    char date_time_mills[64] = {0};
 };
 
 //
@@ -107,5 +114,5 @@ const char *process_start_date_time_mills()
 {
     return record_process_start_time::s_instance.date_time_mills;
 }
-}
-}
+} // namespace utils
+} // namespace dsn

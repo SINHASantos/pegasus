@@ -1,32 +1,65 @@
 /*
-* The MIT License (MIT)
-*
-* Copyright (c) 2015 Microsoft Corporation
-*
-* -=- Robust Distributed System Nucleus (rDSN) -=-
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files (the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-* THE SOFTWARE.
-*/
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2015 Microsoft Corporation
+ *
+ * -=- Robust Distributed System Nucleus (rDSN) -=-
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
 #include "simple_kv.server.impl.h"
-#include <fstream>
-#include <sstream>
+
+#include <fmt/core.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "aio/aio_task.h"
+#include "aio/file_io.h"
+#include "common/replication.codes.h"
+#include "consensus_types.h"
+#include "rocksdb/env.h"
+#include "rocksdb/slice.h"
+#include "rocksdb/status.h"
+#include "runtime/serverlet.h"
+#include "simple_kv_types.h"
+#include "utils/autoref_ptr.h"
+#include "utils/binary_reader.h"
+#include "utils/blob.h"
+#include "utils/env.h"
 #include "utils/filesystem.h"
+#include "utils/fmt_logging.h"
+#include "utils/utils.h"
+
+// TODO(yingchun): most of the code are the same as
+// src/replica/storage/simple_kv/simple_kv.server.impl.cpp, unify the code!
+namespace dsn {
+
+namespace replication {
+class replica;
+} // namespace replication
+} // namespace dsn
 
 #define VALUE_NOT_EXIST "<<not-exist>>"
 
@@ -45,11 +78,7 @@ simple_kv_service_impl::simple_kv_service_impl(replica *r) : simple_kv_service(r
     LOG_INFO("simple_kv_service_impl inited");
 }
 
-void simple_kv_service_impl::reset_state()
-{
-    _test_file_learning = dsn_config_get_value_bool("test", "test_file_learning", true, "");
-    _last_durable_decree = 0;
-}
+void simple_kv_service_impl::reset_state() { _last_durable_decree = 0; }
 
 // RPC_SIMPLE_KV_READ
 void simple_kv_service_impl::on_read(const std::string &key, ::dsn::rpc_replier<std::string> &reply)
@@ -64,8 +93,6 @@ void simple_kv_service_impl::on_read(const std::string &key, ::dsn::rpc_replier<
         value = it->second;
     }
 
-    // LOG_INFO("=== on_exec_read:int64_t=%" PRId64 ",key=%s,value=%s", last_committed_decree(),
-    // key.c_str(), value.c_str());
     reply(value);
 }
 
@@ -75,8 +102,6 @@ void simple_kv_service_impl::on_write(const kv_pair &pr, ::dsn::rpc_replier<int3
     dsn::zauto_lock l(_lock);
     _store[pr.key] = pr.value;
 
-    // LOG_INFO("=== on_exec_write:int64_t=%" PRId64 ",key=%s,value=%s", last_committed_decree(),
-    // pr.key.c_str(), pr.value.c_str());
     reply(0);
 }
 
@@ -90,8 +115,6 @@ void simple_kv_service_impl::on_append(const kv_pair &pr, ::dsn::rpc_replier<int
     else
         _store[pr.key] = pr.value;
 
-    // LOG_INFO("=== on_exec_append:int64_t=%" PRId64 ",key=%s,value=%s", last_committed_decree(),
-    // pr.key.c_str(), pr.value.c_str());
     reply(0);
 }
 
@@ -121,7 +144,7 @@ void simple_kv_service_impl::on_append(const kv_pair &pr, ::dsn::rpc_replier<int
         _store.clear();
         reset_state();
     }
-    LOG_INFO("simple_kv_service_impl closed, clear_state = %s", clear_state ? "true" : "false");
+    LOG_INFO("simple_kv_service_impl closed, clear_state = {}", clear_state ? "true" : "false");
     return ERR_OK;
 }
 
@@ -157,42 +180,61 @@ void simple_kv_service_impl::recover()
         recover(name, max_version);
         set_last_durable_decree(max_version);
     }
-    LOG_INFO("simple_kv_service_impl recovered, last_durable_decree = %" PRId64 "",
-             last_durable_decree());
+    LOG_INFO("simple_kv_service_impl recovered, last_durable_decree = {}", last_durable_decree());
 }
 
 void simple_kv_service_impl::recover(const std::string &name, int64_t version)
 {
     dsn::zauto_lock l(_lock);
 
-    std::ifstream is(name.c_str(), std::ios::binary);
-    if (!is.is_open())
-        return;
+    std::unique_ptr<rocksdb::SequentialFile> rfile;
+    auto s = dsn::utils::PegasusEnv(dsn::utils::FileDataType::kSensitive)
+                 ->NewSequentialFile(name, &rfile, rocksdb::EnvOptions());
+    CHECK(s.ok(), "open log file '{}' failed, err = {}", name, s.ToString());
 
     _store.clear();
 
-    uint64_t count;
-    int magic;
+    // Read header.
+    uint64_t count = 0;
+    int magic = 0;
+    rocksdb::Slice result;
+    static const uint64_t kHeaderSize = sizeof(count) + sizeof(magic);
+    char buff[kHeaderSize] = {0};
+    s = rfile->Read(kHeaderSize, &result, buff);
+    CHECK(s.ok(), "read header failed, err = {}", s.ToString());
+    CHECK(!result.empty(), "read EOF of file '{}'", name);
 
-    is.read((char *)&count, sizeof(count));
-    is.read((char *)&magic, sizeof(magic));
+    binary_reader reader(blob(buff, 0, kHeaderSize));
+    CHECK_EQ(sizeof(count), reader.read(count));
+    CHECK_EQ(sizeof(magic), reader.read(magic));
     CHECK_EQ_MSG(magic, 0xdeadbeef, "invalid checkpoint");
 
+    // Read kv pairs.
     for (uint64_t i = 0; i < count; i++) {
-        std::string key;
-        std::string value;
+        // Read key.
+        uint32_t sz = 0;
+        s = rfile->Read(sizeof(sz), &result, (char *)&sz);
+        CHECK(s.ok(), "read key size failed, err = {}", s.ToString());
+        CHECK(!result.empty(), "read EOF of file '{}'", name);
 
-        uint32_t sz;
-        is.read((char *)&sz, (uint32_t)sizeof(sz));
-        key.resize(sz);
+        std::shared_ptr<char> key_buffer(dsn::utils::make_shared_array<char>(sz));
+        s = rfile->Read(sz, &result, key_buffer.get());
+        CHECK(s.ok(), "read key failed, err = {}", s.ToString());
+        CHECK(!result.empty(), "read EOF of file '{}'", name);
+        std::string key = result.ToString();
 
-        is.read((char *)&key[0], sz);
+        // Read value.
+        s = rfile->Read(sizeof(sz), &result, (char *)&sz);
+        CHECK(s.ok(), "read value size failed, err = {}", s.ToString());
+        CHECK(!result.empty(), "read EOF of file '{}'", name);
 
-        is.read((char *)&sz, (uint32_t)sizeof(sz));
-        value.resize(sz);
+        std::shared_ptr<char> value_buffer(dsn::utils::make_shared_array<char>(sz));
+        s = rfile->Read(sz, &result, value_buffer.get());
+        CHECK(s.ok(), "read value failed, err = {}", s.ToString());
+        CHECK(!result.empty(), "read EOF of file '{}'", name);
+        std::string value = result.ToString();
 
-        is.read((char *)&value[0], sz);
-
+        // Store the kv pair.
         _store[key] = value;
     }
 }
@@ -204,39 +246,52 @@ void simple_kv_service_impl::recover(const std::string &name, int64_t version)
     int64_t last_commit = last_committed_decree();
     if (last_commit == last_durable_decree()) {
         LOG_INFO("simple_kv_service_impl no need to create checkpoint, "
-                 "checkpoint already the latest, last_durable_decree = %" PRId64 "",
+                 "checkpoint already the latest, last_durable_decree = {}",
                  last_durable_decree());
         return ERR_OK;
     }
 
-    // TODO: should use async write instead
-    char name[256];
-    sprintf(name, "%s/checkpoint.%" PRId64, data_dir().c_str(), last_commit);
-    std::ofstream os(name, std::ios::binary);
+    std::string fname = fmt::format("{}/checkpoint.{}", data_dir(), last_commit);
+    auto wfile = file::open(fname, file::FileOpenType::kWriteOnly);
+    CHECK_NOTNULL(wfile, "");
 
+#define WRITE_DATA_SIZE(data, size)                                                                \
+    do {                                                                                           \
+        auto tsk = ::dsn::file::write(                                                             \
+            wfile, (char *)&data, size, offset, LPC_AIO_IMMEDIATE_CALLBACK, nullptr, nullptr);     \
+        tsk->wait();                                                                               \
+        offset += size;                                                                            \
+    } while (false)
+
+#define WRITE_DATA(data) WRITE_DATA_SIZE(data, sizeof(data))
+
+    uint64_t offset = 0;
     uint64_t count = (uint64_t)_store.size();
+    WRITE_DATA(count);
+
     int magic = 0xdeadbeef;
+    WRITE_DATA(magic);
 
-    os.write((const char *)&count, (uint32_t)sizeof(count));
-    os.write((const char *)&magic, (uint32_t)sizeof(magic));
-
-    for (auto it = _store.begin(); it != _store.end(); ++it) {
-        const std::string &k = it->first;
+    for (const auto &kv : _store) {
+        const std::string &k = kv.first;
         uint32_t sz = (uint32_t)k.length();
+        WRITE_DATA(sz);
+        WRITE_DATA_SIZE(k[0], sz);
 
-        os.write((const char *)&sz, (uint32_t)sizeof(sz));
-        os.write((const char *)&k[0], sz);
-
-        const std::string &v = it->second;
+        const std::string &v = kv.second;
         sz = (uint32_t)v.length();
-
-        os.write((const char *)&sz, (uint32_t)sizeof(sz));
-        os.write((const char *)&v[0], sz);
+        WRITE_DATA(sz);
+        WRITE_DATA_SIZE(v[0], sz);
     }
+#undef WRITE_DATA
+#undef WRITE_DATA_SIZE
+
+    CHECK_EQ(ERR_OK, file::flush(wfile));
+    CHECK_EQ(ERR_OK, file::close(wfile));
 
     set_last_durable_decree(last_commit);
     LOG_INFO("simple_kv_service_impl create checkpoint succeed, "
-             "last_durable_decree = %" PRId64 "",
+             "last_durable_decree = {}",
              last_durable_decree());
     return ERR_OK;
 }
@@ -267,7 +322,7 @@ void simple_kv_service_impl::recover(const std::string &name, int64_t version)
         state.to_decree_included = last_durable_decree();
         state.files.push_back(std::string(name));
 
-        LOG_INFO("simple_kv_service_impl get checkpoint succeed, last_durable_decree = %" PRId64 "",
+        LOG_INFO("simple_kv_service_impl get checkpoint succeed, last_durable_decree = {}",
                  last_durable_decree());
         return ERR_OK;
     } else {
@@ -287,8 +342,6 @@ void simple_kv_service_impl::recover(const std::string &name, int64_t version)
 
     if (mode == replication_app_base::chkpt_apply_mode::learn) {
         recover(state.files[0], state.to_decree_included);
-        // LOG_INFO("simple_kv_service_impl learn checkpoint succeed, last_committed_decree = %"
-        // PRId64 "", last_committed_decree());
         return ERR_OK;
     } else {
         CHECK_EQ_MSG(replication_app_base::chkpt_apply_mode::copy, mode, "invalid mode");
@@ -303,13 +356,12 @@ void simple_kv_service_impl::recover(const std::string &name, int64_t version)
             return ERR_CHECKPOINT_FAILED;
         } else {
             set_last_durable_decree(state.to_decree_included);
-            LOG_INFO(
-                "simple_kv_service_impl copy checkpoint succeed, last_durable_decree = %" PRId64 "",
-                last_durable_decree());
+            LOG_INFO("simple_kv_service_impl copy checkpoint succeed, last_durable_decree = {}",
+                     last_durable_decree());
             return ERR_OK;
         }
     }
 }
-}
-}
-}
+} // namespace test
+} // namespace replication
+} // namespace dsn

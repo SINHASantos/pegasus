@@ -19,25 +19,30 @@
 
 #pragma once
 
-#include "runtime/task/task_code.h"
+#include <functional>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+
+#include "fmt/core.h"
+#include "http/http_method.h"
+#include "http/http_status_code.h"
+#include "task/task_code.h"
 #include "utils/blob.h"
 #include "utils/errors.h"
 #include "utils/flags.h"
-
-namespace dsn {
+#include "utils/threadpool_code.h"
 
 DSN_DECLARE_bool(enable_http_server);
+
+namespace dsn {
 
 /// The rpc code for all the HTTP RPCs.
 DEFINE_TASK_CODE_RPC(RPC_HTTP_SERVICE, TASK_PRIORITY_COMMON, THREAD_POOL_DEFAULT);
 
-enum http_method
-{
-    HTTP_METHOD_GET = 1,
-    HTTP_METHOD_POST = 2,
-};
-
 class message_ex;
+
 struct http_request
 {
     static error_with<http_request> parse(dsn::message_ex *m);
@@ -50,21 +55,10 @@ struct http_request
     http_method method;
 };
 
-enum class http_status_code
-{
-    ok,                    // 200
-    temporary_redirect,    // 307
-    bad_request,           // 400
-    not_found,             // 404
-    internal_server_error, // 500
-};
-
-extern std::string http_status_code_to_string(http_status_code code);
-
 struct http_response
 {
     std::string body;
-    http_status_code status_code{http_status_code::ok};
+    http_status_code status_code{http_status_code::kOk};
     std::string content_type = "text/plain";
     std::string location;
 };
@@ -83,9 +77,10 @@ struct http_call
         callback = std::move(cb);
         return *this;
     }
-    http_call &with_help(std::string hp)
+    http_call &with_help(std::string hp) { return with_help("", std::move(hp)); }
+    http_call &with_help(std::string parameters, std::string hp)
     {
-        help = std::move(hp);
+        help = fmt::format("{}{}{}", parameters, parameters.empty() ? "" : ". ", hp);
         return *this;
     }
 };
@@ -96,11 +91,24 @@ struct http_call
 class http_service
 {
 public:
+    http_service() noexcept = default;
     virtual ~http_service() = default;
 
     virtual std::string path() const = 0;
 
-    void register_handler(std::string sub_path, http_callback cb, std::string help);
+    void register_handler(std::string sub_path, http_callback cb, std::string help) const;
+
+    void register_handler(std::string sub_path,
+                          http_callback cb,
+                          std::string parameters,
+                          std::string help) const;
+
+    void deregister_handler(std::string sub_path) const;
+
+private:
+    // If sub_path is 'app/duplication', the built path would be '<root_path>/app/duplication',
+    // where path() would be called as root_path.
+    std::string get_rel_path(const std::string &sub_path) const;
 };
 
 class http_server_base : public http_service
@@ -115,7 +123,8 @@ public:
                                        this,
                                        std::placeholders::_1,
                                        std::placeholders::_2),
-                             "ip:port/updateConfig?<key>=<value>");
+                             "<key>=<new_value>",
+                             "Update the config to the new value.");
         });
     }
 
@@ -135,10 +144,12 @@ protected:
 //                              this,
 //                              std::placeholders::_1,
 //                              std::placeholders::_2))
-//     .with_help("Gets the app information")
+//     .with_help("Gets the app information.")
 //     .add_argument("app_name", HTTP_ARG_STRING);
 // ```
 extern http_call &register_http_call(std::string full_path);
+
+extern void deregister_http_call(const std::string &full_path);
 
 // Starts serving HTTP requests.
 // The internal HTTP server will reuse the rDSN server port.

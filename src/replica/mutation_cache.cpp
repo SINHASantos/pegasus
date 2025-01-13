@@ -25,7 +25,12 @@
  */
 
 #include "mutation_cache.h"
+
+// IWYU pragma: no_include <ext/alloc_traits.h>
+#include "consensus_types.h"
 #include "mutation.h"
+#include "utils/autoref_ptr.h"
+#include "utils/fmt_logging.h"
 
 namespace dsn {
 namespace replication {
@@ -142,5 +147,5 @@ mutation_ptr mutation_cache::get_mutation_by_decree(decree decree)
     else
         return _array[(_start_idx + (decree - _start_decree) + _max_count) % _max_count];
 }
-}
-} // namespace end
+} // namespace replication
+} // namespace dsn

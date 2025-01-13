@@ -17,8 +17,10 @@
 
 #include "uri_decoder.h"
 
-#include <fmt/format.h>
+#include <stddef.h>
 
+#include "fmt/core.h"
+#include "utils/error_code.h"
 #include "utils/fmt_logging.h"
 
 namespace dsn {
@@ -38,7 +40,7 @@ error_with<char> from_hex(const char c)
     }
 }
 
-error_with<char> decode_char(const string_view &hex)
+error_with<char> decode_char(const std::string_view &hex)
 {
     CHECK_EQ(2, hex.size());
 
@@ -51,7 +53,7 @@ error_with<char> decode_char(const string_view &hex)
     return error_s::make(ERR_INVALID_PARAMETERS);
 }
 
-error_with<std::string> decode(const string_view &encoded_uri)
+error_with<std::string> decode(const std::string_view &encoded_uri)
 {
     std::string decoded_uri;
     for (size_t i = 0; i < encoded_uri.size(); ++i) {
@@ -62,7 +64,7 @@ error_with<std::string> decode(const string_view &encoded_uri)
                                      "Encountered partial escape sequence at end of string");
             }
 
-            const string_view encoded_char(encoded_uri.data() + i + 1, 2);
+            const std::string_view encoded_char(encoded_uri.data() + i + 1, 2);
             auto decoded_char = decode_char(encoded_char);
             if (!decoded_char.is_ok()) {
                 return error_s::make(

@@ -25,20 +25,15 @@
  */
 
 #include <gtest/gtest.h>
+#include <chrono>
+#include <string>
+#include <thread>
+#include <vector>
 
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
+#include "common/replication_common.h"
 #include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
-#include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
-#include "runtime/serverlet.h"
 #include "runtime/service_app.h"
-#include "runtime/rpc/rpc_address.h"
+#include "utils/error_code.h"
 
 int g_test_count = 0;
 int g_test_ret = 0;
@@ -62,7 +57,8 @@ GTEST_API_ int main(int argc, char **argv)
 {
     testing::InitGoogleTest(&argc, argv);
 
-    dsn::service_app::register_factory<gtest_app>("replica");
+    dsn::service_app::register_factory<gtest_app>(
+        dsn::replication::replication_options::kReplicaAppType.c_str());
 
     dsn_run_config("config-test.ini", false);
     while (g_test_count == 0) {

@@ -24,29 +24,25 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     Replication testing framework.
- *
- * Revision history:
- *     Nov., 2015, @qinzuoyan (Zuoyan Qin), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 
-#include "runtime/service_app.h"
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "meta_admin_types.h"
-#include "partition_split_types.h"
-#include "duplication_types.h"
-#include "bulk_load_types.h"
-#include "backup_types.h"
-#include "consensus_types.h"
-#include "replica_admin_types.h"
-#include "replica/storage/simple_kv/simple_kv.client.h"
+#include "rpc/rpc_host_port.h"
+#include "runtime/service_app.h"
+#include "task/task_tracker.h"
+#include "utils/error_code.h"
 
 namespace dsn {
+
 namespace replication {
+namespace application {
+class simple_kv_client;
+} // namespace application
+
 namespace test {
 
 class simple_kv_client_app : public ::dsn::service_app
@@ -62,16 +58,16 @@ public:
 
     void begin_read(int id, const std::string &key, int timeout_ms);
     void begin_write(int id, const std::string &key, const std::string &value, int timeout_ms);
-    void send_config_to_meta(const rpc_address &receiver,
+    void send_config_to_meta(const host_port &receiver,
                              dsn::replication::config_type::type type,
-                             const rpc_address &node);
+                             const host_port &node);
 
 private:
     std::unique_ptr<application::simple_kv_client> _simple_kv_client;
-    rpc_address _meta_server_group;
-    rpc_address _service_addr;
+    host_port _meta_server_group;
+    host_port _service_addr;
     dsn::task_tracker _tracker;
 };
-}
-}
-}
+} // namespace test
+} // namespace replication
+} // namespace dsn

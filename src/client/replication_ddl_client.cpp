@@ -26,61 +26,124 @@
 
 #include "replication_ddl_client.h"
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/socket.h>
-
+// IWYU pragma: no_include <ext/alloc_traits.h>
+#include <string.h>
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <type_traits>
 
-#include <boost/lexical_cast.hpp>
-#include "utils/fmt_logging.h"
+#include "backup_types.h"
 #include "common//duplication_common.h"
-#include "common/replication_other_types.h"
-#include "runtime/rpc/group_address.h"
-#include "utils/error_code.h"
-#include "utils/output_utils.h"
-#include <fmt/format.h>
-#include "utils/time_utils.h"
-
-#include "common/replication_common.h"
+#include "common/backup_common.h"
 #include "common/bulk_load_common.h"
-#include "common/partition_split_common.h"
+#include "common/gpid.h"
 #include "common/manual_compact.h"
+#include "common/partition_split_common.h"
+#include "common/replication.codes.h"
+#include "common/replication_common.h"
+#include "common/replication_enums.h"
+#include "fmt/core.h"
+#include "fmt/format.h"
 #include "meta/meta_rpc_types.h"
+#include "rpc/group_host_port.h"
+#include "rpc/rpc_address.h"
+#include "runtime/api_layer1.h"
+#include "utils/error_code.h"
+#include "utils/fmt_logging.h"
+#include "utils/output_utils.h"
+#include "utils/time_utils.h"
+#include "utils/utils.h"
+
+DSN_DEFINE_uint32(ddl_client,
+                  ddl_client_max_attempt_count,
+                  3,
+                  "The max count that attempt for failed requests to meta server.");
+DSN_DEFINE_validator(ddl_client_max_attempt_count,
+                     [](uint32_t value) -> bool { return value > 0; });
+
+DSN_DEFINE_uint32(ddl_client,
+                  ddl_client_retry_interval_ms,
+                  10 * 1000,
+                  "The retry interval after receiving error from meta server.");
 
 namespace dsn {
 namespace replication {
 
 using tp_output_format = ::dsn::utils::table_printer::output_format;
 
-replication_ddl_client::replication_ddl_client(const std::vector<dsn::rpc_address> &meta_servers)
+error_s replication_ddl_client::validate_app_name(const std::string &app_name,
+                                                  bool allow_empty_name)
+{
+    if ((app_name.empty() && !allow_empty_name) ||
+        !std::all_of(app_name.cbegin(), app_name.cend(), [](const char c) {
+            return static_cast<bool>(std::isalnum(c)) || c == '_' || c == '.' || c == ':';
+        })) {
+        return FMT_ERR(ERR_INVALID_PARAMETERS, "Invalid name: Only 0-9a-zA-Z.:_ are valid.");
+    }
+
+    return error_s::ok();
+}
+
+replication_ddl_client::replication_ddl_client(const std::vector<dsn::host_port> &meta_servers)
 {
     _meta_server.assign_group("meta-servers");
     for (const auto &m : meta_servers) {
-        if (!_meta_server.group_address()->add(m)) {
-            LOG_WARNING_F("duplicate adress {}", m);
+        if (!_meta_server.group_host_port()->add(m)) {
+            LOG_WARNING("duplicate address {}", m);
         }
     }
 }
 
 replication_ddl_client::~replication_ddl_client() { _tracker.cancel_outstanding_tasks(); }
 
+void replication_ddl_client::set_meta_servers_leader()
+{
+    auto req = std::make_shared<configuration_cluster_info_request>();
+
+    auto resp_task = request_meta(RPC_CM_CLUSTER_INFO, req);
+    resp_task->wait();
+    if (resp_task->error() != dsn::ERR_OK) {
+        LOG_ERROR("get cluster_info failed!");
+        return;
+    }
+
+    configuration_cluster_info_response resp;
+    ::dsn::unmarshall(resp_task->get_response(), resp);
+    if (resp.err != dsn::ERR_OK) {
+        LOG_ERROR("get cluster_info failed!");
+        return;
+    }
+
+    for (int i = 0; i < resp.keys.size(); i++) {
+        if (resp.keys[i] == "primary_meta_server") {
+            auto hp = host_port::from_string(resp.values[i]);
+            if (_meta_server.group_host_port()->contains(hp)) {
+                _meta_server.group_host_port()->set_leader(hp);
+            } else {
+                LOG_ERROR("meta_servers not contains {}", hp);
+            }
+            break;
+        }
+    }
+}
+
 dsn::error_code replication_ddl_client::wait_app_ready(const std::string &app_name,
                                                        int partition_count,
                                                        int max_replica_count)
 {
-    int sleep_sec = 2;
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::seconds(sleep_sec));
+    do {
+        uint32_t one_step_wait_sec = std::min(_max_wait_secs, 2U);
+        std::this_thread::sleep_for(std::chrono::seconds(one_step_wait_sec));
+        _max_wait_secs -= one_step_wait_sec;
 
-        std::shared_ptr<configuration_query_by_index_request> query_req(
-            new configuration_query_by_index_request());
+        auto query_req = std::make_shared<query_cfg_request>();
         query_req->app_name = app_name;
 
-        auto query_task = request_meta<configuration_query_by_index_request>(
-            RPC_CM_QUERY_PARTITION_CONFIG_BY_INDEX, query_req);
+        auto query_task = request_meta(RPC_CM_QUERY_PARTITION_CONFIG_BY_INDEX, query_req);
         query_task->wait();
         if (query_task->error() == ERR_INVALID_STATE) {
             std::cout << app_name << " not ready yet, still waiting..." << std::endl;
@@ -89,24 +152,22 @@ dsn::error_code replication_ddl_client::wait_app_ready(const std::string &app_na
 
         if (query_task->error() != dsn::ERR_OK) {
             std::cout << "create app " << app_name
-                      << " failed: [query] call server error: " << query_task->error().to_string()
-                      << std::endl;
+                      << " failed: [query] call server error: " << query_task->error() << std::endl;
             return query_task->error();
         }
 
-        dsn::configuration_query_by_index_response query_resp;
+        dsn::query_cfg_response query_resp;
         ::dsn::unmarshall(query_task->get_response(), query_resp);
         if (query_resp.err != dsn::ERR_OK) {
             std::cout << "create app " << app_name
-                      << " failed: [query] received server error: " << query_resp.err.to_string()
-                      << std::endl;
+                      << " failed: [query] received server error: " << query_resp.err << std::endl;
             return query_resp.err;
         }
         CHECK_EQ(partition_count, query_resp.partition_count);
         int ready_count = 0;
         for (int i = 0; i < partition_count; i++) {
-            const partition_configuration &pc = query_resp.partitions[i];
-            if (!pc.primary.is_invalid() && (pc.secondaries.size() + 1 >= max_replica_count)) {
+            const auto &pc = query_resp.partitions[i];
+            if (pc.hp_primary && (pc.hp_secondaries.size() + 1 >= max_replica_count)) {
                 ready_count++;
             }
         }
@@ -117,7 +178,8 @@ dsn::error_code replication_ddl_client::wait_app_ready(const std::string &app_na
         }
         std::cout << app_name << " not ready yet, still waiting... (" << ready_count << "/"
                   << partition_count << ")" << std::endl;
-    }
+    } while (_max_wait_secs > 0);
+
     return dsn::ERR_OK;
 }
 
@@ -126,7 +188,8 @@ dsn::error_code replication_ddl_client::create_app(const std::string &app_name,
                                                    int partition_count,
                                                    int replica_count,
                                                    const std::map<std::string, std::string> &envs,
-                                                   bool is_stateless)
+                                                   bool is_stateless,
+                                                   bool success_if_exist)
 {
     if (partition_count < 1) {
         std::cout << "create app " << app_name << " failed: partition_count should >= 1"
@@ -139,46 +202,30 @@ dsn::error_code replication_ddl_client::create_app(const std::string &app_name,
         return ERR_INVALID_PARAMETERS;
     }
 
-    if (app_name.empty() ||
-        !std::all_of(app_name.cbegin(),
-                     app_name.cend(),
-                     (bool (*)(int))replication_ddl_client::valid_app_char)) {
-        std::cout << "create app " << app_name << " failed: invalid app_name" << std::endl;
-        return ERR_INVALID_PARAMETERS;
-    }
+    RETURN_EC_NOT_OK_MSG(validate_app_name(app_name), "invalid app_name: '{}'", app_name);
+    RETURN_EC_NOT_OK_MSG(validate_app_name(app_type), "invalid app_type: '{}'", app_type);
 
-    if (app_type.empty() ||
-        !std::all_of(app_type.cbegin(),
-                     app_type.cend(),
-                     (bool (*)(int))replication_ddl_client::valid_app_char)) {
-        std::cout << "create app " << app_name << " failed: invalid app_type" << std::endl;
-        return ERR_INVALID_PARAMETERS;
-    }
-
-    std::shared_ptr<configuration_create_app_request> req(new configuration_create_app_request());
+    auto req = std::make_shared<configuration_create_app_request>();
     req->app_name = app_name;
     req->options.partition_count = partition_count;
     req->options.replica_count = replica_count;
-    req->options.success_if_exist = true;
+    req->options.success_if_exist = success_if_exist;
     req->options.app_type = app_type;
     req->options.envs = envs;
     req->options.is_stateful = !is_stateless;
 
-    auto resp_task = request_meta<configuration_create_app_request>(RPC_CM_CREATE_APP, req);
-    resp_task->wait();
+    dsn::replication::configuration_create_app_response resp;
+    auto resp_task = request_meta_and_wait_response(RPC_CM_CREATE_APP, req, resp);
+
     if (resp_task->error() != dsn::ERR_OK) {
         std::cout << "create app " << app_name
-                  << " failed: [create] call server error: " << resp_task->error().to_string()
-                  << std::endl;
+                  << " failed: [create] call server error: " << resp_task->error() << std::endl;
         return resp_task->error();
     }
 
-    dsn::replication::configuration_create_app_response resp;
-    ::dsn::unmarshall(resp_task->get_response(), resp);
     if (resp.err != dsn::ERR_OK) {
         std::cout << "create app " << app_name
-                  << " failed: [create] received server error: " << resp.err.to_string()
-                  << std::endl;
+                  << " failed: [create] received server error: " << resp.err << std::endl;
         return resp.err;
     }
 
@@ -192,52 +239,46 @@ dsn::error_code replication_ddl_client::create_app(const std::string &app_name,
 
 dsn::error_code replication_ddl_client::drop_app(const std::string &app_name, int reserve_seconds)
 {
-    if (app_name.empty() ||
-        !std::all_of(app_name.cbegin(),
-                     app_name.cend(),
-                     (bool (*)(int))replication_ddl_client::valid_app_char))
-        return ERR_INVALID_PARAMETERS;
+    RETURN_EC_NOT_OK_MSG(validate_app_name(app_name), "invalid app_name: '{}'", app_name);
 
-    std::shared_ptr<configuration_drop_app_request> req(new configuration_drop_app_request());
+    auto req = std::make_shared<configuration_drop_app_request>();
     req->app_name = app_name;
     req->options.success_if_not_exist = true;
     req->options.__set_reserve_seconds(reserve_seconds);
 
-    auto resp_task = request_meta<configuration_drop_app_request>(RPC_CM_DROP_APP, req);
-    resp_task->wait();
+    dsn::replication::configuration_drop_app_response resp;
+    auto resp_task = request_meta_and_wait_response(RPC_CM_DROP_APP, req, resp);
+
     if (resp_task->error() != dsn::ERR_OK) {
         return resp_task->error();
     }
 
-    dsn::replication::configuration_drop_app_response resp;
-    ::dsn::unmarshall(resp_task->get_response(), resp);
     if (resp.err != dsn::ERR_OK) {
         return resp.err;
     }
+
     return dsn::ERR_OK;
 }
 
 dsn::error_code replication_ddl_client::recall_app(int32_t app_id, const std::string &new_app_name)
 {
-    if (!std::all_of(new_app_name.cbegin(),
-                     new_app_name.cend(),
-                     (bool (*)(int))replication_ddl_client::valid_app_char))
-        return ERR_INVALID_PARAMETERS;
-
-    std::shared_ptr<configuration_recall_app_request> req =
-        std::make_shared<configuration_recall_app_request>();
+    RETURN_EC_NOT_OK_MSG(
+        validate_app_name(new_app_name, true), "invalid new_app_name: '{}'", new_app_name);
+    auto req = std::make_shared<configuration_recall_app_request>();
     req->app_id = app_id;
     req->new_app_name = new_app_name;
 
-    auto resp_task = request_meta<configuration_recall_app_request>(RPC_CM_RECALL_APP, req);
-    resp_task->wait();
-    if (resp_task->error() != dsn::ERR_OK)
-        return resp_task->error();
-
     dsn::replication::configuration_recall_app_response resp;
-    dsn::unmarshall(resp_task->get_response(), resp);
-    if (resp.err != dsn::ERR_OK)
+    auto resp_task = request_meta_and_wait_response(RPC_CM_RECALL_APP, req, resp);
+
+    if (resp_task->error() != dsn::ERR_OK) {
+        return resp_task->error();
+    }
+
+    if (resp.err != dsn::ERR_OK) {
         return resp.err;
+    }
+
     std::cout << "recall app ok, id(" << resp.info.app_id << "), "
               << "name(" << resp.info.app_name << "), "
               << "partition_count(" << resp.info.partition_count << "), wait it ready" << std::endl;
@@ -248,10 +289,10 @@ dsn::error_code replication_ddl_client::recall_app(int32_t app_id, const std::st
 dsn::error_code replication_ddl_client::list_apps(const dsn::app_status::type status,
                                                   std::vector<::dsn::app_info> &apps)
 {
-    std::shared_ptr<configuration_list_apps_request> req(new configuration_list_apps_request());
+    auto req = std::make_shared<configuration_list_apps_request>();
     req->status = status;
 
-    auto resp_task = request_meta<configuration_list_apps_request>(RPC_CM_LIST_APPS, req);
+    auto resp_task = request_meta(RPC_CM_LIST_APPS, req);
     resp_task->wait();
     if (resp_task->error() != dsn::ERR_OK) {
         return resp_task->error();
@@ -325,10 +366,10 @@ dsn::error_code replication_ddl_client::list_apps(const dsn::app_status::type st
         status_str = status_str.substr(status_str.find("AS_") + 3);
         std::string create_time = "-";
         if (info.create_second > 0) {
-            char buf[20];
-            dsn::utils::time_ms_to_date_time((uint64_t)info.create_second * 1000, buf, 20);
-            buf[10] = '_';
-            create_time = buf;
+            char ts_buf[20] = {0};
+            dsn::utils::time_ms_to_date_time((uint64_t)info.create_second * 1000, ts_buf, 20);
+            ts_buf[10] = '_';
+            create_time = ts_buf;
         }
         std::string drop_time = "-";
         std::string drop_expire_time = "-";
@@ -336,16 +377,16 @@ dsn::error_code replication_ddl_client::list_apps(const dsn::app_status::type st
             available_app_count++;
         } else if (info.status == app_status::AS_DROPPED && info.expire_second > 0) {
             if (info.drop_second > 0) {
-                char buf[20];
-                dsn::utils::time_ms_to_date_time((uint64_t)info.drop_second * 1000, buf, 20);
-                buf[10] = '_';
-                drop_time = buf;
+                char ts_buf[20] = {0};
+                dsn::utils::time_ms_to_date_time((uint64_t)info.drop_second * 1000, ts_buf, 20);
+                ts_buf[10] = '_';
+                drop_time = ts_buf;
             }
             if (info.expire_second > 0) {
-                char buf[20];
-                dsn::utils::time_ms_to_date_time((uint64_t)info.expire_second * 1000, buf, 20);
-                buf[10] = '_';
-                drop_expire_time = buf;
+                char ts_buf[20] = {0};
+                dsn::utils::time_ms_to_date_time((uint64_t)info.expire_second * 1000, ts_buf, 20);
+                ts_buf[10] = '_';
+                drop_expire_time = ts_buf;
             }
         }
         tp_general.add_row(info.app_id);
@@ -381,10 +422,10 @@ dsn::error_code replication_ddl_client::list_apps(const dsn::app_status::type st
             }
             int32_t app_id;
             int32_t partition_count;
-            std::vector<partition_configuration> partitions;
-            r = list_app(info.app_name, app_id, partition_count, partitions);
+            std::vector<partition_configuration> pcs;
+            r = list_app(info.app_name, app_id, partition_count, pcs);
             if (r != dsn::ERR_OK) {
-                LOG_ERROR("list app(%s) failed, err = %s", info.app_name.c_str(), r.to_string());
+                LOG_ERROR("list app({}) failed, err = {}", info.app_name, r);
                 return r;
             }
             CHECK_EQ(info.app_id, app_id);
@@ -392,18 +433,18 @@ dsn::error_code replication_ddl_client::list_apps(const dsn::app_status::type st
             int fully_healthy = 0;
             int write_unhealthy = 0;
             int read_unhealthy = 0;
-            for (int i = 0; i < partitions.size(); i++) {
-                const dsn::partition_configuration &p = partitions[i];
+            for (const auto &pc : pcs) {
                 int replica_count = 0;
-                if (!p.primary.is_invalid()) {
+                if (pc.hp_primary) {
                     replica_count++;
                 }
-                replica_count += p.secondaries.size();
-                if (!p.primary.is_invalid()) {
-                    if (replica_count >= p.max_replica_count)
+                replica_count += pc.hp_secondaries.size();
+                if (pc.hp_primary) {
+                    if (replica_count >= pc.max_replica_count) {
                         fully_healthy++;
-                    else if (replica_count < 2)
+                    } else if (replica_count < 2) {
                         write_unhealthy++;
+                    }
                 } else {
                     write_unhealthy++;
                     read_unhealthy++;
@@ -440,6 +481,7 @@ dsn::error_code replication_ddl_client::list_apps(const dsn::app_status::type st
     }
     mtp.add(std::move(tp_count));
 
+    // TODO(wangdan): use dsn::utils::output() in output_utils.h instead.
     mtp.output(out, json ? tp_output_format::kJsonPretty : tp_output_format::kTabular);
 
     return dsn::ERR_OK;
@@ -447,11 +489,11 @@ dsn::error_code replication_ddl_client::list_apps(const dsn::app_status::type st
 
 dsn::error_code replication_ddl_client::list_nodes(
     const dsn::replication::node_status::type status,
-    std::map<dsn::rpc_address, dsn::replication::node_status::type> &nodes)
+    std::map<dsn::host_port, dsn::replication::node_status::type> &nodes)
 {
-    std::shared_ptr<configuration_list_nodes_request> req(new configuration_list_nodes_request());
+    auto req = std::make_shared<configuration_list_nodes_request>();
     req->status = status;
-    auto resp_task = request_meta<configuration_list_nodes_request>(RPC_CM_LIST_NODES, req);
+    auto resp_task = request_meta(RPC_CM_LIST_NODES, req);
     resp_task->wait();
     if (resp_task->error() != dsn::ERR_OK) {
         return resp_task->error();
@@ -463,8 +505,10 @@ dsn::error_code replication_ddl_client::list_nodes(
         return resp.err;
     }
 
-    for (const dsn::replication::node_info &n : resp.infos) {
-        nodes[n.address] = n.status;
+    for (const auto &n : resp.infos) {
+        host_port hp;
+        GET_HOST_PORT(n, node, hp);
+        nodes[hp] = n.status;
     }
 
     return dsn::ERR_OK;
@@ -482,14 +526,13 @@ struct list_nodes_helper
     }
 };
 
-std::string host_name_resolve(bool resolve_ip, std::string value)
+std::string replication_ddl_client::node_name(const host_port &hp, bool resolve_ip)
 {
-    if (resolve_ip) {
-        std::string temp;
-        if (dsn::utils::hostname_from_ip_port(value.c_str(), &temp))
-            return temp;
+    if (!resolve_ip) {
+        return hp.to_string();
     }
-    return value;
+
+    return dns_resolver::instance().resolve_address(hp).to_string();
 }
 
 dsn::error_code replication_ddl_client::list_nodes(const dsn::replication::node_status::type status,
@@ -497,22 +540,21 @@ dsn::error_code replication_ddl_client::list_nodes(const dsn::replication::node_
                                                    const std::string &file_name,
                                                    bool resolve_ip)
 {
-    std::map<dsn::rpc_address, dsn::replication::node_status::type> nodes;
+    std::map<dsn::host_port, dsn::replication::node_status::type> nodes;
     auto r = list_nodes(status, nodes);
     if (r != dsn::ERR_OK) {
         return r;
     }
 
-    std::map<dsn::rpc_address, list_nodes_helper> tmp_map;
+    std::map<dsn::host_port, list_nodes_helper> tmp_map;
     int alive_node_count = 0;
-    for (auto &kv : nodes) {
-        if (kv.second == dsn::replication::node_status::NS_ALIVE)
+    for (const auto &[hp, type] : nodes) {
+        if (type == dsn::replication::node_status::NS_ALIVE) {
             alive_node_count++;
-        std::string status_str = enum_to_string(kv.second);
+        }
+        std::string status_str = enum_to_string(type);
         status_str = status_str.substr(status_str.find("NS_") + 3);
-        tmp_map.emplace(
-            kv.first,
-            list_nodes_helper(host_name_resolve(resolve_ip, kv.first.to_std_string()), status_str));
+        tmp_map.emplace(hp, list_nodes_helper(node_name(hp, resolve_ip), status_str));
     }
 
     if (detailed) {
@@ -525,22 +567,21 @@ dsn::error_code replication_ddl_client::list_nodes(const dsn::replication::node_
         for (auto &app : apps) {
             int32_t app_id;
             int32_t partition_count;
-            std::vector<partition_configuration> partitions;
-            r = list_app(app.app_name, app_id, partition_count, partitions);
+            std::vector<partition_configuration> pcs;
+            r = list_app(app.app_name, app_id, partition_count, pcs);
             if (r != dsn::ERR_OK) {
                 return r;
             }
 
-            for (int i = 0; i < partitions.size(); i++) {
-                const dsn::partition_configuration &p = partitions[i];
-                if (!p.primary.is_invalid()) {
-                    auto find = tmp_map.find(p.primary);
+            for (const auto &pc : pcs) {
+                if (pc.hp_primary) {
+                    auto find = tmp_map.find(pc.hp_primary);
                     if (find != tmp_map.end()) {
                         find->second.primary_count++;
                     }
                 }
-                for (int j = 0; j < p.secondaries.size(); j++) {
-                    auto find = tmp_map.find(p.secondaries[j]);
+                for (const auto &secondary : pc.hp_secondaries) {
+                    auto find = tmp_map.find(secondary);
                     if (find != tmp_map.end()) {
                         find->second.secondary_count++;
                     }
@@ -594,11 +635,9 @@ dsn::error_code replication_ddl_client::list_nodes(const dsn::replication::node_
 
 dsn::error_code replication_ddl_client::cluster_name(int64_t timeout_ms, std::string &cluster_name)
 {
-    std::shared_ptr<configuration_cluster_info_request> req(
-        new configuration_cluster_info_request());
+    auto req = std::make_shared<configuration_cluster_info_request>();
 
-    auto resp_task =
-        request_meta<configuration_cluster_info_request>(RPC_CM_CLUSTER_INFO, req, timeout_ms);
+    auto resp_task = request_meta(RPC_CM_CLUSTER_INFO, req, timeout_ms);
     resp_task->wait();
     if (resp_task->error() != dsn::ERR_OK) {
         return resp_task->error();
@@ -623,10 +662,9 @@ dsn::error_code replication_ddl_client::cluster_name(int64_t timeout_ms, std::st
 dsn::error_code
 replication_ddl_client::cluster_info(const std::string &file_name, bool resolve_ip, bool json)
 {
-    std::shared_ptr<configuration_cluster_info_request> req(
-        new configuration_cluster_info_request());
+    auto req = std::make_shared<configuration_cluster_info_request>();
 
-    auto resp_task = request_meta<configuration_cluster_info_request>(RPC_CM_CLUSTER_INFO, req);
+    auto resp_task = request_meta(RPC_CM_CLUSTER_INFO, req);
     resp_task->wait();
     if (resp_task->error() != dsn::ERR_OK) {
         return resp_task->error();
@@ -652,10 +690,8 @@ replication_ddl_client::cluster_info(const std::string &file_name, bool resolve_
 
     if (resolve_ip) {
         for (int i = 0; i < resp.keys.size(); ++i) {
-            if (resp.keys[i] == "meta_servers") {
-                dsn::utils::list_hostname_from_ip_port(resp.values[i].c_str(), &resp.values[i]);
-            } else if (resp.keys[i] == "primary_meta_server") {
-                dsn::utils::hostname_from_ip_port(resp.values[i].c_str(), &resp.values[i]);
+            if (resp.keys[i] == "meta_servers" || resp.keys[i] == "primary_meta_server") {
+                resp.values[i] = dns_resolver::ip_ports_from_host_ports(resp.values[i]);
             }
         }
     }
@@ -687,16 +723,16 @@ dsn::error_code replication_ddl_client::list_app(const std::string &app_name,
     int32_t app_id = 0;
     int32_t partition_count = 0;
     int32_t max_replica_count = 0;
-    std::vector<partition_configuration> partitions;
-    dsn::error_code err = list_app(app_name, app_id, partition_count, partitions);
+    std::vector<partition_configuration> pcs;
+    dsn::error_code err = list_app(app_name, app_id, partition_count, pcs);
     if (err != dsn::ERR_OK) {
         return err;
     }
-    if (!partitions.empty()) {
-        max_replica_count = partitions[0].max_replica_count;
+    if (!pcs.empty()) {
+        max_replica_count = pcs[0].max_replica_count;
     }
 
-    // print configuration_query_by_index_response
+    // print query_cfg_response
     std::streambuf *buf;
     std::ofstream of;
 
@@ -722,50 +758,40 @@ dsn::error_code replication_ddl_client::list_app(const std::string &app_name,
         tp_details.add_column("replica_count");
         tp_details.add_column("primary");
         tp_details.add_column("secondaries");
-        std::map<rpc_address, std::pair<int, int>> node_stat;
+        std::map<host_port, std::pair<int, int>> node_stat;
 
         int total_prim_count = 0;
         int total_sec_count = 0;
         int fully_healthy = 0;
         int write_unhealthy = 0;
         int read_unhealthy = 0;
-        for (const auto &p : partitions) {
+        for (const auto &pc : pcs) {
             int replica_count = 0;
-            if (!p.primary.is_invalid()) {
+            if (pc.hp_primary) {
                 replica_count++;
-                node_stat[p.primary].first++;
+                node_stat[pc.hp_primary].first++;
                 total_prim_count++;
             }
-            replica_count += p.secondaries.size();
-            total_sec_count += p.secondaries.size();
-            if (!p.primary.is_invalid()) {
-                if (replica_count >= p.max_replica_count)
+            replica_count += pc.hp_secondaries.size();
+            total_sec_count += pc.hp_secondaries.size();
+            if (pc.hp_primary) {
+                if (replica_count >= pc.max_replica_count) {
                     fully_healthy++;
-                else if (replica_count < 2)
+                } else if (replica_count < 2) {
                     write_unhealthy++;
+                }
             } else {
                 write_unhealthy++;
                 read_unhealthy++;
             }
-            tp_details.add_row(p.pid.get_partition_index());
-            tp_details.append_data(p.ballot);
-            std::stringstream oss;
-            oss << replica_count << "/" << p.max_replica_count;
-            tp_details.append_data(oss.str());
-            tp_details.append_data(
-                (p.primary.is_invalid() ? "-" : host_name_resolve(resolve_ip,
-                                                                  p.primary.to_std_string())));
-            oss.str("");
-            oss << "[";
-            // TODO (yingchun) join
-            for (int j = 0; j < p.secondaries.size(); j++) {
-                if (j != 0)
-                    oss << ",";
-                oss << host_name_resolve(resolve_ip, p.secondaries[j].to_std_string());
-                node_stat[p.secondaries[j]].second++;
+            for (const auto &secondary : pc.hp_secondaries) {
+                node_stat[secondary].second++;
             }
-            oss << "]";
-            tp_details.append_data(oss.str());
+            tp_details.add_row(pc.pid.get_partition_index());
+            tp_details.append_data(pc.ballot);
+            tp_details.append_data(fmt::format("{}/{}", replica_count, pc.max_replica_count));
+            tp_details.append_data(pc.hp_primary ? pc.hp_primary.to_string() : "-");
+            tp_details.append_data(fmt::format("[{}]", fmt::join(pc.hp_secondaries, ",")));
         }
         mtp.add(std::move(tp_details));
 
@@ -775,11 +801,11 @@ dsn::error_code replication_ddl_client::list_app(const std::string &app_name,
         tp_nodes.add_column("primary");
         tp_nodes.add_column("secondary");
         tp_nodes.add_column("total");
-        for (auto &kv : node_stat) {
-            tp_nodes.add_row(host_name_resolve(resolve_ip, kv.first.to_std_string()));
-            tp_nodes.append_data(kv.second.first);
-            tp_nodes.append_data(kv.second.second);
-            tp_nodes.append_data(kv.second.first + kv.second.second);
+        for (const auto &[hp, pri_and_sec_rep_cnts] : node_stat) {
+            tp_nodes.add_row(node_name(hp, resolve_ip));
+            tp_nodes.append_data(pri_and_sec_rep_cnts.first);
+            tp_nodes.append_data(pri_and_sec_rep_cnts.second);
+            tp_nodes.append_data(pri_and_sec_rep_cnts.first + pri_and_sec_rep_cnts.second);
         }
         tp_nodes.add_row("");
         tp_nodes.append_data(total_prim_count);
@@ -803,27 +829,21 @@ dsn::error_code replication_ddl_client::list_app(const std::string &app_name,
 dsn::error_code replication_ddl_client::list_app(const std::string &app_name,
                                                  int32_t &app_id,
                                                  int32_t &partition_count,
-                                                 std::vector<partition_configuration> &partitions)
+                                                 std::vector<partition_configuration> &pcs)
 {
-    if (app_name.empty() ||
-        !std::all_of(app_name.cbegin(),
-                     app_name.cend(),
-                     (bool (*)(int))replication_ddl_client::valid_app_char))
-        return ERR_INVALID_PARAMETERS;
+    RETURN_EC_NOT_OK_MSG(validate_app_name(app_name), "invalid app_name: '{}'", app_name);
 
-    std::shared_ptr<configuration_query_by_index_request> req(
-        new configuration_query_by_index_request());
+    auto req = std::make_shared<query_cfg_request>();
     req->app_name = app_name;
 
-    auto resp_task = request_meta<configuration_query_by_index_request>(
-        RPC_CM_QUERY_PARTITION_CONFIG_BY_INDEX, req);
+    auto resp_task = request_meta(RPC_CM_QUERY_PARTITION_CONFIG_BY_INDEX, req);
 
     resp_task->wait();
     if (resp_task->error() != dsn::ERR_OK) {
         return resp_task->error();
     }
 
-    dsn::configuration_query_by_index_response resp;
+    dsn::query_cfg_response resp;
     dsn::unmarshall(resp_task->get_response(), resp);
     if (resp.err != dsn::ERR_OK) {
         return resp.err;
@@ -831,7 +851,7 @@ dsn::error_code replication_ddl_client::list_app(const std::string &app_name,
 
     app_id = resp.app_id;
     partition_count = resp.partition_count;
-    partitions = resp.partitions;
+    pcs = resp.partitions;
 
     return dsn::ERR_OK;
 }
@@ -839,11 +859,10 @@ dsn::error_code replication_ddl_client::list_app(const std::string &app_name,
 dsn::replication::configuration_meta_control_response
 replication_ddl_client::control_meta_function_level(meta_function_level::type level)
 {
-    std::shared_ptr<configuration_meta_control_request> req =
-        std::make_shared<configuration_meta_control_request>();
+    auto req = std::make_shared<configuration_meta_control_request>();
     req->level = level;
 
-    auto response_task = request_meta<configuration_meta_control_request>(RPC_CM_CONTROL_META, req);
+    auto response_task = request_meta(RPC_CM_CONTROL_META, req);
     response_task->wait();
     configuration_meta_control_response resp;
     if (response_task->error() != dsn::ERR_OK) {
@@ -857,10 +876,9 @@ replication_ddl_client::control_meta_function_level(meta_function_level::type le
 dsn::error_code
 replication_ddl_client::send_balancer_proposal(const configuration_balancer_request &request)
 {
-    std::shared_ptr<configuration_balancer_request> req =
-        std::make_shared<configuration_balancer_request>(request);
+    auto req = std::make_shared<configuration_balancer_request>(request);
 
-    auto response_task = request_meta<configuration_balancer_request>(RPC_CM_PROPOSE_BALANCER, req);
+    auto response_task = request_meta(RPC_CM_PROPOSE_BALANCER, req);
     response_task->wait();
     if (response_task->error() != dsn::ERR_OK)
         return response_task->error();
@@ -869,7 +887,7 @@ replication_ddl_client::send_balancer_proposal(const configuration_balancer_requ
     return resp.err;
 }
 
-dsn::error_code replication_ddl_client::do_recovery(const std::vector<rpc_address> &replica_nodes,
+dsn::error_code replication_ddl_client::do_recovery(const std::vector<host_port> &replica_nodes,
                                                     int wait_seconds,
                                                     bool skip_bad_nodes,
                                                     bool skip_lost_partitions,
@@ -886,21 +904,23 @@ dsn::error_code replication_ddl_client::do_recovery(const std::vector<rpc_addres
     }
     std::ostream out(buf);
 
-    std::shared_ptr<configuration_recovery_request> req =
-        std::make_shared<configuration_recovery_request>();
-    req->recovery_set.clear();
-    for (const dsn::rpc_address &node : replica_nodes) {
-        if (std::find(req->recovery_set.begin(), req->recovery_set.end(), node) !=
-            req->recovery_set.end()) {
-            out << "duplicate replica node " << node.to_string() << ", just ingore it" << std::endl;
+    auto req = std::make_shared<configuration_recovery_request>();
+    CLEAR_IP_AND_HOST_PORT(*req, recovery_nodes);
+    for (const auto &node : replica_nodes) {
+        if (utils::contains(req->hp_recovery_nodes, node)) {
+            out << "duplicate replica node " << node << ", just ingore it" << std::endl;
         } else {
-            req->recovery_set.push_back(node);
+            ADD_IP_AND_HOST_PORT_BY_DNS(*req, recovery_nodes, node);
         }
     }
-    if (req->recovery_set.empty()) {
+    if (req->hp_recovery_nodes.empty()) {
+        CHECK(req->recovery_nodes.empty(),
+              "recovery_nodes should be set together with hp_recovery_nodes");
         out << "node set for recovery it empty" << std::endl;
         return ERR_INVALID_PARAMETERS;
     }
+    CHECK(!req->recovery_nodes.empty(),
+          "recovery_nodes should be set together with hp_recovery_nodes");
     req->skip_bad_nodes = skip_bad_nodes;
     req->skip_lost_partitions = skip_lost_partitions;
 
@@ -909,13 +929,12 @@ dsn::error_code replication_ddl_client::do_recovery(const std::vector<rpc_addres
     out << "Skip lost partitions: " << (skip_lost_partitions ? "true" : "false") << std::endl;
     out << "Node list:" << std::endl;
     out << "=============================" << std::endl;
-    for (auto &node : req->recovery_set) {
-        out << node.to_string() << std::endl;
+    for (auto &node : req->hp_recovery_nodes) {
+        out << node << std::endl;
     }
     out << "=============================" << std::endl;
 
-    auto response_task = request_meta<configuration_recovery_request>(
-        RPC_CM_START_RECOVERY, req, wait_seconds * 1000);
+    auto response_task = request_meta(RPC_CM_START_RECOVERY, req, wait_seconds * 1000);
     bool wait_done = false;
     for (int i = 0; i < wait_seconds; ++i) {
         wait_done = response_task->wait(1000);
@@ -932,7 +951,7 @@ dsn::error_code replication_ddl_client::do_recovery(const std::vector<rpc_addres
     } else {
         configuration_recovery_response resp;
         dsn::unmarshall(response_task->get_response(), resp);
-        out << "Recover result: " << resp.err.to_string() << std::endl;
+        out << "Recover result: " << resp.err << std::endl;
         if (!resp.hint_message.empty()) {
             out << "=============================" << std::endl;
             out << resp.hint_message;
@@ -952,24 +971,12 @@ dsn::error_code replication_ddl_client::do_restore(const std::string &backup_pro
                                                    bool skip_bad_partition,
                                                    const std::string &restore_path)
 {
-    if (old_app_name.empty() ||
-        !std::all_of(old_app_name.cbegin(),
-                     old_app_name.cend(),
-                     (bool (*)(int))replication_ddl_client::valid_app_char)) {
-        std::cout << "restore app " << old_app_name << " failed: invalid old_app_name" << std::endl;
-        return ERR_INVALID_PARAMETERS;
-    }
+    RETURN_EC_NOT_OK_MSG(
+        validate_app_name(old_app_name), "invalid old_app_name: '{}'", old_app_name);
+    RETURN_EC_NOT_OK_MSG(
+        validate_app_name(new_app_name), "invalid new_app_name: '{}'", new_app_name);
 
-    if (new_app_name.empty() ||
-        !std::all_of(new_app_name.cbegin(),
-                     new_app_name.cend(),
-                     (bool (*)(int))replication_ddl_client::valid_app_char)) {
-        std::cout << "restore app " << new_app_name << " failed: invalid new_app_name" << std::endl;
-        return ERR_INVALID_PARAMETERS;
-    }
-
-    std::shared_ptr<configuration_restore_request> req =
-        std::make_shared<configuration_restore_request>();
+    auto req = std::make_shared<configuration_restore_request>();
 
     req->cluster_name = cluster_name;
     req->policy_name = policy_name;
@@ -984,7 +991,7 @@ dsn::error_code replication_ddl_client::do_restore(const std::string &backup_pro
         std::cout << "restore app from the specified path : " << restore_path << std::endl;
     }
 
-    auto resp_task = request_meta<configuration_restore_request>(RPC_CM_START_RESTORE, req);
+    auto resp_task = request_meta(RPC_CM_START_RESTORE, req);
     bool finish = false;
     while (!finish) {
         std::cout << "sleep 1 second to wait complete..." << std::endl;
@@ -1013,16 +1020,14 @@ dsn::error_code replication_ddl_client::add_backup_policy(const std::string &pol
                                                           int32_t backup_history_cnt,
                                                           const std::string &start_time)
 {
-    std::shared_ptr<configuration_add_backup_policy_request> req =
-        std::make_shared<configuration_add_backup_policy_request>();
+    auto req = std::make_shared<configuration_add_backup_policy_request>();
     req->policy_name = policy_name;
     req->backup_provider_type = backup_provider_type;
     req->app_ids = app_ids;
     req->backup_interval_seconds = backup_interval_seconds;
     req->backup_history_count_to_keep = backup_history_cnt;
     req->start_time = start_time;
-    auto resp_task =
-        request_meta<configuration_add_backup_policy_request>(RPC_CM_ADD_BACKUP_POLICY, req);
+    auto resp_task = request_meta(RPC_CM_ADD_BACKUP_POLICY, req);
     resp_task->wait();
 
     if (resp_task->error() != ERR_OK) {
@@ -1033,6 +1038,7 @@ dsn::error_code replication_ddl_client::add_backup_policy(const std::string &pol
     ::dsn::unmarshall(resp_task->get_response(), resp);
 
     if (resp.err != ERR_OK) {
+        std::cout << "add backup policy failed: " << resp.hint_message << std::endl;
         return resp.err;
     } else {
         std::cout << "add backup policy succeed, policy_name = " << policy_name << std::endl;
@@ -1043,7 +1049,8 @@ dsn::error_code replication_ddl_client::add_backup_policy(const std::string &pol
 error_with<start_backup_app_response> replication_ddl_client::backup_app(
     int32_t app_id, const std::string &backup_provider_type, const std::string &backup_path)
 {
-    auto req = make_unique<start_backup_app_request>();
+    set_meta_servers_leader();
+    auto req = std::make_unique<start_backup_app_request>();
     req->app_id = app_id;
     req->backup_provider_type = backup_provider_type;
     if (!backup_path.empty()) {
@@ -1055,7 +1062,7 @@ error_with<start_backup_app_response> replication_ddl_client::backup_app(
 error_with<query_backup_status_response> replication_ddl_client::query_backup(int32_t app_id,
                                                                               int64_t backup_id)
 {
-    auto req = make_unique<query_backup_status_request>();
+    auto req = std::make_unique<query_backup_status_request>();
     req->app_id = app_id;
 
     if (backup_id > 0) {
@@ -1064,15 +1071,15 @@ error_with<query_backup_status_response> replication_ddl_client::query_backup(in
     return call_rpc_sync(query_backup_status_rpc(std::move(req), RPC_CM_QUERY_BACKUP_STATUS));
 }
 
-dsn::error_code replication_ddl_client::disable_backup_policy(const std::string &policy_name)
+dsn::error_code replication_ddl_client::disable_backup_policy(const std::string &policy_name,
+                                                              bool force)
 {
-    std::shared_ptr<configuration_modify_backup_policy_request> req =
-        std::make_shared<configuration_modify_backup_policy_request>();
+    auto req = std::make_shared<configuration_modify_backup_policy_request>();
     req->policy_name = policy_name;
     req->__set_is_disable(true);
+    req->__set_force_disable(force);
 
-    auto resp_task =
-        request_meta<configuration_modify_backup_policy_request>(RPC_CM_MODIFY_BACKUP_POLICY, req);
+    auto resp_task = request_meta(RPC_CM_MODIFY_BACKUP_POLICY, req);
 
     resp_task->wait();
     if (resp_task->error() != ERR_OK) {
@@ -1082,9 +1089,10 @@ dsn::error_code replication_ddl_client::disable_backup_policy(const std::string 
     configuration_modify_backup_policy_response resp;
     ::dsn::unmarshall(resp_task->get_response(), resp);
     if (resp.err != ERR_OK) {
+        std::cout << "disable backup policy failed: " << resp.hint_message << std::endl;
         return resp.err;
     } else {
-        std::cout << "disable policy result: " << resp.err.to_string() << std::endl;
+        std::cout << "disable policy result: " << resp.err << std::endl;
         if (!resp.hint_message.empty()) {
             std::cout << "=============================" << std::endl;
             std::cout << resp.hint_message << std::endl;
@@ -1096,13 +1104,11 @@ dsn::error_code replication_ddl_client::disable_backup_policy(const std::string 
 
 dsn::error_code replication_ddl_client::enable_backup_policy(const std::string &policy_name)
 {
-    std::shared_ptr<configuration_modify_backup_policy_request> req =
-        std::make_shared<configuration_modify_backup_policy_request>();
+    auto req = std::make_shared<configuration_modify_backup_policy_request>();
     req->policy_name = policy_name;
     req->__set_is_disable(false);
 
-    auto resp_task =
-        request_meta<configuration_modify_backup_policy_request>(RPC_CM_MODIFY_BACKUP_POLICY, req);
+    auto resp_task = request_meta(RPC_CM_MODIFY_BACKUP_POLICY, req);
 
     resp_task->wait();
     if (resp_task->error() != ERR_OK) {
@@ -1112,12 +1118,13 @@ dsn::error_code replication_ddl_client::enable_backup_policy(const std::string &
     configuration_modify_backup_policy_response resp;
     ::dsn::unmarshall(resp_task->get_response(), resp);
     if (resp.err != ERR_OK) {
+        std::cout << "enable backup policy failed: " << resp.hint_message << std::endl;
         return resp.err;
     } else if (resp.err == ERR_BUSY) {
         std::cout << "policy is under backup, please try disable later" << std::endl;
         return ERR_OK;
     } else {
-        std::cout << "enable policy result: " << resp.err.to_string() << std::endl;
+        std::cout << "enable policy result: " << resp.err << std::endl;
         if (!resp.hint_message.empty()) {
             std::cout << "=============================" << std::endl;
             std::cout << resp.hint_message << std::endl;
@@ -1127,41 +1134,19 @@ dsn::error_code replication_ddl_client::enable_backup_policy(const std::string &
     }
 }
 
-// help functions
-
-// TODO (yingchun) use join
-template <typename T>
-// make sure T support cout << T;
-std::string print_set(const std::set<T> &set)
+static dsn::utils::table_printer print_policy_entry(const policy_entry &entry)
 {
-    std::stringstream ss;
-    ss << "{";
-    auto begin = set.begin();
-    auto end = set.end();
-    for (auto it = begin; it != end; it++) {
-        if (it != begin) {
-            ss << ", ";
-        }
-        ss << *it;
-    }
-    ss << "}";
-    return ss.str();
+    dsn::utils::table_printer tp(entry.policy_name);
+    tp.add_row_name_and_data("backup_provider_type", entry.backup_provider_type);
+    tp.add_row_name_and_data("backup_interval", entry.backup_interval_seconds + "s");
+    tp.add_row_name_and_data("app_ids", fmt::format("{{{}}}", fmt::join(entry.app_ids, ", ")));
+    tp.add_row_name_and_data("start_time", entry.start_time);
+    tp.add_row_name_and_data("status", entry.is_disable ? "disabled" : "enabled");
+    tp.add_row_name_and_data("backup_history_count", entry.backup_history_count_to_keep);
+    return tp;
 }
 
-static void print_policy_entry(const policy_entry &entry)
-{
-    dsn::utils::table_printer tp;
-    tp.add_row_name_and_data("    name", entry.policy_name);
-    tp.add_row_name_and_data("    backup_provider_type", entry.backup_provider_type);
-    tp.add_row_name_and_data("    backup_interval", entry.backup_interval_seconds + "s");
-    tp.add_row_name_and_data("    app_ids", print_set(entry.app_ids));
-    tp.add_row_name_and_data("    start_time", entry.start_time);
-    tp.add_row_name_and_data("    status", entry.is_disable ? "disabled" : "enabled");
-    tp.add_row_name_and_data("    backup_history_count", entry.backup_history_count_to_keep);
-    tp.output(std::cout);
-}
-
-static void print_backup_entry(const backup_entry &bentry)
+static void print_backup_entry(dsn::utils::table_printer &tp, const backup_entry &bentry)
 {
     char start_time[30] = {'\0'};
     char end_time[30] = {'\0'};
@@ -1173,23 +1158,19 @@ static void print_backup_entry(const backup_entry &bentry)
         ::dsn::utils::time_ms_to_date_time(bentry.end_time_ms, end_time, 30);
     }
 
-    dsn::utils::table_printer tp;
-    tp.add_row_name_and_data("    id", bentry.backup_id);
-    tp.add_row_name_and_data("    start_time", start_time);
-    tp.add_row_name_and_data("    end_time", end_time);
-    tp.add_row_name_and_data("    app_ids", print_set(bentry.app_ids));
-    tp.output(std::cout);
+    tp.add_row(bentry.backup_id);
+    tp.append_data(start_time);
+    tp.append_data(end_time);
+    tp.append_data(fmt::format("{{{}}}", fmt::join(bentry.app_ids, ", ")));
 }
 
-dsn::error_code replication_ddl_client::ls_backup_policy()
+dsn::error_code replication_ddl_client::ls_backup_policy(bool json)
 {
-    std::shared_ptr<configuration_query_backup_policy_request> req =
-        std::make_shared<configuration_query_backup_policy_request>();
+    auto req = std::make_shared<configuration_query_backup_policy_request>();
     req->policy_names.clear();
     req->backup_info_count = 0;
 
-    auto resp_task =
-        request_meta<configuration_query_backup_policy_request>(RPC_CM_QUERY_BACKUP_POLICY, req);
+    auto resp_task = request_meta(RPC_CM_QUERY_BACKUP_POLICY, req);
     resp_task->wait();
 
     if (resp_task->error() != ERR_OK) {
@@ -1198,29 +1179,32 @@ dsn::error_code replication_ddl_client::ls_backup_policy()
     configuration_query_backup_policy_response resp;
     ::dsn::unmarshall(resp_task->get_response(), resp);
 
+    std::streambuf *buf;
+    std::ofstream of;
+    buf = std::cout.rdbuf();
+    std::ostream out(buf);
+
     if (resp.err != ERR_OK) {
         return resp.err;
     } else {
+        dsn::utils::multi_table_printer mtp;
         for (int32_t idx = 0; idx < resp.policys.size(); idx++) {
-            std::cout << "[" << idx + 1 << "]" << std::endl;
-            print_policy_entry(resp.policys[idx]);
-            std::cout << std::endl;
+            dsn::utils::table_printer tp = print_policy_entry(resp.policys[idx]);
+            mtp.add(std::move(tp));
         }
+        mtp.output(out, json ? tp_output_format::kJsonPretty : tp_output_format::kTabular);
     }
     return ERR_OK;
 }
 
-dsn::error_code
-replication_ddl_client::query_backup_policy(const std::vector<std::string> &policy_names,
-                                            int backup_info_cnt)
+dsn::error_code replication_ddl_client::query_backup_policy(
+    const std::vector<std::string> &policy_names, int backup_info_cnt, bool json)
 {
-    std::shared_ptr<configuration_query_backup_policy_request> req =
-        std::make_shared<configuration_query_backup_policy_request>();
+    auto req = std::make_shared<configuration_query_backup_policy_request>();
     req->policy_names = policy_names;
     req->backup_info_count = backup_info_cnt;
 
-    auto resp_task =
-        request_meta<configuration_query_backup_policy_request>(RPC_CM_QUERY_BACKUP_POLICY, req);
+    auto resp_task = request_meta(RPC_CM_QUERY_BACKUP_POLICY, req);
     resp_task->wait();
 
     if (resp_task->error() != ERR_OK) {
@@ -1230,23 +1214,32 @@ replication_ddl_client::query_backup_policy(const std::vector<std::string> &poli
     configuration_query_backup_policy_response resp;
     ::dsn::unmarshall(resp_task->get_response(), resp);
 
+    std::streambuf *buf;
+    std::ofstream of;
+    buf = std::cout.rdbuf();
+    std::ostream out(buf);
+
     if (resp.err != ERR_OK) {
         return resp.err;
     } else {
+        dsn::utils::multi_table_printer mtp;
         for (int32_t idx = 0; idx < resp.policys.size(); idx++) {
-            if (idx != 0) {
-                std::cout << "************************" << std::endl;
-            }
             const policy_entry &pentry = resp.policys[idx];
-            std::cout << "policy_info:" << std::endl;
-            print_policy_entry(pentry);
-            std::cout << std::endl << "backup_infos:" << std::endl;
+            dsn::utils::table_printer tp_policy = print_policy_entry(pentry);
+            mtp.add(std::move(tp_policy));
             const std::vector<backup_entry> &backup_infos = resp.backup_infos[idx];
-            for (int idx = 0; idx < backup_infos.size(); idx++) {
-                std::cout << "[" << (idx + 1) << "]" << std::endl;
-                print_backup_entry(backup_infos[idx]);
+            dsn::utils::table_printer tp_backup(pentry.policy_name + "_" +
+                                                cold_backup_constant::BACKUP_INFO);
+            tp_backup.add_title("id");
+            tp_backup.add_column("start_time");
+            tp_backup.add_column("end_time");
+            tp_backup.add_column("app_ids");
+            for (int bi_idx = 0; bi_idx < backup_infos.size(); bi_idx++) {
+                print_backup_entry(tp_backup, backup_infos[bi_idx]);
             }
+            mtp.add(std::move(tp_backup));
         }
+        mtp.output(out, json ? tp_output_format::kJsonPretty : tp_output_format::kTabular);
     }
     return ERR_OK;
 }
@@ -1259,8 +1252,7 @@ replication_ddl_client::update_backup_policy(const std::string &policy_name,
                                              int32_t backup_history_count_to_keep,
                                              const std::string &start_time)
 {
-    std::shared_ptr<configuration_modify_backup_policy_request> req =
-        std::make_shared<configuration_modify_backup_policy_request>();
+    auto req = std::make_shared<configuration_modify_backup_policy_request>();
     req->policy_name = policy_name;
     if (!add_appids.empty()) {
         req->__set_add_appids(add_appids);
@@ -1279,8 +1271,7 @@ replication_ddl_client::update_backup_policy(const std::string &policy_name,
     if (!start_time.empty()) {
         req->__set_start_time(start_time);
     }
-    auto resp_task =
-        request_meta<configuration_modify_backup_policy_request>(RPC_CM_MODIFY_BACKUP_POLICY, req);
+    auto resp_task = request_meta(RPC_CM_MODIFY_BACKUP_POLICY, req);
     resp_task->wait();
 
     if (resp_task->error() != ERR_OK) {
@@ -1290,9 +1281,10 @@ replication_ddl_client::update_backup_policy(const std::string &policy_name,
     configuration_modify_backup_policy_response resp;
     ::dsn::unmarshall(resp_task->get_response(), resp);
     if (resp.err != ERR_OK) {
+        std::cout << "modify backup policy failed: " << resp.hint_message << std::endl;
         return resp.err;
     } else {
-        std::cout << "Modify policy result: " << resp.err.to_string() << std::endl;
+        std::cout << "Modify policy result: " << resp.err << std::endl;
         if (!resp.hint_message.empty()) {
             std::cout << "=============================" << std::endl;
             std::cout << resp.hint_message << std::endl;
@@ -1307,12 +1299,10 @@ dsn::error_code replication_ddl_client::query_restore(int32_t restore_app_id, bo
     if (restore_app_id <= 0) {
         return ERR_INVALID_PARAMETERS;
     }
-    std::shared_ptr<configuration_query_restore_request> req =
-        std::make_shared<configuration_query_restore_request>();
+    auto req = std::make_shared<configuration_query_restore_request>();
     req->restore_app_id = restore_app_id;
 
-    auto resp_task =
-        request_meta<configuration_query_restore_request>(RPC_CM_QUERY_RESTORE_STATUS, req);
+    auto resp_task = request_meta(RPC_CM_QUERY_RESTORE_STATUS, req);
 
     resp_task->wait();
 
@@ -1324,8 +1314,8 @@ dsn::error_code replication_ddl_client::query_restore(int32_t restore_app_id, bo
     ::dsn::unmarshall(resp_task->get_response(), response);
     if (response.err == ERR_OK) {
         int overall_progress = 0;
-        for (const auto &p : response.restore_progress) {
-            overall_progress += p;
+        for (const auto &progress : response.restore_progress) {
+            overall_progress += progress;
         }
         overall_progress = overall_progress / response.restore_progress.size();
         overall_progress = overall_progress / 10;
@@ -1368,73 +1358,120 @@ dsn::error_code replication_ddl_client::query_restore(int32_t restore_app_id, bo
     } else if (response.err == ERR_APP_DROPPED) {
         std::cout << "restore failed, because some partition's data is damaged on cold backup media"
                   << std::endl;
+    } else {
+        return response.err;
     }
     return ERR_OK;
 }
 
-error_with<duplication_add_response> replication_ddl_client::add_dup(
-    std::string app_name, std::string remote_cluster_name, bool is_duplicating_checkpoint)
+error_with<duplication_add_response>
+replication_ddl_client::add_dup(const std::string &app_name,
+                                const std::string &remote_cluster_name,
+                                bool is_duplicating_checkpoint,
+                                const std::string &remote_app_name,
+                                const uint32_t remote_replica_count)
 {
-    auto req = make_unique<duplication_add_request>();
-    req->app_name = std::move(app_name);
-    req->remote_cluster_name = std::move(remote_cluster_name);
+    RETURN_EW_NOT_OK_MSG(validate_app_name(remote_app_name, false),
+                         duplication_add_response,
+                         "invalid remote_app_name: '{}'",
+                         remote_app_name);
+
+    auto req = std::make_unique<duplication_add_request>();
+    req->app_name = app_name;
+    req->remote_cluster_name = remote_cluster_name;
     req->is_duplicating_checkpoint = is_duplicating_checkpoint;
+    req->__set_remote_app_name(remote_app_name);
+    req->__set_remote_replica_count(static_cast<int32_t>(remote_replica_count));
     return call_rpc_sync(duplication_add_rpc(std::move(req), RPC_CM_ADD_DUPLICATION));
 }
 
 error_with<duplication_modify_response> replication_ddl_client::change_dup_status(
-    std::string app_name, int dupid, duplication_status::type status)
+    const std::string &app_name, int dupid, duplication_status::type status)
 {
-    auto req = make_unique<duplication_modify_request>();
-    req->app_name = std::move(app_name);
+    auto req = std::make_unique<duplication_modify_request>();
+    req->app_name = app_name;
     req->dupid = dupid;
     req->__set_status(status);
     return call_rpc_sync(duplication_modify_rpc(std::move(req), RPC_CM_MODIFY_DUPLICATION));
 }
 
 error_with<duplication_modify_response> replication_ddl_client::update_dup_fail_mode(
-    std::string app_name, int dupid, duplication_fail_mode::type fmode)
+    const std::string &app_name, int dupid, duplication_fail_mode::type fmode)
 {
     if (_duplication_fail_mode_VALUES_TO_NAMES.find(fmode) ==
         _duplication_fail_mode_VALUES_TO_NAMES.end()) {
         return FMT_ERR(ERR_INVALID_PARAMETERS, "unexpected duplication_fail_mode {}", fmode);
     }
-    auto req = make_unique<duplication_modify_request>();
-    req->app_name = std::move(app_name);
+    auto req = std::make_unique<duplication_modify_request>();
+    req->app_name = app_name;
     req->dupid = dupid;
     req->__set_fail_mode(fmode);
     return call_rpc_sync(duplication_modify_rpc(std::move(req), RPC_CM_MODIFY_DUPLICATION));
 }
 
-error_with<duplication_query_response> replication_ddl_client::query_dup(std::string app_name)
+error_with<duplication_query_response>
+replication_ddl_client::query_dup(const std::string &app_name)
 {
-    auto req = make_unique<duplication_query_request>();
-    req->app_name = std::move(app_name);
+    auto req = std::make_unique<duplication_query_request>();
+    req->app_name = app_name;
     return call_rpc_sync(duplication_query_rpc(std::move(req), RPC_CM_QUERY_DUPLICATION));
 }
 
-bool replication_ddl_client::valid_app_char(int c)
+error_with<duplication_list_response>
+replication_ddl_client::list_dups(const std::string &app_name_pattern,
+                                  utils::pattern_match_type::type match_type)
 {
-    return (bool)std::isalnum(c) || c == '_' || c == '.' || c == ':';
+    auto req = std::make_unique<duplication_list_request>();
+    req->app_name_pattern = app_name_pattern;
+    req->match_type = match_type;
+    return call_rpc_sync(duplication_list_rpc(std::move(req), RPC_CM_LIST_DUPLICATION));
 }
 
+namespace {
+
+bool need_retry(uint32_t attempt_count, const dsn::error_code &err)
+{
+    // For successful request, no need to retry.
+    if (err == dsn::ERR_OK) {
+        return false;
+    }
+
+    // As long as the max attempt count has not been reached, just do retry;
+    // otherwise, do not attempt again.
+    return attempt_count < FLAGS_ddl_client_max_attempt_count;
+}
+
+} // anonymous namespace
+
 void replication_ddl_client::end_meta_request(const rpc_response_task_ptr &callback,
-                                              int retry_times,
-                                              error_code err,
+                                              uint32_t attempt_count,
+                                              const error_code &err,
                                               dsn::message_ex *request,
                                               dsn::message_ex *resp)
 {
-    if (err != dsn::ERR_OK && retry_times < 2) {
-        rpc::call(_meta_server,
-                  request,
-                  &_tracker,
-                  [this, retry_times, callback](
-                      error_code err, dsn::message_ex *request, dsn::message_ex *response) mutable {
-                      end_meta_request(callback, retry_times + 1, err, request, response);
-                  });
-    } else {
+    LOG_INFO(
+        "send request to meta server: rpc_code={}, err={}, attempt_count={}, max_attempt_count={}",
+        request->local_rpc_code,
+        err,
+        attempt_count,
+        FLAGS_ddl_client_max_attempt_count);
+
+    if (!need_retry(attempt_count, err)) {
         callback->enqueue(err, (message_ex *)resp);
+        return;
     }
+
+    rpc::call(dsn::dns_resolver::instance().resolve_address(_meta_server),
+              request,
+              &_tracker,
+              [this, attempt_count, callback](
+                  error_code err, dsn::message_ex *request, dsn::message_ex *response) mutable {
+                  FAIL_POINT_INJECT_NOT_RETURN_F(
+                      "ddl_client_request_meta",
+                      [&err, this](std::string_view str) { err = pop_mock_error(); });
+
+                  end_meta_request(callback, attempt_count + 1, err, request, response);
+              });
 }
 
 dsn::error_code replication_ddl_client::get_app_envs(const std::string &app_name,
@@ -1461,7 +1498,7 @@ replication_ddl_client::set_app_envs(const std::string &app_name,
                                      const std::vector<std::string> &keys,
                                      const std::vector<std::string> &values)
 {
-    auto req = make_unique<configuration_update_app_env_request>();
+    auto req = std::make_unique<configuration_update_app_env_request>();
     req->__set_app_name(app_name);
     req->__set_keys(keys);
     req->__set_values(values);
@@ -1472,13 +1509,12 @@ replication_ddl_client::set_app_envs(const std::string &app_name,
 ::dsn::error_code replication_ddl_client::del_app_envs(const std::string &app_name,
                                                        const std::vector<std::string> &keys)
 {
-    std::shared_ptr<configuration_update_app_env_request> req =
-        std::make_shared<configuration_update_app_env_request>();
+    auto req = std::make_shared<configuration_update_app_env_request>();
     req->__set_app_name(app_name);
     req->__set_op(app_env_operation::type::APP_ENV_OP_DEL);
     req->__set_keys(keys);
 
-    auto resp_task = request_meta<configuration_update_app_env_request>(RPC_CM_UPDATE_APP_ENV, req);
+    auto resp_task = request_meta(RPC_CM_UPDATE_APP_ENV, req);
     resp_task->wait();
 
     if (resp_task->error() != ERR_OK) {
@@ -1503,8 +1539,7 @@ replication_ddl_client::set_app_envs(const std::string &app_name,
                                                          bool clear_all,
                                                          const std::string &prefix)
 {
-    std::shared_ptr<configuration_update_app_env_request> req =
-        std::make_shared<configuration_update_app_env_request>();
+    auto req = std::make_shared<configuration_update_app_env_request>();
     req->__set_app_name(app_name);
     req->__set_op(app_env_operation::type::APP_ENV_OP_CLEAR);
     if (clear_all) {
@@ -1514,7 +1549,7 @@ replication_ddl_client::set_app_envs(const std::string &app_name,
         req->__set_clear_prefix(prefix);
     }
 
-    auto resp_task = request_meta<configuration_update_app_env_request>(RPC_CM_UPDATE_APP_ENV, req);
+    auto resp_task = request_meta(RPC_CM_UPDATE_APP_ENV, req);
     resp_task->wait();
 
     if (resp_task->error() != ERR_OK) {
@@ -1538,10 +1573,10 @@ replication_ddl_client::set_app_envs(const std::string &app_name,
 dsn::error_code
 replication_ddl_client::ddd_diagnose(gpid pid, std::vector<ddd_partition_info> &ddd_partitions)
 {
-    std::shared_ptr<ddd_diagnose_request> req(new ddd_diagnose_request());
+    auto req = std::make_shared<ddd_diagnose_request>();
     req->pid = pid;
 
-    auto resp_task = request_meta<ddd_diagnose_request>(RPC_CM_DDD_DIAGNOSE, req);
+    auto resp_task = request_meta(RPC_CM_DDD_DIAGNOSE, req);
 
     resp_task->wait();
     if (resp_task->error() != dsn::ERR_OK) {
@@ -1560,14 +1595,14 @@ replication_ddl_client::ddd_diagnose(gpid pid, std::vector<ddd_partition_info> &
 }
 
 void replication_ddl_client::query_disk_info(
-    const std::vector<dsn::rpc_address> &targets,
+    const std::vector<dsn::host_port> &targets,
     const std::string &app_name,
-    /*out*/ std::map<dsn::rpc_address, error_with<query_disk_info_response>> &resps)
+    /*out*/ std::map<dsn::host_port, error_with<query_disk_info_response>> &resps)
 {
-    std::map<dsn::rpc_address, query_disk_info_rpc> query_disk_info_rpcs;
+    std::map<dsn::host_port, query_disk_info_rpc> query_disk_info_rpcs;
     for (const auto &target : targets) {
-        auto request = make_unique<query_disk_info_request>();
-        request->node = target;
+        auto request = std::make_unique<query_disk_info_request>();
+        SET_IP_AND_HOST_PORT_BY_DNS(*request, node1, target);
         request->app_name = app_name;
         query_disk_info_rpcs.emplace(target,
                                      query_disk_info_rpc(std::move(request), RPC_QUERY_DISK_INFO));
@@ -1582,7 +1617,7 @@ replication_ddl_client::start_bulk_load(const std::string &app_name,
                                         const std::string &remote_root_path,
                                         const bool ingest_behind)
 {
-    auto req = make_unique<start_bulk_load_request>();
+    auto req = std::make_unique<start_bulk_load_request>();
     req->app_name = app_name;
     req->cluster_name = cluster_name;
     req->file_provider_type = file_provider_type;
@@ -1595,7 +1630,7 @@ error_with<control_bulk_load_response>
 replication_ddl_client::control_bulk_load(const std::string &app_name,
                                           const bulk_load_control_type::type control_type)
 {
-    auto req = make_unique<control_bulk_load_request>();
+    auto req = std::make_unique<control_bulk_load_request>();
     req->app_name = app_name;
     req->type = control_type;
     return call_rpc_sync(control_bulk_load_rpc(std::move(req), RPC_CM_CONTROL_BULK_LOAD));
@@ -1605,7 +1640,7 @@ error_with<query_bulk_load_response>
 replication_ddl_client::query_bulk_load(const std::string &app_name)
 {
 
-    auto req = make_unique<query_bulk_load_request>();
+    auto req = std::make_unique<query_bulk_load_request>();
     req->app_name = app_name;
     return call_rpc_sync(query_bulk_load_rpc(std::move(req), RPC_CM_QUERY_BULK_LOAD_STATUS));
 }
@@ -1613,19 +1648,19 @@ replication_ddl_client::query_bulk_load(const std::string &app_name)
 error_with<clear_bulk_load_state_response>
 replication_ddl_client::clear_bulk_load(const std::string &app_name)
 {
-    auto req = make_unique<clear_bulk_load_state_request>();
+    auto req = std::make_unique<clear_bulk_load_state_request>();
     req->app_name = app_name;
     return call_rpc_sync(clear_bulk_load_rpc(std::move(req), RPC_CM_CLEAR_BULK_LOAD));
 }
 
-error_code replication_ddl_client::detect_hotkey(const dsn::rpc_address &target,
+error_code replication_ddl_client::detect_hotkey(const dsn::host_port &target,
                                                  detect_hotkey_request &req,
                                                  detect_hotkey_response &resp)
 {
-    std::map<dsn::rpc_address, detect_hotkey_rpc> detect_hotkey_rpcs;
-    auto request = make_unique<detect_hotkey_request>(req);
+    std::map<dsn::host_port, detect_hotkey_rpc> detect_hotkey_rpcs;
+    auto request = std::make_unique<detect_hotkey_request>(req);
     detect_hotkey_rpcs.emplace(target, detect_hotkey_rpc(std::move(request), RPC_DETECT_HOTKEY));
-    std::map<dsn::rpc_address, error_with<detect_hotkey_response>> resps;
+    std::map<dsn::host_port, error_with<detect_hotkey_response>> resps;
     call_rpcs_sync(detect_hotkey_rpcs, resps);
     resp = resps.begin()->second.get_value();
     return resps.begin()->second.get_error().code();
@@ -1634,7 +1669,7 @@ error_code replication_ddl_client::detect_hotkey(const dsn::rpc_address &target,
 error_with<start_partition_split_response>
 replication_ddl_client::start_partition_split(const std::string &app_name, int new_partition_count)
 {
-    auto req = make_unique<start_partition_split_request>();
+    auto req = std::make_unique<start_partition_split_request>();
     req->__set_app_name(app_name);
     req->__set_new_partition_count(new_partition_count);
     return call_rpc_sync(start_split_rpc(std::move(req), RPC_CM_START_PARTITION_SPLIT));
@@ -1667,7 +1702,7 @@ replication_ddl_client::control_partition_split(const std::string &app_name,
                                                 const int32_t parent_pidx,
                                                 const int32_t old_partition_count)
 {
-    auto req = make_unique<control_split_request>();
+    auto req = std::make_unique<control_split_request>();
     req->__set_app_name(app_name);
     req->__set_control_type(control_type);
     req->__set_parent_pidx(parent_pidx);
@@ -1678,21 +1713,21 @@ replication_ddl_client::control_partition_split(const std::string &app_name,
 error_with<query_split_response>
 replication_ddl_client::query_partition_split(const std::string &app_name)
 {
-    auto req = make_unique<query_split_request>();
+    auto req = std::make_unique<query_split_request>();
     req->__set_app_name(app_name);
     return call_rpc_sync(query_split_rpc(std::move(req), RPC_CM_QUERY_PARTITION_SPLIT));
 }
 
-error_with<add_new_disk_response>
-replication_ddl_client::add_new_disk(const rpc_address &target_node, const std::string &disk_str)
+error_with<add_new_disk_response> replication_ddl_client::add_new_disk(const host_port &target_node,
+                                                                       const std::string &disk_str)
 {
-    auto req = make_unique<add_new_disk_request>();
+    auto req = std::make_unique<add_new_disk_request>();
     req->disk_str = disk_str;
 
-    std::map<rpc_address, add_new_disk_rpc> add_new_disk_rpcs;
+    std::map<host_port, add_new_disk_rpc> add_new_disk_rpcs;
     add_new_disk_rpcs.emplace(target_node, add_new_disk_rpc(std::move(req), RPC_ADD_NEW_DISK));
 
-    std::map<rpc_address, error_with<add_new_disk_response>> resps;
+    std::map<host_port, error_with<add_new_disk_response>> resps;
     call_rpcs_sync(add_new_disk_rpcs, resps);
     return resps.begin()->second.get_value();
 }
@@ -1700,7 +1735,7 @@ replication_ddl_client::add_new_disk(const rpc_address &target_node, const std::
 error_with<start_app_manual_compact_response> replication_ddl_client::start_app_manual_compact(
     const std::string &app_name, bool bottommost, const int32_t level, const int32_t max_count)
 {
-    auto req = make_unique<start_app_manual_compact_request>();
+    auto req = std::make_unique<start_app_manual_compact_request>();
     req->app_name = app_name;
     req->__set_trigger_time(dsn_now_s());
     req->__set_target_level(level);
@@ -1714,7 +1749,7 @@ error_with<start_app_manual_compact_response> replication_ddl_client::start_app_
 error_with<query_app_manual_compact_response>
 replication_ddl_client::query_app_manual_compact(const std::string &app_name)
 {
-    auto req = make_unique<query_app_manual_compact_request>();
+    auto req = std::make_unique<query_app_manual_compact_request>();
     req->app_name = app_name;
     return call_rpc_sync(
         query_manual_compact_rpc(std::move(req), RPC_CM_QUERY_MANUAL_COMPACT_STATUS));
@@ -1723,7 +1758,7 @@ replication_ddl_client::query_app_manual_compact(const std::string &app_name)
 error_with<configuration_get_max_replica_count_response>
 replication_ddl_client::get_max_replica_count(const std::string &app_name)
 {
-    auto req = make_unique<configuration_get_max_replica_count_request>();
+    auto req = std::make_unique<configuration_get_max_replica_count_request>();
     req->__set_app_name(app_name);
     return call_rpc_sync(
         configuration_get_max_replica_count_rpc(std::move(req), RPC_CM_GET_MAX_REPLICA_COUNT));
@@ -1733,12 +1768,25 @@ error_with<configuration_set_max_replica_count_response>
 replication_ddl_client::set_max_replica_count(const std::string &app_name,
                                               int32_t max_replica_count)
 {
-    auto req = make_unique<configuration_set_max_replica_count_request>();
+    auto req = std::make_unique<configuration_set_max_replica_count_request>();
     req->__set_app_name(app_name);
     req->__set_max_replica_count(max_replica_count);
     return call_rpc_sync(
         configuration_set_max_replica_count_rpc(std::move(req), RPC_CM_SET_MAX_REPLICA_COUNT));
 }
 
+error_with<configuration_rename_app_response>
+replication_ddl_client::rename_app(const std::string &old_app_name, const std::string &new_app_name)
+{
+    RETURN_ES_NOT_OK_MSG(
+        validate_app_name(old_app_name), "invalid old_app_name: '{}'", old_app_name);
+    RETURN_ES_NOT_OK_MSG(
+        validate_app_name(new_app_name), "invalid new_app_name: '{}'", new_app_name);
+
+    auto req = std::make_unique<configuration_rename_app_request>();
+    req->__set_old_app_name(old_app_name);
+    req->__set_new_app_name(new_app_name);
+    return call_rpc_sync(configuration_rename_app_rpc(std::move(req), RPC_CM_RENAME_APP));
+}
 } // namespace replication
 } // namespace dsn

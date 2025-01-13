@@ -24,19 +24,132 @@
  * THE SOFTWARE.
  */
 
+#include <absl/strings/ascii.h>
+#include <boost/algorithm/string/predicate.hpp>
+#include <cstdio>
+#include <openssl/md5.h>
+#include <strings.h>
 #include <algorithm>
 #include <cstring>
-#include <sstream>
+#include <sstream> // IWYU pragma: keep
 #include <utility>
 
-#include <openssl/md5.h>
-#include "utils/api_utilities.h"
 #include "utils/fmt_logging.h"
-#include "utils/ports.h"
 #include "utils/strings.h"
 
 namespace dsn {
 namespace utils {
+
+#define CHECK_NULL_PTR(lhs, rhs)                                                                   \
+    do {                                                                                           \
+        if (lhs == nullptr) {                                                                      \
+            return rhs == nullptr;                                                                 \
+        }                                                                                          \
+        if (rhs == nullptr) {                                                                      \
+            return false;                                                                          \
+        }                                                                                          \
+    } while (0)
+
+bool equals(const char *lhs, const char *rhs)
+{
+    CHECK_NULL_PTR(lhs, rhs);
+    return std::strcmp(lhs, rhs) == 0;
+}
+
+bool equals(const char *lhs, const char *rhs, size_t n)
+{
+    CHECK_NULL_PTR(lhs, rhs);
+    return std::strncmp(lhs, rhs, n) == 0;
+}
+
+bool iequals(const char *lhs, const char *rhs)
+{
+    CHECK_NULL_PTR(lhs, rhs);
+    return ::strcasecmp(lhs, rhs) == 0;
+}
+
+bool iequals(const char *lhs, const char *rhs, size_t n)
+{
+    CHECK_NULL_PTR(lhs, rhs);
+    return ::strncasecmp(lhs, rhs, n) == 0;
+}
+
+bool iequals(const std::string &lhs, const char *rhs)
+{
+    if (rhs == nullptr) {
+        return false;
+    }
+    return ::strcasecmp(lhs.c_str(), rhs) == 0;
+}
+
+bool iequals(const std::string &lhs, const char *rhs, size_t n)
+{
+    if (rhs == nullptr) {
+        return false;
+    }
+    return ::strncasecmp(lhs.c_str(), rhs, n) == 0;
+}
+
+bool iequals(const char *lhs, const std::string &rhs)
+{
+    if (lhs == nullptr) {
+        return false;
+    }
+    return ::strcasecmp(lhs, rhs.c_str()) == 0;
+}
+
+bool iequals(const char *lhs, const std::string &rhs, size_t n)
+{
+    if (lhs == nullptr) {
+        return false;
+    }
+    return ::strncasecmp(lhs, rhs.c_str(), n) == 0;
+}
+
+bool mequals(const void *lhs, const void *rhs, size_t n)
+{
+    CHECK_NULL_PTR(lhs, rhs);
+    return std::memcmp(lhs, rhs, n) == 0;
+}
+
+#undef CHECK_NULL_PTR
+
+error_code pattern_match(const std::string &str,
+                         const std::string &pattern,
+                         pattern_match_type::type match_type)
+{
+    bool matched = false;
+    switch (match_type) {
+    case pattern_match_type::PMT_MATCH_ALL:
+        // Everything is matched.
+        matched = true;
+        break;
+
+    case pattern_match_type::PMT_MATCH_EXACT:
+        matched = str == pattern;
+        break;
+
+    case pattern_match_type::PMT_MATCH_ANYWHERE:
+        matched = boost::algorithm::contains(str, pattern);
+        break;
+
+    case pattern_match_type::PMT_MATCH_PREFIX:
+        matched = boost::algorithm::starts_with(str, pattern);
+        break;
+
+    case pattern_match_type::PMT_MATCH_POSTFIX:
+        matched = boost::algorithm::ends_with(str, pattern);
+        break;
+
+    // TODO(wangdan): PMT_MATCH_REGEX would be supported soon.
+    case pattern_match_type::PMT_MATCH_REGEX:
+
+    default:
+        return ERR_NOT_IMPLEMENTED;
+    }
+
+    return matched ? ERR_OK : ERR_NOT_MATCHED;
+}
 
 std::string get_last_component(const std::string &input, const char splitters[])
 {
@@ -97,7 +210,7 @@ struct SequenceInserter
     // The new element is constructed through variadic template and appended at the end
     // of the sequence container.
     template <typename SequenceContainer, typename... Args>
-    void emplace(SequenceContainer &container, Args &&... args) const
+    void emplace(SequenceContainer &container, Args &&...args) const
     {
         container.emplace_back(std::forward<Args>(args)...);
     }
@@ -109,7 +222,7 @@ struct AssociativeInserter
     // The new element is constructed through variadic template and inserted into the associative
     // container.
     template <typename AssociativeContainer, typename... Args>
-    void emplace(AssociativeContainer &container, Args &&... args) const
+    void emplace(AssociativeContainer &container, Args &&...args) const
     {
         container.emplace(std::forward<Args>(args)...);
     }
@@ -341,5 +454,24 @@ std::string string_md5(const char *buffer, unsigned length)
 
     return result;
 }
+
+std::string find_string_prefix(const std::string &input, char separator)
+{
+    auto current = input.find(separator);
+    if (current == 0 || current == std::string::npos) {
+        return std::string();
+    }
+    return input.substr(0, current);
+}
+
+bool has_space(const std::string &str)
+{
+    // Use absl::ascii_isspace() instead of std::isspace(), which could not be used as
+    // the predicate directly, since it might be implemented as a macro, and its parameter
+    // must be declared as unsigned. Thus, to use std::isspace(), we have to wrap it into
+    // a lambda expression.
+    return std::any_of(str.begin(), str.end(), absl::ascii_isspace);
+}
+
 } // namespace utils
 } // namespace dsn

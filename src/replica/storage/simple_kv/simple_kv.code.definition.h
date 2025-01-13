@@ -24,15 +24,6 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 #include "common/replication.codes.h"
 
@@ -46,6 +37,6 @@ DEFINE_STORAGE_WRITE_RPC_CODE(RPC_SIMPLE_KV_SIMPLE_KV_APPEND, ALLOW_BATCH, NOT_I
 
 // test timer task code
 DEFINE_TASK_CODE(LPC_SIMPLE_KV_TEST_TIMER, TASK_PRIORITY_COMMON, ::dsn::THREAD_POOL_DEFAULT)
-}
-}
-}
+} // namespace application
+} // namespace replication
+} // namespace dsn

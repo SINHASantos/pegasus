@@ -26,21 +26,24 @@
 
 #pragma once
 
-#include <vector>
 #include <map>
+#include <string>
+#include <vector>
+
+#include "client/partition_resolver.h"
 #include "utils/singleton.h"
 #include "utils/zlocks.h"
-#include "runtime/rpc/rpc_address.h"
-#include "client/partition_resolver.h"
 
 namespace dsn {
+class host_port;
+
 namespace replication {
 
 class partition_resolver_manager : public dsn::utils::singleton<partition_resolver_manager>
 {
 public:
     partition_resolver_ptr find_or_create(const char *cluster_name,
-                                          const std::vector<rpc_address> &meta_list,
+                                          const std::vector<host_port> &meta_list,
                                           const char *app_name);
 
 private:

@@ -27,18 +27,22 @@
 #include "perf_counters.h"
 
 #include <iomanip>
+#include <map>
 #include <regex>
+#include <sstream>
+#include <utility>
 
-#include "builtin_counters.h"
-#include "common/json_helper.h"
+#include "perf_counter/perf_counter.h"
 #include "perf_counter/perf_counter_atomic.h"
 #include "perf_counter/perf_counter_utils.h"
-#include "perf_counter/perf_counter.h"
-#include "runtime/service_app.h"
+#include "runtime/api_layer1.h"
 #include "runtime/service_engine.h"
-#include "runtime/task/task.h"
+#include "task/task.h"
+#include "utils/autoref_ptr.h"
 #include "utils/command_manager.h"
-#include "utils/string_view.h"
+#include "utils/fmt_logging.h"
+#include "utils/shared_io_service.h"
+#include "utils/strings.h"
 #include "utils/time_utils.h"
 
 namespace dsn {
@@ -63,7 +67,6 @@ std::map<std::string, std::string> s_brief_stat_map = {
     {"replica*app.pegasus*manual.compact.running.count", "manual_compact_running_count"},
     {"replica*app.pegasus*manual.compact.enqueue.count", "manual_compact_enqueue_count"},
     {"replica*app.pegasus*rdb.block_cache.memory_usage", "rdb_block_cache_memory_usage"},
-    {"replica*eon.replica_stub*shared.log.size(MB)", "shared_log_size(MB)"},
     {"replica*server*memused.virt(MB)", "memused_virt(MB)"},
     {"replica*server*memused.res(MB)", "memused_res(MB)"},
     {"replica*eon.replica_stub*disk.capacity.total(MB)", "disk_capacity_total(MB)"},
@@ -114,52 +117,52 @@ perf_counters::perf_counters()
     // perf_counters
     tools::shared_io_service::instance();
 
-    _cmds.emplace_back(command_manager::instance().register_command(
-        {"perf-counters"},
-        "perf-counters - query perf counters, filtered by OR of POSIX basic regular expressions",
-        "perf-counters [regexp]...",
+    _cmds.emplace_back(command_manager::instance().register_single_command(
+        "perf-counters",
+        "Query perf counters, filtered by OR of POSIX basic regular expressions",
+        "[regexp]...",
         [](const std::vector<std::string> &args) {
             return perf_counters::instance().list_snapshot_by_regexp(args);
         }));
-    _cmds.emplace_back(command_manager::instance().register_command(
-        {"perf-counters-by-substr"},
-        "perf-counters-by-substr - query perf counters, filtered by OR of substrs",
-        "perf-counters-by-substr [substr]...",
+    _cmds.emplace_back(command_manager::instance().register_single_command(
+        "perf-counters-by-substr",
+        "Query perf counters, filtered by OR of substrs",
+        "[substr]...",
         [](const std::vector<std::string> &args) {
             return perf_counters::instance().list_snapshot_by_literal(
                 args, [](const std::string &arg, const counter_snapshot &cs) {
                     return cs.name.find(arg) != std::string::npos;
                 });
         }));
-    _cmds.emplace_back(command_manager::instance().register_command(
-        {"perf-counters-by-prefix"},
-        "perf-counters-by-prefix - query perf counters, filtered by OR of prefix strings",
-        "perf-counters-by-prefix [prefix]...",
+    _cmds.emplace_back(command_manager::instance().register_single_command(
+        "perf-counters-by-prefix",
+        "Query perf counters, filtered by OR of prefix strings",
+        "[prefix]...",
         [](const std::vector<std::string> &args) {
             return perf_counters::instance().list_snapshot_by_literal(
                 args, [](const std::string &arg, const counter_snapshot &cs) {
                     return cs.name.size() >= arg.size() &&
-                           ::memcmp(cs.name.c_str(), arg.c_str(), arg.size()) == 0;
+                           utils::mequals(cs.name.c_str(), arg.c_str(), arg.size());
                 });
         }));
-    _cmds.emplace_back(command_manager::instance().register_command(
-        {"perf-counters-by-postfix"},
-        "perf-counters-by-postfix - query perf counters, filtered by OR of postfix strings",
-        "perf-counters-by-postfix [postfix]...",
+    _cmds.emplace_back(command_manager::instance().register_single_command(
+        "perf-counters-by-postfix",
+        "Query perf counters, filtered by OR of postfix strings",
+        "[postfix]...",
         [](const std::vector<std::string> &args) {
             return perf_counters::instance().list_snapshot_by_literal(
                 args, [](const std::string &arg, const counter_snapshot &cs) {
                     return cs.name.size() >= arg.size() &&
-                           ::memcmp(cs.name.c_str() + cs.name.size() - arg.size(),
-                                    arg.c_str(),
-                                    arg.size()) == 0;
+                           utils::mequals(cs.name.c_str() + cs.name.size() - arg.size(),
+                                          arg.c_str(),
+                                          arg.size());
                 });
         }));
 
-    _cmds.emplace_back(command_manager::instance().register_command(
-        {"server-stat"},
-        "server-stat - query selected perf counters",
+    _cmds.emplace_back(command_manager::instance().register_single_command(
         "server-stat",
+        "Query selected perf counters",
+        "",
         [](const std::vector<std::string> &args) { return get_brief_stat(); }));
 }
 
@@ -217,7 +220,7 @@ perf_counter_ptr perf_counters::get_global_counter(const char *app,
     }
 }
 
-bool perf_counters::remove_counter(const char *full_name)
+bool perf_counters::remove_counter(const std::string &full_name)
 {
     int remain_ref;
     {
@@ -234,18 +237,8 @@ bool perf_counters::remove_counter(const char *full_name)
         }
     }
 
-    LOG_DEBUG("performance counter %s is removed, remaining reference (%d)", full_name, remain_ref);
+    LOG_DEBUG("performance counter {} is removed, remaining reference ({})", full_name, remain_ref);
     return true;
-}
-
-perf_counter_ptr perf_counters::get_counter(const std::string &full_name)
-{
-    utils::auto_read_lock l(_lock);
-    auto it = _counters.find(full_name);
-    if (it != _counters.end())
-        return it->second.counter;
-
-    return nullptr;
 }
 
 perf_counter *perf_counters::new_counter(const char *app,
@@ -362,8 +355,6 @@ std::string perf_counters::list_snapshot_by_literal(
 
 void perf_counters::take_snapshot()
 {
-    builtin_counters::instance().update_counters();
-
     std::vector<perf_counter_ptr> all_counters;
     get_all_counters(&all_counters);
 

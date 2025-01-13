@@ -26,20 +26,24 @@
 
 #pragma once
 
+#include <gtest/gtest.h>
+
 #include "runtime/api_task.h"
 #include "runtime/api_layer1.h"
 #include "runtime/app_model.h"
 #include "utils/api_utilities.h"
 #include "utils/error_code.h"
 #include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
+#include "task/task_code.h"
 #include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
+#include "rpc/serialization.h"
+#include "rpc/rpc_stream.h"
 #include "runtime/serverlet.h"
 #include "runtime/service_app.h"
-#include "runtime/rpc/rpc_address.h"
-#include "runtime/task/async_calls.h"
+#include "rpc/rpc_address.h"
+#include "task/async_calls.h"
+#include "rpc/rpc_address.h"
+#include "task/async_calls.h"
 #include "meta_admin_types.h"
 #include "partition_split_types.h"
 #include "duplication_types.h"
@@ -48,11 +52,9 @@
 #include "consensus_types.h"
 #include "replica_admin_types.h"
 #include "meta/meta_service_app.h"
-
 #include "meta/server_state.h"
 #include "meta/meta_service.h"
-
-#include <gtest/gtest.h>
+#include "common/replication.codes.h"
 
 namespace dsn {
 namespace replication {
@@ -88,7 +90,10 @@ inline dsn::message_ex *create_corresponding_receive(dsn::message_ex *request_ms
 class fake_receiver_meta_service : public dsn::replication::meta_service
 {
 public:
-    fake_receiver_meta_service() : meta_service() {}
+    fake_receiver_meta_service() : meta_service()
+    {
+        _access_controller = security::create_meta_access_controller(nullptr);
+    }
     virtual ~fake_receiver_meta_service() {}
     virtual void reply_message(dsn::message_ex *request, dsn::message_ex *response) override
     {
@@ -132,7 +137,7 @@ public:
     void json_compacity();
 
     // test server_state set_app_envs/del_app_envs/clear_app_envs
-    void app_envs_basic_test();
+    static void app_envs_basic_test();
 
     // test for bug found
     void adjust_dropped_size();

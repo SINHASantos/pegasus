@@ -19,10 +19,13 @@
 
 #include "server/hashkey_transform.h"
 
-#include <gtest/gtest.h>
+#include <fmt/core.h>
 #include <rocksdb/comparator.h>
+#include <string>
 
 #include "base/pegasus_key_schema.h"
+#include "gtest/gtest.h"
+#include "utils/blob.h"
 
 // User define SliceTransform must obey the 4 rules of ColumnFamilyOptions.prefix_extractor:
 // 1) key.starts_with(prefix(key))

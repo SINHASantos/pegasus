@@ -17,19 +17,20 @@
 
 #pragma once
 
+#include <string>
+
 #include "replica/replica_base.h"
-#include "meta_admin_types.h"
-#include "partition_split_types.h"
-#include "duplication_types.h"
-#include "bulk_load_types.h"
-#include "backup_types.h"
-#include "consensus_types.h"
-#include "replica_admin_types.h"
+#include "task/task.h"
+#include "utils/metrics.h"
 
 namespace dsn {
+class gpid;
+
 namespace replication {
 
+class backup_clear_request;
 class replica;
+
 class replica_backup_manager : replica_base
 {
 public:
@@ -40,6 +41,9 @@ public:
     void start_collect_backup_info();
 
 private:
+    friend class replica;
+    friend class replica_backup_manager_test;
+
     void clear_backup_checkpoint(const std::string &policy_name);
     void send_clear_request_to_secondaries(const gpid &pid, const std::string &policy_name);
     void background_clear_backup_checkpoint(const std::string &policy_name);
@@ -48,8 +52,9 @@ private:
     replica *_replica;
     dsn::task_ptr _collect_info_timer;
 
-    friend class replica;
-    friend class replica_backup_manager_test;
+    METRIC_VAR_DECLARE_gauge_int64(backup_running_count);
+    METRIC_VAR_DECLARE_gauge_int64(backup_max_duration_ms);
+    METRIC_VAR_DECLARE_gauge_int64(backup_file_upload_max_bytes);
 };
 
 } // namespace replication

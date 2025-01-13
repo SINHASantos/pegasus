@@ -25,7 +25,10 @@
  */
 
 #include "utils/join_point.h"
-#include <gtest/gtest.h>
+
+#include <vector>
+
+#include "gtest/gtest.h"
 
 namespace dsn {
 

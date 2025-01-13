@@ -17,13 +17,32 @@
 
 #pragma once
 
-#include <fstream>
+#include <nlohmann/detail/macro_scope.hpp>
+#include <nlohmann/json.hpp>     // IWYU pragma: keep
+#include <nlohmann/json_fwd.hpp> // IWYU pragma: keep
+#include <stdint.h>
+#include <string>
+#include <vector>
 
 #include "block_service/block_service.h"
+#include "task/task.h"
+#include "task/task_code.h"
+#include "utils/error_code.h"
 
 namespace dsn {
+class task_tracker;
+
 namespace dist {
 namespace block_service {
+
+struct file_metadata
+{
+    int64_t size = 0;
+    std::string md5;
+
+    file_metadata(int64_t s = 0, const std::string &m = "") : size(s), md5(m) {}
+};
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(file_metadata, size, md5);
 
 class local_service : public block_filesystem
 {
@@ -85,7 +104,6 @@ public:
                                    dsn::task_tracker *tracker = nullptr) override;
 
     error_code load_metadata();
-    error_code store_metadata();
 
 private:
     std::string compute_md5();
@@ -95,6 +113,6 @@ private:
     std::string _md5_value;
     bool _has_meta_synced;
 };
-}
-}
-}
+} // namespace block_service
+} // namespace dist
+} // namespace dsn

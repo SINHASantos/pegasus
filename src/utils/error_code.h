@@ -26,10 +26,20 @@
 
 #pragma once
 
+#include <stdint.h>
 #include <ostream>
+#include <string>
 
-#include "customizable_id.h"
-#include <thrift/protocol/TProtocol.h>
+#include "utils/fmt_utils.h"
+#include "utils/ports.h"
+
+namespace apache {
+namespace thrift {
+namespace protocol {
+class TProtocol;
+} // namespace protocol
+} // namespace thrift
+} // namespace apache
 
 namespace dsn {
 
@@ -44,9 +54,12 @@ public:
 
     const char *to_string() const;
 
-    constexpr bool operator==(const error_code &r) { return _internal_code == r._internal_code; }
+    constexpr bool operator==(const error_code &r) const
+    {
+        return _internal_code == r._internal_code;
+    }
 
-    constexpr bool operator!=(const error_code &r) { return !(*this == r); }
+    constexpr bool operator!=(const error_code &r) const { return !(*this == r); }
 
     constexpr operator int() const { return _internal_code; }
 
@@ -159,4 +172,23 @@ DEFINE_ERR_CODE(ERR_PARENT_PARTITION_MISUSED)
 DEFINE_ERR_CODE(ERR_CHILD_NOT_READY)
 DEFINE_ERR_CODE(ERR_DISK_INSUFFICIENT)
 DEFINE_ERR_CODE(ERR_RETRY_EXHAUSTED)
+
+DEFINE_ERR_CODE(ERR_SYNC_RANGER_POLICIES_FAILED)
+DEFINE_ERR_CODE(ERR_RANGER_PARSE_ACL)
+DEFINE_ERR_CODE(ERR_RANGER_POLICIES_NO_NEED_UPDATE)
+
+DEFINE_ERR_CODE(ERR_RDB_CORRUPTION)
+
+DEFINE_ERR_CODE(ERR_DISK_IO_ERROR)
+
+DEFINE_ERR_CODE(ERR_CURL_FAILED)
+
+DEFINE_ERR_CODE(ERR_DUP_EXIST)
+
+DEFINE_ERR_CODE(ERR_HTTP_ERROR)
+
+DEFINE_ERR_CODE(ERR_NOT_MATCHED)
+
 } // namespace dsn
+
+USER_DEFINED_STRUCTURE_FORMATTER(::dsn::error_code);

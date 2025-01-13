@@ -24,23 +24,13 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     transform zookeeper error code to dsn error code, header
- *
- * Revision history:
- *     2015-12-04, @shengofsun (sunweijie@xiaomi.com)
- */
 #pragma once
 
 #include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
-#include "common/gpid.h"
 
 namespace dsn {
 namespace dist {
 
 error_code from_zerror(int zerr);
 }
-}
+} // namespace dsn

@@ -19,23 +19,20 @@
 
 #pragma once
 
-#include <array>
+#include <rocksdb/slice.h>
 #include <stdint.h>
+#include <string.h>
+#include <algorithm>
+#include <array>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include <rocksdb/slice.h>
-
-#include "utils/api_utilities.h"
 #include "utils/blob.h"
 #include "utils/endians.h"
 #include "utils/fmt_logging.h"
-#include "utils/ports.h"
-#include "utils/smart_pointers.h"
-#include "utils/utils.h"
-#include "runtime/api_layer1.h"
-#include "runtime/api_task.h"
-#include "runtime/app_model.h"
+#include <string_view>
 #include "value_field.h"
 
 namespace pegasus {
@@ -58,7 +55,7 @@ inline uint64_t extract_timestamp_from_timetag(uint64_t timetag)
 /// Extracts expire_ts from rocksdb value with given version.
 /// The value schema must be in v0 or v1.
 /// \return expire_ts in host endian
-inline uint32_t pegasus_extract_expire_ts(uint32_t version, dsn::string_view value)
+inline uint32_t pegasus_extract_expire_ts(uint32_t version, std::string_view value)
 {
     CHECK_LE(version, PEGASUS_DATA_VERSION_MAX);
     return dsn::data_input(value).read_u32();
@@ -79,7 +76,7 @@ pegasus_extract_user_data(uint32_t version, std::string &&raw_value, ::dsn::blob
     if (version == 1) {
         input.skip(sizeof(uint64_t));
     }
-    dsn::string_view view = input.read_str();
+    std::string_view view = input.read_str();
 
     // tricky code to avoid memory copy
     std::shared_ptr<char> buf(const_cast<char *>(view.data()), [s](char *) { delete s; });
@@ -87,7 +84,7 @@ pegasus_extract_user_data(uint32_t version, std::string &&raw_value, ::dsn::blob
 }
 
 /// Extracts timetag from a v1 value.
-inline uint64_t pegasus_extract_timetag(int version, dsn::string_view value)
+inline uint64_t pegasus_extract_timetag(int version, std::string_view value)
 {
     CHECK_EQ(version, 1);
 
@@ -107,7 +104,7 @@ inline void pegasus_update_expire_ts(uint32_t version, std::string &value, uint3
         new_expire_ts = dsn::endian::hton(new_expire_ts);
         memcpy(const_cast<char *>(value.data()), &new_expire_ts, sizeof(uint32_t));
     } else {
-        LOG_FATAL_F("unsupported value schema version: {}", version);
+        LOG_FATAL("unsupported value schema version: {}", version);
         __builtin_unreachable();
     }
 }
@@ -121,7 +118,7 @@ inline bool check_if_ts_expired(uint32_t epoch_now, uint32_t expire_ts)
 /// \return true if expired
 inline bool check_if_record_expired(uint32_t value_schema_version,
                                     uint32_t epoch_now,
-                                    dsn::string_view raw_value)
+                                    std::string_view raw_value)
 {
     return check_if_ts_expired(epoch_now,
                                pegasus_extract_expire_ts(value_schema_version, raw_value));
@@ -139,7 +136,7 @@ public:
     /// A higher level utility for generating value with given version.
     /// The value schema must be in v0 or v1.
     rocksdb::SliceParts generate_value(uint32_t value_schema_version,
-                                       dsn::string_view user_data,
+                                       std::string_view user_data,
                                        uint32_t expire_ts,
                                        uint64_t timetag)
     {
@@ -148,7 +145,7 @@ public:
         } else if (value_schema_version == 1) {
             return generate_value_v1(expire_ts, timetag, user_data);
         } else {
-            LOG_FATAL_F("unsupported value schema version: {}", value_schema_version);
+            LOG_FATAL("unsupported value schema version: {}", value_schema_version);
             __builtin_unreachable();
         }
     }
@@ -160,7 +157,7 @@ public:
     ///
     /// rocksdb value (ver 0) = [expire_ts(uint32_t)] [user_data(bytes)]
     /// \internal
-    rocksdb::SliceParts generate_value_v0(uint32_t expire_ts, dsn::string_view user_data)
+    rocksdb::SliceParts generate_value_v0(uint32_t expire_ts, std::string_view user_data)
     {
         _write_buf.resize(sizeof(uint32_t));
         _write_slices.clear();
@@ -213,7 +210,7 @@ public:
     ///
     /// \internal
     rocksdb::SliceParts
-    generate_value_v1(uint32_t expire_ts, uint64_t timetag, dsn::string_view user_data)
+    generate_value_v1(uint32_t expire_ts, uint64_t timetag, std::string_view user_data)
     {
         _write_buf.resize(sizeof(uint32_t) + sizeof(uint64_t));
         _write_slices.clear();
@@ -261,7 +258,7 @@ class value_schema
 public:
     virtual ~value_schema() = default;
 
-    virtual std::unique_ptr<value_field> extract_field(dsn::string_view value,
+    virtual std::unique_ptr<value_field> extract_field(std::string_view value,
                                                        value_field_type type) = 0;
     /// Extracts user value from the raw rocksdb value.
     /// In order to avoid data copy, the ownership of `raw_value` will be transferred

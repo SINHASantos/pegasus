@@ -24,34 +24,36 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     A greedy load balancer based on Dijkstra & Ford-Fulkerson
- *
- * Revision history:
- *     2016-02-03, Weijie Sun, first version
- */
-
 #pragma once
 
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "meta/meta_data.h"
 #include "server_load_balancer.h"
+#include "utils/fmt_utils.h"
 
 namespace dsn {
-namespace replication {
-class load_balance_policy;
+class command_deregister;
 
+namespace replication {
+class configuration_proposal_action;
+class load_balance_policy;
+class meta_service;
+
+// A greedy load balancer based on Dijkstra & Ford-Fulkerson.
 class greedy_load_balancer : public server_load_balancer
 {
 public:
     explicit greedy_load_balancer(meta_service *svc);
-    ~greedy_load_balancer() override;
+    virtual ~greedy_load_balancer();
     bool balance(meta_view view, migration_list &list) override;
     bool check(meta_view view, migration_list &list) override;
     void report(const migration_list &list, bool balance_checker) override;
     void score(meta_view view, double &primary_stddev, double &total_stddev) override;
 
     void register_ctrl_commands() override;
-    void unregister_ctrl_commands() override;
 
     std::string get_balance_operation_count(const std::vector<std::string> &args) override;
 
@@ -70,32 +72,19 @@ private:
     migration_list *t_migration_result;
     int t_alive_nodes;
     int t_operation_counters[MAX_COUNT];
+    bool _all_replca_infos_collected;
 
     std::unique_ptr<load_balance_policy> _app_balance_policy;
     std::unique_ptr<load_balance_policy> _cluster_balance_policy;
 
     std::unique_ptr<command_deregister> _get_balance_operation_count;
 
-    // perf counters
-    perf_counter_wrapper _balance_operation_count;
-    perf_counter_wrapper _recent_balance_move_primary_count;
-    perf_counter_wrapper _recent_balance_copy_primary_count;
-    perf_counter_wrapper _recent_balance_copy_secondary_count;
-
 private:
     void greedy_balancer(bool balance_checker);
     bool all_replica_infos_collected(const node_state &ns);
 };
 
-inline configuration_proposal_action
-new_proposal_action(const rpc_address &target, const rpc_address &node, config_type::type type)
-{
-    configuration_proposal_action act;
-    act.__set_target(target);
-    act.__set_node(node);
-    act.__set_type(type);
-    return act;
-}
-
 } // namespace replication
 } // namespace dsn
+
+USER_DEFINED_STRUCTURE_FORMATTER(::dsn::replication::configuration_proposal_action);

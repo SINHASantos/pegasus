@@ -24,8 +24,12 @@
  * THE SOFTWARE.
  */
 
+#include <string>
+#include <thread>
+
+#include "gtest/gtest.h"
+#include "utils/enum_helper.h"
 #include "utils/lockp.std.h"
-#include <gtest/gtest.h>
 
 using namespace dsn;
 using namespace dsn::tools;

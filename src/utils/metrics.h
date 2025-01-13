@@ -17,13 +17,22 @@
 
 #pragma once
 
+#include <boost/asio/deadline_timer.hpp>
+#include <boost/asio/detail/impl/epoll_reactor.hpp>
+#include <boost/asio/detail/impl/timer_queue_ptime.ipp>
+#include <rapidjson/ostreamwrapper.h>
+#include <stddef.h>
 #include <algorithm>
 #include <atomic>
 #include <bitset>
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
+#include <new>
+#include <ratio>
 #include <set>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -31,21 +40,33 @@
 #include <utility>
 #include <vector>
 
-#include <boost/asio/deadline_timer.hpp>
-
-#include "api_utilities.h"
-#include "alloc.h"
-#include "autoref_ptr.h"
-#include "casts.h"
+#include <string_view>
 #include "common/json_helper.h"
-#include "enum_helper.h"
-#include "fmt_logging.h"
-#include "long_adder.h"
-#include "nth_element.h"
-#include "ports.h"
-#include "singleton.h"
-#include "string_view.h"
-#include "synchronize.h"
+#include "gutil/map_util.h"
+#include "http/http_server.h"
+#include "utils/alloc.h"
+#include "utils/autoref_ptr.h"
+#include "utils/blob.h"
+#include "utils/casts.h"
+#include "utils/enum_helper.h"
+#include "utils/error_code.h"
+#include "utils/errors.h"
+#include "utils/fmt_logging.h"
+#include "utils/long_adder.h"
+#include "utils/macros.h"
+#include "utils/nth_element.h"
+#include "utils/ports.h"
+#include "utils/singleton.h"
+#include "utils/string_conv.h"
+#include "utils/synchronize.h"
+#include "utils/time_utils.h"
+#include "utils/utils.h"
+
+namespace boost {
+namespace system {
+class error_code;
+} // namespace system
+} // namespace boost
 
 // A metric library (for details pls see https://github.com/apache/incubator-pegasus/issues/922)
 // inspired by Kudu metrics (https://github.com/apache/kudu/blob/master/src/kudu/util/metrics.h).
@@ -78,7 +99,8 @@
 // Instantiating the metric in whatever class represents it with some initial arguments, if any:
 // metric_instance = METRIC_my_gauge_name.instantiate(entity_instance, ...);
 
-// Convenient macros are provided to define entity types and metric prototypes.
+// The following are convenient macros provided to define entity types and metric prototypes.
+
 #define METRIC_DEFINE_entity(name) ::dsn::metric_entity_prototype METRIC_ENTITY_##name(#name)
 #define METRIC_DEFINE_gauge_int64(entity_type, name, unit, desc, ...)                              \
     ::dsn::gauge_prototype<int64_t> METRIC_##name(                                                 \
@@ -86,10 +108,11 @@
 #define METRIC_DEFINE_gauge_double(entity_type, name, unit, desc, ...)                             \
     ::dsn::gauge_prototype<double> METRIC_##name(                                                  \
         {#entity_type, dsn::metric_type::kGauge, #name, unit, desc, ##__VA_ARGS__})
+
 // There are 2 kinds of counters:
-// - `counter` is the general type of counter that is implemented by striped_long_adder, which can
+// * `counter` is the general type of counter that is implemented by striped_long_adder, which can
 //   achieve high performance while consuming less memory if it's not updated very frequently.
-// - `concurrent_counter` uses concurrent_long_adder as the underlying implementation. It has
+// * `concurrent_counter` uses concurrent_long_adder as the underlying implementation. It has
 //   higher performance while consuming more memory if it's updated very frequently.
 // See also include/dsn/utility/long_adder.h for details.
 #define METRIC_DEFINE_counter(entity_type, name, unit, desc, ...)                                  \
@@ -130,13 +153,201 @@
 #define METRIC_DECLARE_percentile_double(name)                                                     \
     extern dsn::floating_percentile_prototype<double> METRIC_##name
 
-namespace dsn {
+// Following METRIC_VAR* macros are introduced so that:
+// * only need to use prototype name to operate each metric variable;
+// * uniformly name each variable in user class;
+// * differentiate operations on metrics significantly from main logic, improving code readability.
 
-class metric_prototype;
-class metric;
+// Declare a metric variable in user class.
+//
+// Since a type tends to be a class template where there might be commas, use variadic arguments
+// instead of a single fixed argument to represent a type.
+#define METRIC_VAR_NAME(name) _metric_##name
+#define METRIC_VAR_DECLARE(name, ...) __VA_ARGS__ METRIC_VAR_NAME(name)
+
+// Variadic arguments are possible qualifiers for the variable, such as `static`.
+#define METRIC_VAR_DECLARE_gauge_int64(name, ...)                                                  \
+    METRIC_VAR_DECLARE(name, __VA_ARGS__ dsn::gauge_ptr<int64_t>)
+#define METRIC_VAR_DECLARE_counter(name, ...)                                                      \
+    METRIC_VAR_DECLARE(name, __VA_ARGS__ dsn::counter_ptr<dsn::striped_long_adder, false>)
+#define METRIC_VAR_DECLARE_percentile_int64(name, ...)                                             \
+    METRIC_VAR_DECLARE(name, __VA_ARGS__ dsn::percentile_ptr<int64_t>)
+
+// Macro METRIC_VAR_DEFINE* are used for the metric that is a static member of a class:
+// * `clazz` is the name of the class;
+// * variadic arguments are possible qualifiers for the variable.
+#define METRIC_VAR_DEFINE(name, clazz, ...) __VA_ARGS__ clazz::METRIC_VAR_NAME(name)
+#define METRIC_VAR_DEFINE_gauge_int64(name, clazz, ...)                                            \
+    METRIC_VAR_DEFINE(name, clazz, __VA_ARGS__ dsn::gauge_ptr<int64_t>)
+#define METRIC_VAR_DEFINE_counter(name, clazz, ...)                                                \
+    METRIC_VAR_DEFINE(name, clazz, __VA_ARGS__ dsn::counter_ptr<dsn::striped_long_adder, false>)
+#define METRIC_VAR_DEFINE_percentile_int64(name, clazz, ...)                                       \
+    METRIC_VAR_DEFINE(name, clazz, __VA_ARGS__ dsn::percentile_ptr<int64_t>)
+
+// Initialize a metric variable in user class:
+// * macros METRIC_VAR_INIT* could be used to initialize metric variables in member initializer
+//   lists of the constructor of user class;
+// * macros METRIC_VAR_ASSIGN* could be used to initialize metric variables by assignment operator
+//   (=).
+#define METRIC_VAR_INSTANTIATE(name, entity, op, ...)                                              \
+    METRIC_VAR_NAME(name) op(METRIC_##name.instantiate(entity##_metric_entity(), ##__VA_ARGS__))
+#define METRIC_VAR_ASSIGN(name, entity, ...) METRIC_VAR_INSTANTIATE(name, entity, =, ##__VA_ARGS__)
+#define METRIC_VAR_INIT(name, entity, ...) METRIC_VAR_INSTANTIATE(name, entity, , ##__VA_ARGS__)
+#define METRIC_VAR_INIT_replica(name, ...) METRIC_VAR_INIT(name, replica, ##__VA_ARGS__)
+#define METRIC_VAR_ASSIGN_server(name, ...) METRIC_VAR_ASSIGN(name, server, ##__VA_ARGS__)
+#define METRIC_VAR_INIT_server(name, ...) METRIC_VAR_INIT(name, server, ##__VA_ARGS__)
+#define METRIC_VAR_INIT_disk(name, ...) METRIC_VAR_INIT(name, disk, ##__VA_ARGS__)
+#define METRIC_VAR_INIT_table(name, ...) METRIC_VAR_INIT(name, table, ##__VA_ARGS__)
+#define METRIC_VAR_INIT_partition(name, ...) METRIC_VAR_INIT(name, partition, ##__VA_ARGS__)
+#define METRIC_VAR_INIT_backup_policy(name, ...) METRIC_VAR_INIT(name, backup_policy, ##__VA_ARGS__)
+#define METRIC_VAR_INIT_queue(name, ...) METRIC_VAR_INIT(name, queue, ##__VA_ARGS__)
+#define METRIC_VAR_ASSIGN_profiler(name, ...) METRIC_VAR_ASSIGN(name, profiler, ##__VA_ARGS__)
+#define METRIC_VAR_INIT_latency_tracer(name, ...)                                                  \
+    METRIC_VAR_INIT(name, latency_tracer, ##__VA_ARGS__)
+
+// Perform increment_by() operations on gauges and counters.
+#define METRIC_VAR_INCREMENT_BY(name, x)                                                           \
+    do {                                                                                           \
+        const auto v = (x);                                                                        \
+        if (v != 0) {                                                                              \
+            METRIC_VAR_NAME(name)->increment_by(v);                                                \
+        }                                                                                          \
+    } while (0)
+
+// Perform increment() operations on gauges and counters.
+#define METRIC_VAR_INCREMENT(name) METRIC_VAR_NAME(name)->increment()
+
+// Perform decrement_by() operations on gauges.
+#define METRIC_VAR_DECREMENT_BY(name, x)                                                           \
+    do {                                                                                           \
+        const auto v = (x);                                                                        \
+        if (v != 0) {                                                                              \
+            METRIC_VAR_NAME(name)->decrement_by(v);                                                \
+        }                                                                                          \
+    } while (0)
+
+// Perform decrement() operations on gauges.
+#define METRIC_VAR_DECREMENT(name) METRIC_VAR_NAME(name)->decrement()
+
+// Perform set() operations on gauges and percentiles.
+//
+// There are 2 kinds of invocations of set() for a metric:
+// * set(val): set a single value for a metric, such as gauge, percentile;
+// * set(n, val): set multiple repeated values (the number of duplicates is n) for a metric,
+// such as percentile.
+#define METRIC_VAR_SET(name, ...) METRIC_VAR_NAME(name)->set(__VA_ARGS__)
+
+// Read the current measurement of gauges and counters.
+#define METRIC_VAR_VALUE(name) METRIC_VAR_NAME(name)->value()
+
+// Convenient macro that is used to compute latency automatically, which is dedicated to percentile.
+#define METRIC_VAR_AUTO_LATENCY(name, ...)                                                         \
+    dsn::auto_latency __##name##_auto_latency(METRIC_VAR_NAME(name), ##__VA_ARGS__)
+
+#define METRIC_VAR_AUTO_LATENCY_DURATION_NS(name) __##name##_auto_latency.duration_ns()
+
+// Convenient macro that is used to increment/decrement gauge automatically in current scope.
+#define METRIC_VAR_AUTO_COUNT(name, ...)                                                           \
+    dsn::auto_count __##name##_auto_count(METRIC_VAR_NAME(name), ##__VA_ARGS__)
+
+// Implement a member function that runs `method` on the metric variable, without any argument.
+#define METRIC_DEFINE_NO_ARG(method, name)                                                         \
+    void METRIC_FUNC_NAME_##method(name)() { METRIC_VAR_##method(name); }
+
+// Implement a member function that runs `method` on the metric variable if NOT NULL,
+// without any argument.
+#define METRIC_DEFINE_NO_ARG_NOTNULL(method, name)                                                 \
+    void METRIC_FUNC_NAME_##method(name)()                                                         \
+    {                                                                                              \
+        if (METRIC_VAR_NAME(name) != nullptr) {                                                    \
+            METRIC_VAR_##method(name);                                                             \
+        }                                                                                          \
+    }
+
+// Implement a member function that runs `method` on the metric variable and return `ret_type`,
+// without any argument.
+#define METRIC_DEFINE_RET_AND_NO_ARG(ret_type, method, name)                                       \
+    ret_type METRIC_FUNC_NAME_##method(name)() { return METRIC_VAR_##method(name); }
+
+// Implement a member function that runs `method` on the metric variable, with an argument.
+#define METRIC_DEFINE_ONE_ARG(method, name, arg_type)                                              \
+    void METRIC_FUNC_NAME_##method(name)(arg_type arg) { METRIC_VAR_##method(name, arg); }
+
+// Implement a member function that runs `method` on the metric variable if NOT NULL,
+// with an argument.
+#define METRIC_DEFINE_ONE_ARG_NOTNULL(method, name, arg_type)                                      \
+    void METRIC_FUNC_NAME_##method(name)(arg_type arg)                                             \
+    {                                                                                              \
+        if (METRIC_VAR_NAME(name) != nullptr) {                                                    \
+            METRIC_VAR_##method(name, arg);                                                        \
+        }                                                                                          \
+    }
+
+// Call the member function of `obj` to run `method` on the metric variable.
+#define METRIC_CALL(obj, method, name, ...) (obj).METRIC_FUNC_NAME_##method(name)(__VA_ARGS__)
+
+// The name of the member function that increments the metric variable by some value.
+#define METRIC_FUNC_NAME_INCREMENT_BY(name) increment_##name##_by
+
+// Implement a member function that increments the metric variable by some value.
+#define METRIC_DEFINE_INCREMENT_BY(name) METRIC_DEFINE_ONE_ARG(INCREMENT_BY, name, int64_t)
+
+// To be adaptive to self-defined `increment_by` methods, arguments are declared as variadic.
+#define METRIC_INCREMENT_BY(obj, name, ...) METRIC_CALL(obj, INCREMENT_BY, name, ##__VA_ARGS__)
+
+// The name of the member function that increments the metric variable by one.
+#define METRIC_FUNC_NAME_INCREMENT(name) increment_##name
+
+// Implement a member function that increments the metric variable by one.
+#define METRIC_DEFINE_INCREMENT(name) METRIC_DEFINE_NO_ARG(INCREMENT, name)
+
+// Implement a member function that increments the metric variable by one if NOT NULL.
+#define METRIC_DEFINE_INCREMENT_NOTNULL(name) METRIC_DEFINE_NO_ARG_NOTNULL(INCREMENT, name)
+
+// To be adaptive to self-defined `increment` methods, arguments are declared as variadic.
+#define METRIC_INCREMENT(obj, name, ...) METRIC_CALL(obj, INCREMENT, name, ##__VA_ARGS__)
+
+// The name of the member function that decrements the metric variable by one.
+#define METRIC_FUNC_NAME_DECREMENT(name) decrement_##name
+
+// Implement a member function that decrements the metric variable by one.
+#define METRIC_DEFINE_DECREMENT(name) METRIC_DEFINE_NO_ARG(DECREMENT, name)
+
+// Implement a member function that decrements the metric variable by one if NOT NULL.
+#define METRIC_DEFINE_DECREMENT_NOTNULL(name) METRIC_DEFINE_NO_ARG_NOTNULL(DECREMENT, name)
+
+// To be adaptive to self-defined `decrement` methods, arguments are declared as variadic.
+#define METRIC_DECREMENT(obj, name, ...) METRIC_CALL(obj, DECREMENT, name, ##__VA_ARGS__)
+
+// The name of the member function that sets the metric variable with some value.
+#define METRIC_FUNC_NAME_SET(name) set_##name
+
+// Implement a member function that sets the metric variable with some value.
+#define METRIC_DEFINE_SET(name, value_type) METRIC_DEFINE_ONE_ARG(SET, name, value_type)
+
+// Implement a member function that sets the metric variable with some value if NOT NULL.
+#define METRIC_DEFINE_SET_NOTNULL(name, value_type)                                                \
+    METRIC_DEFINE_ONE_ARG_NOTNULL(SET, name, value_type)
+
+// To be adaptive to self-defined `set` methods, arguments are declared as variadic.
+#define METRIC_SET(obj, name, ...) METRIC_CALL(obj, SET, name, ##__VA_ARGS__)
+
+// The name of the member function that gets the value of the metric variable.
+#define METRIC_FUNC_NAME_VALUE(name) get_##name
+
+// Implement a member function that gets the value of the metric variable.
+#define METRIC_DEFINE_VALUE(name, value_type) METRIC_DEFINE_RET_AND_NO_ARG(value_type, VALUE, name)
+
+// To be adaptive to self-defined `value` methods, arguments are declared as variadic.
+#define METRIC_VALUE(obj, name, ...) METRIC_CALL(obj, VALUE, name, ##__VA_ARGS__)
+
+namespace dsn {
+class metric;                  // IWYU pragma: keep
+class metric_entity_prototype; // IWYU pragma: keep
+class metric_prototype;        // IWYU pragma: keep
+struct metric_filters;         // IWYU pragma: keep
+
 using metric_ptr = ref_ptr<metric>;
-struct metric_filters;
-class metric_entity_prototype;
 
 using metric_json_writer = dsn::json::PrettyJsonWriter;
 
@@ -144,6 +355,13 @@ const std::string kMetricEntityTypeField = "type";
 const std::string kMetricEntityIdField = "id";
 const std::string kMetricEntityAttrsField = "attributes";
 const std::string kMetricEntityMetricsField = "metrics";
+
+const std::string kMetricClusterField = "cluster";
+const std::string kMetricRoleField = "role";
+const std::string kMetricHostField = "host";
+const std::string kMetricPortField = "port";
+const std::string kMetricTimestampNsField = "timestamp_ns";
+const std::string kMetricEntitiesField = "entities";
 
 class metric_entity : public ref_counter
 {
@@ -159,28 +377,16 @@ public:
 
     metric_map metrics() const;
 
-    // args are the parameters that are used to construct the object of MetricType
+    // `args` are the parameters that are used to construct the object of MetricType.
     template <typename MetricType, typename... Args>
-    ref_ptr<MetricType> find_or_create(const metric_prototype *prototype, Args &&... args)
-    {
-        utils::auto_write_lock l(_lock);
-
-        metric_map::const_iterator iter = _metrics.find(prototype);
-        if (iter != _metrics.end()) {
-            auto raw_ptr = down_cast<MetricType *>(iter->second.get());
-            return raw_ptr;
-        }
-
-        ref_ptr<MetricType> ptr(new MetricType(prototype, std::forward<Args>(args)...));
-        _metrics[prototype] = ptr;
-        return ptr;
-    }
+    ref_ptr<MetricType> find_or_create(const metric_prototype *prototype, Args &&...args);
 
     void take_snapshot(metric_json_writer &writer, const metric_filters &filters) const;
 
 private:
     friend class metric_registry;
     friend class ref_ptr<metric_entity>;
+    friend class scoped_entity;
 
     metric_entity(const metric_entity_prototype *prototype,
                   const std::string &id,
@@ -207,12 +413,30 @@ private:
 
     void encode_id(metric_json_writer &writer) const;
 
+    // Decide if an entity is stale. An entity becomes stale if it is no longer used by any other
+    // object.
+    //
+    // An entity could be bound to one or multiple objects. Once all of these objects are
+    // destroyed, this entity will become stale, which means all of the metrics held by this
+    // entity are also stale.
+    //
+    // For example, once a replica is removed, the replica entity (and all metrics it holds) will
+    // become stale; then, this entity is scheduled to be retired after a configurable retention
+    // interval; finally, this entity will be removed from the registry with all metrics it holds.
+    bool is_stale() const;
+
     const metric_entity_prototype *const _prototype;
     const std::string _id;
 
     mutable utils::rw_lock_nr _lock;
     attr_map _attrs;
     metric_map _metrics;
+
+    // The timestamp when this entity should be retired:
+    // * default value is 0, which means this entity has not been scheduled to be retired;
+    // * otherwise, non-zero value means this entity has been scheduled to be retired, and will
+    // be retired at any time once current time has reached or exceeded this timestamp.
+    uint64_t _retire_time_ms;
 
     DISALLOW_COPY_AND_ASSIGN(metric_entity);
 };
@@ -248,7 +472,7 @@ struct metric_filters
         RETURN_MATCHED_WITH_EMPTY_WHITE_LIST(white_list);
         // Will use `bool operator==(const string &lhs, const char *rhs);` to compare each element
         // in `white_list` with `candidate`.
-        return std::find(white_list.begin(), white_list.end(), candidate) != white_list.end();
+        return utils::contains(white_list, candidate);
     }
 
     static inline bool match(const std::string &candidate,
@@ -294,6 +518,11 @@ struct metric_filters
     void extract_entity_metrics(const metric_entity::metric_map &candidates,
                                 metric_entity::metric_map &target_metrics) const;
 
+    // Build the http query string based on metric filters. This is useful when an http request
+    // is performed for metrics query: firstly, set metric filters with what you want; then,
+    // get query string by this function conveniently and put it into the http request.
+    std::string to_query_string() const;
+
     // `with_metric_fields` includes all the metric fields that are wanted by client. If it
     // is empty, there will be no restriction: in other words, all fields owned by the metric
     // will be put in the response.
@@ -307,6 +536,22 @@ struct metric_filters
 
     entity_metrics_type entity_metrics;
 };
+
+inline std::string encode_as_json(std::function<void(metric_json_writer &)> encoder)
+{
+    std::ostringstream out;
+    rapidjson::OStreamWrapper wrapper(out);
+    metric_json_writer writer(wrapper);
+    encoder(writer);
+    return out.str();
+}
+
+template <typename T>
+inline std::string take_snapshot_as_json(T *m, const metric_filters &filters)
+{
+    return encode_as_json(
+        [m, &filters](metric_json_writer &writer) { m->take_snapshot(writer, filters); });
+}
 
 class metric_entity_prototype
 {
@@ -327,10 +572,120 @@ private:
     DISALLOW_COPY_AND_ASSIGN(metric_entity_prototype);
 };
 
+class metric_registry; // IWYU pragma: keep
+
+class metrics_http_service : public http_server_base
+{
+public:
+    static const std::string kMetricsRootPath;
+    static const std::string kMetricsQuerySubPath;
+    static const std::string kMetricsQueryPath;
+
+    explicit metrics_http_service(metric_registry *registry);
+    ~metrics_http_service() = default;
+
+    // There is only one API now whose URI is "/metrics", thus just make
+    // this URI as sub path while leaving the root path empty.
+    std::string path() const override { return kMetricsRootPath; }
+
+private:
+    friend void test_get_metrics_handler(const http_request &req, http_response &resp);
+
+    void get_metrics_handler(const http_request &req, http_response &resp);
+
+    metric_registry *_registry;
+
+    DISALLOW_COPY_AND_ASSIGN(metrics_http_service);
+};
+
+// `metric_timer` is a timer class that runs metric-related computations periodically, such as
+// calculating percentile, checking if there are stale entities. It accepts `on_exec` and
+// `on_close` as the callbacks for execution and close.
+//
+// In case that all metrics (such as percentiles) are computed at the same time and lead to very
+// high load, first calculation will be delayed at a random interval.
+class metric_timer
+{
+public:
+    enum class state : int
+    {
+        kRunning,
+        kClosing,
+        kClosed,
+    };
+
+    using on_exec_fn = std::function<void()>;
+    using on_close_fn = std::function<void()>;
+
+    metric_timer(uint64_t interval_ms, on_exec_fn on_exec, on_close_fn on_close);
+    ~metric_timer() = default;
+
+    void close();
+    void wait();
+
+    // Get the initial delay that is randomly generated by `generate_initial_delay_ms()`.
+    uint64_t get_initial_delay_ms() const { return _initial_delay_ms; }
+
+private:
+    // Generate an initial delay randomly in case that all percentiles are computed at the
+    // same time.
+    static uint64_t generate_initial_delay_ms(uint64_t interval_ms);
+
+    void on_close();
+
+    void on_timer(const boost::system::error_code &ec);
+
+    const uint64_t _initial_delay_ms;
+    const uint64_t _interval_ms;
+    const on_exec_fn _on_exec;
+    const on_close_fn _on_close;
+    std::atomic<state> _state;
+    utils::notify_event _completed;
+    std::unique_ptr<boost::asio::deadline_timer> _timer;
+
+    DISALLOW_COPY_AND_ASSIGN(metric_timer);
+};
+
 class metric_registry : public utils::singleton<metric_registry>
 {
 public:
     using entity_map = std::unordered_map<std::string, metric_entity_ptr>;
+    using collected_entity_list = std::unordered_set<std::string>;
+
+    struct collected_entities_info
+    {
+        // The collected entities that will be processed by retire_stale_entities(). Following
+        // kinds of entities will be collected:
+        // * entities that should be retired immediately. The entities that are still within
+        // the retention interval will not be collected.
+        // * entities that were previously considered stale however have already been reemployed,
+        // which means its retirement should be cancelled by retire_stale_entities().
+        collected_entity_list collected_entities;
+
+        // The number of all entities in the registry.
+        size_t num_all_entities = 0;
+
+        // The number of the entities that have been scheduled to be retired.
+        size_t num_scheduled_entities = 0;
+
+        collected_entities_info() = default;
+    };
+
+    struct retired_entities_stat
+    {
+        // The number of retired entities.
+        size_t num_retired_entities = 0;
+
+        // The number of entities that were recently considered stale and scheduled to be
+        // retired.
+        size_t num_recently_scheduled_entities = 0;
+
+        // The number of the entities that had previously been scheduled to be retired and
+        // were recently reemployed.
+        size_t num_reemployed_entities = 0;
+
+        retired_entities_stat() = default;
+    };
 
     entity_map entities() const;
 
@@ -340,15 +695,53 @@ private:
     friend class metric_entity_prototype;
     friend class utils::singleton<metric_registry>;
 
+    friend void test_get_metrics_handler(const http_request &req, http_response &resp);
+    friend class scoped_entity;
+    friend class MetricsRetirementTest;
+
     metric_registry();
     ~metric_registry();
+
+    void on_close();
+
+    void start_timer();
+    void stop_timer();
 
     metric_entity_ptr find_or_create_entity(const metric_entity_prototype *prototype,
                                             const std::string &id,
                                             const metric_entity::attr_map &attrs);
 
+    void encode_entities(metric_json_writer &writer, const metric_filters &filters) const;
+
+    // These functions are used to retire stale entities.
+    //
+    // Since retirement is infrequent, there tend to be no entity that should be retired.
+    // Therefore, the whole retirement process is divided into two phases: "collect" and
+    // "retire".
+    //
+    // At the first phase "collect", we just check if there are entities that:
+    // * has become stale, but has not been scheduled to be retired, or
+    // * should be retired immediately, or
+    // * previously were scheduled to be retired, now has been reemployed.
+    //
+    // All operations in the first phase are read-only, needing just read lock which is more
+    // lightweight. If some entities were found following above conditions, albeit infrequenly,
+    // they would be collected to be processed at the next phase.
+    //
+    // Collected entities, if any, will be processed at the second phase "retire":
+    // * stale entities will be schedule to be retired;
+    // * the expired entities will be retired;
+    // * reset the retirement timestamp to 0 for reemployed entities.
+    collected_entities_info collect_stale_entities() const;
+    retired_entities_stat retire_stale_entities(const collected_entity_list &collected_entities);
+    void process_stale_entities();
+
     mutable utils::rw_lock_nr _lock;
     entity_map _entities;
+
+    metrics_http_service _http_service;
+
+    std::unique_ptr<metric_timer> _timer;
 
     DISALLOW_COPY_AND_ASSIGN(metric_registry);
 };
@@ -361,38 +754,99 @@ private:
 // On the other hand, it is also needed when some special operation should be done
 // for a metric type. For example, percentile should be closed while it's no longer
 // used.
+#define ENUM_FOREACH_METRIC_TYPE(DEF)                                                              \
+    DEF(Gauge)                                                                                     \
+    DEF(Counter)                                                                                   \
+    DEF(VolatileCounter)                                                                           \
+    DEF(Percentile)
+
 enum class metric_type
 {
-    kGauge,
-    kCounter,
-    kVolatileCounter,
-    kPercentile,
-    kInvalidUnit,
+    ENUM_FOREACH_METRIC_TYPE(ENUM_CONST_DEF) kInvalidType,
 };
 
-ENUM_BEGIN(metric_type, metric_type::kInvalidUnit)
-ENUM_REG_WITH_CUSTOM_NAME(metric_type::kGauge, gauge)
-ENUM_REG_WITH_CUSTOM_NAME(metric_type::kCounter, counter)
-ENUM_REG_WITH_CUSTOM_NAME(metric_type::kVolatileCounter, volatile_counter)
-ENUM_REG_WITH_CUSTOM_NAME(metric_type::kPercentile, percentile)
+#define ENUM_CONST_REG_STR_METRIC_TYPE(str) ENUM_CONST_REG_STR(metric_type, str)
+
+ENUM_BEGIN(metric_type, metric_type::kInvalidType)
+ENUM_FOREACH_METRIC_TYPE(ENUM_CONST_REG_STR_METRIC_TYPE)
 ENUM_END(metric_type)
 
-enum class metric_unit
+#define ENUM_FOREACH_METRIC_UNIT(DEF)                                                              \
+    DEF(NanoSeconds)                                                                               \
+    DEF(MicroSeconds)                                                                              \
+    DEF(MilliSeconds)                                                                              \
+    DEF(Seconds)                                                                                   \
+    DEF(Bytes)                                                                                     \
+    DEF(MegaBytes)                                                                                 \
+    DEF(BytesPerSec)                                                                               \
+    DEF(CapacityUnits)                                                                             \
+    DEF(Percent)                                                                                   \
+    DEF(Replicas)                                                                                  \
+    DEF(Partitions)                                                                                \
+    DEF(PartitionSplittings)                                                                       \
+    DEF(Servers)                                                                                   \
+    DEF(Requests)                                                                                  \
+    DEF(Responses)                                                                                 \
+    DEF(Seeks)                                                                                     \
+    DEF(PointLookups)                                                                              \
+    DEF(Values)                                                                                    \
+    DEF(Keys)                                                                                      \
+    DEF(Files)                                                                                     \
+    DEF(Dirs)                                                                                      \
+    DEF(Amplification)                                                                             \
+    DEF(Checkpoints)                                                                               \
+    DEF(Flushes)                                                                                   \
+    DEF(Compactions)                                                                               \
+    DEF(Mutations)                                                                                 \
+    DEF(Writes)                                                                                    \
+    DEF(Changes)                                                                                   \
+    DEF(Operations)                                                                                \
+    DEF(Tasks)                                                                                     \
+    DEF(Disconnections)                                                                            \
+    DEF(Sessions)                                                                                  \
+    DEF(Learns)                                                                                    \
+    DEF(Rounds)                                                                                    \
+    DEF(Resets)                                                                                    \
+    DEF(Backups)                                                                                   \
+    DEF(FileLoads)                                                                                 \
+    DEF(FileUploads)                                                                               \
+    DEF(BulkLoads)                                                                                 \
+    DEF(Beacons)
+
+enum class metric_unit : size_t
 {
-    kNanoSeconds,
-    kMicroSeconds,
-    kMilliSeconds,
-    kSeconds,
-    kRequests,
-    kInvalidUnit,
+    ENUM_FOREACH_METRIC_UNIT(ENUM_CONST_DEF) kInvalidUnit,
 };
 
+#define METRIC_ASSERT_UNIT_LATENCY(unit, index)                                                    \
+    static_assert(static_cast<size_t>(metric_unit::unit) == index,                                 \
+                  #unit " should be at index " #index)
+
+METRIC_ASSERT_UNIT_LATENCY(kNanoSeconds, 0);
+METRIC_ASSERT_UNIT_LATENCY(kMicroSeconds, 1);
+METRIC_ASSERT_UNIT_LATENCY(kMilliSeconds, 2);
+METRIC_ASSERT_UNIT_LATENCY(kSeconds, 3);
+
+const std::vector<uint64_t> kMetricLatencyConverterFromNS = {
+    1, 1000, 1000 * 1000, 1000 * 1000 * 1000};
+
+inline uint64_t convert_metric_latency_from_ns(uint64_t latency_ns, metric_unit target_unit)
+{
+    if (dsn_likely(target_unit == metric_unit::kNanoSeconds)) {
+        // Since nanoseconds are used as the latency unit more frequently, eliminate unnecessary
+        // conversion by branch prediction.
+        return latency_ns;
+    }
+
+    auto index = static_cast<size_t>(target_unit);
+    CHECK_LT(index, kMetricLatencyConverterFromNS.size());
+    return latency_ns / kMetricLatencyConverterFromNS[index];
+}
+
+#define ENUM_CONST_REG_STR_METRIC_UNIT(str) ENUM_CONST_REG_STR(metric_unit, str)
+
 ENUM_BEGIN(metric_unit, metric_unit::kInvalidUnit)
-ENUM_REG_WITH_CUSTOM_NAME(metric_unit::kNanoSeconds, nanoseconds)
-ENUM_REG_WITH_CUSTOM_NAME(metric_unit::kMicroSeconds, microseconds)
-ENUM_REG_WITH_CUSTOM_NAME(metric_unit::kMilliSeconds, milliseconds)
-ENUM_REG_WITH_CUSTOM_NAME(metric_unit::kSeconds, seconds)
-ENUM_REG_WITH_CUSTOM_NAME(metric_unit::kRequests, requests)
+ENUM_FOREACH_METRIC_UNIT(ENUM_CONST_REG_STR_METRIC_UNIT)
 ENUM_END(metric_unit)
 
 class metric_prototype
@@ -400,22 +854,22 @@ class metric_prototype
 public:
     struct ctor_args
     {
-        const string_view entity_type;
+        const std::string_view entity_type;
         const metric_type type;
-        const string_view name;
+        const std::string_view name;
         const metric_unit unit;
-        const string_view desc;
+        const std::string_view desc;
     };
 
-    string_view entity_type() const { return _args.entity_type; }
+    std::string_view entity_type() const { return _args.entity_type; }
 
     metric_type type() const { return _args.type; }
 
-    string_view name() const { return _args.name; }
+    std::string_view name() const { return _args.name; }
 
     metric_unit unit() const { return _args.unit; }
 
-    string_view description() const { return _args.desc; }
+    std::string_view description() const { return _args.desc; }
 
 protected:
     explicit metric_prototype(const ctor_args &args);
@@ -438,7 +892,7 @@ public:
 
     // Construct a metric object based on the instance of metric_entity.
     template <typename... Args>
-    ref_ptr<MetricType> instantiate(const metric_entity_ptr &entity, Args &&... args) const
+    ref_ptr<MetricType> instantiate(const metric_entity_ptr &entity, Args &&...args) const
     {
         return entity->find_or_create<MetricType>(this, std::forward<Args>(args)...);
     }
@@ -446,6 +900,31 @@ public:
 private:
     DISALLOW_COPY_AND_ASSIGN(metric_prototype_with);
 };
+
+template <typename MetricType, typename... Args>
+ref_ptr<MetricType> metric_entity::find_or_create(const metric_prototype *prototype, Args &&...args)
+{
+    CHECK_STREQ_MSG(prototype->entity_type().data(),
+                    _prototype->name(),
+                    "the entity type '{}' of the metric '{}' is inconsistent with the prototype "
+                    "'{}' of the attached entity '{}'",
+                    prototype->entity_type().data(),
+                    prototype->name().data(),
+                    _prototype->name(),
+                    _id);
+
+    utils::auto_write_lock l(_lock);
+
+    metric_map::const_iterator iter = _metrics.find(prototype);
+    if (iter != _metrics.end()) {
+        auto raw_ptr = down_cast<MetricType *>(iter->second.get());
+        return raw_ptr;
+    }
+
+    ref_ptr<MetricType> ptr(new MetricType(prototype, std::forward<Args>(args)...));
+    _metrics[prototype] = ptr;
+    return ptr;
+}
 
 const std::string kMetricTypeField = "type";
 const std::string kMetricNameField = "name";
@@ -536,6 +1015,8 @@ protected:
     const metric_prototype *const _prototype;
 
 private:
+    friend class metric_entity;
+
     DISALLOW_COPY_AND_ASSIGN(metric);
 };
 
@@ -770,8 +1251,6 @@ struct kth_percentile_property
     double decimal;
 };
 
-#define STRINGIFY_HELPER(x) #x
-#define STRINGIFY(x) STRINGIFY_HELPER(x)
 #define STRINGIFY_KTH_PERCENTILE_NAME(kth) STRINGIFY(KTH_PERCENTILE_NAME(kth))
 #define KTH_TO_DECIMAL(kth) 0.##kth
 #define KTH_PERCENTILE_PROPERTY_LIST(kth)                                                          \
@@ -835,56 +1314,6 @@ inline size_t kth_percentile_to_nth_index(size_t size, kth_percentile_type type)
     return kth_percentile_to_nth_index(size, static_cast<size_t>(type));
 }
 
-// `percentile_timer` is a timer class that encapsulates the details how each percentile is
-// computed periodically.
-//
-// To be instantiated, it requires `interval_ms` at which a percentile is computed and `exec`
-// which is used to compute percentile.
-//
-// In case that all percentiles are computed at the same time and lead to very high load,
-// first computation for percentile will be delayed at a random interval.
-class percentile_timer
-{
-public:
-    enum class state : int
-    {
-        kRunning,
-        kClosing,
-        kClosed,
-    };
-
-    using on_exec_fn = std::function<void()>;
-    using on_close_fn = std::function<void()>;
-
-    percentile_timer(uint64_t interval_ms, on_exec_fn on_exec, on_close_fn on_close);
-    ~percentile_timer() = default;
-
-    void close();
-    void wait();
-
-    // Get the initial delay that is randomly generated by `generate_initial_delay_ms()`.
-    uint64_t get_initial_delay_ms() const { return _initial_delay_ms; }
-
-private:
-    // Generate an initial delay randomly in case that all percentiles are computed at the
-    // same time.
-    static uint64_t generate_initial_delay_ms(uint64_t interval_ms);
-
-    void on_close();
-
-    void on_timer(const boost::system::error_code &ec);
-
-    const uint64_t _initial_delay_ms;
-    const uint64_t _interval_ms;
-    const on_exec_fn _on_exec;
-    const on_close_fn _on_close;
-    std::atomic<state> _state;
-    utils::notify_event _completed;
-    std::unique_ptr<boost::asio::deadline_timer> _timer;
-
-    DISALLOW_COPY_AND_ASSIGN(percentile_timer);
-};
-
 // The percentile is a metric type that samples observations. The size of samples has an upper
 // bound. Once the maximum size is reached, the earliest observations will be overwritten.
 //
@@ -911,6 +1340,13 @@ public:
     {
         const auto index = _tail.fetch_add(1, std::memory_order_relaxed);
         _samples.get()[index & (_sample_size - 1)] = val;
+    }
+
+    void set(size_t n, const value_type &val)
+    {
+        for (size_t i = 0; i < n; ++i) {
+            set(val);
+        }
     }
 
     // If `type` is not configured, it will return false with zero value stored in `val`;
@@ -965,6 +1401,8 @@ protected:
     // interval_ms is the interval between the computations for percentiles. Its unit is
     // milliseconds. It's suggested that interval_ms should be near the period between pulls
     // from or pushes to the monitoring system.
+    // TODO(wangdan): we can also support constructing percentiles from the parameters in
+    // the configuration file.
     percentile(const metric_prototype *prototype,
                uint64_t interval_ms = 10000,
                const std::set<kth_percentile_type> &kth_percentiles = kAllKthPercentileTypes,
@@ -991,7 +1429,7 @@ protected:
             _full_nth_elements[i].store(value_type{}, std::memory_order_relaxed);
         }
 
-#ifdef DSN_MOCK_TEST
+#ifdef MOCK_TEST
         if (interval_ms == 0) {
             // Timer is disabled.
             return;
@@ -1009,7 +1447,7 @@ protected:
         // See on_close() for details which is registered in timer and will be called
         // back once close() is invoked.
         add_ref();
-        _timer.reset(new percentile_timer(
+        _timer.reset(new metric_timer(
             interval_ms,
             std::bind(&percentile<value_type, NthElementFinder>::find_nth_elements, this),
             std::bind(&percentile<value_type, NthElementFinder>::on_close, this)));
@@ -1022,6 +1460,7 @@ private:
 
     friend class metric_entity;
     friend class ref_ptr<percentile<value_type, NthElementFinder>>;
+    friend class MetricVarTest;
 
     virtual void close() override
     {
@@ -1044,6 +1483,20 @@ private:
         release_ref();
     }
 
+    std::vector<value_type> samples_for_test()
+    {
+        size_type real_sample_size = std::min(static_cast<size_type>(_tail.load()), _sample_size);
+        if (real_sample_size == 0) {
+            return std::vector<value_type>();
+        }
+
+        std::vector<value_type> real_samples(real_sample_size);
+        std::copy(_samples.get(), _samples.get() + real_sample_size, real_samples.begin());
+        return real_samples;
+    }
+
+    void reset_tail_for_test() { _tail.store(0); }
+
     value_type value(size_t index) const
     {
         return _full_nth_elements[index].load(std::memory_order_relaxed);
@@ -1064,7 +1517,7 @@ private:
         }
 
         // Find nth elements.
-        std::vector<T> array(real_sample_size);
+        std::vector<value_type> array(real_sample_size);
         std::copy(_samples.get(), _samples.get() + real_sample_size, array.begin());
         _nth_element_finder(array.begin(), array.begin(), array.end());
 
@@ -1102,7 +1555,7 @@ private:
     std::vector<std::atomic<value_type>> _full_nth_elements;
     NthElementFinder _nth_element_finder;
 
-    std::unique_ptr<percentile_timer> _timer;
+    std::unique_ptr<metric_timer> _timer;
 
     DISALLOW_COPY_AND_ASSIGN(percentile);
 };
@@ -1133,4 +1586,248 @@ template <typename T,
 using floating_percentile_prototype =
     metric_prototype_with<floating_percentile<T, NthElementFinder>>;
 
+// Compute latency automatically at the end of the scope, which is set to percentile which it has
+// bound to.
+class auto_latency
+{
+public:
+    auto_latency(const percentile_ptr<int64_t> &p) : _percentile(p) {}
+
+    auto_latency(const percentile_ptr<int64_t> &p, std::function<void(uint64_t)> callback)
+        : _percentile(p), _callback(std::move(callback))
+    {
+    }
+
+    auto_latency(const percentile_ptr<int64_t> &p, uint64_t start_time_ns)
+        : _percentile(p), _chrono(start_time_ns)
+    {
+    }
+
+    auto_latency(const percentile_ptr<int64_t> &p,
+                 uint64_t start_time_ns,
+                 std::function<void(uint64_t)> callback)
+        : _percentile(p), _chrono(start_time_ns), _callback(std::move(callback))
+    {
+    }
+
+    ~auto_latency()
+    {
+        auto latency =
+            convert_metric_latency_from_ns(_chrono.duration_ns(), _percentile->prototype()->unit());
+        _percentile->set(static_cast<int64_t>(latency));
+
+        if (_callback) {
+            _callback(latency);
+        }
+    }
+
+    inline uint64_t duration_ns() const { return _chrono.duration_ns(); }
+
+private:
+    percentile_ptr<int64_t> _percentile;
+    utils::chronograph _chrono;
+    std::function<void(uint64_t)> _callback;
+
+    DISALLOW_COPY_AND_ASSIGN(auto_latency);
+};
+
+// Increment gauge and decrement it automatically at the end of the scope.
+class auto_count
+{
+public:
+    auto_count(const gauge_ptr<int64_t> &g) : _gauge(g) { _gauge->increment(); }
+
+    auto_count(const gauge_ptr<int64_t> &g, std::function<void()> callback)
+        : _gauge(g), _callback(std::move(callback))
+    {
+        _gauge->increment();
+    }
+
+    ~auto_count()
+    {
+        if (_callback) {
+            _callback();
+        }
+
+        _gauge->decrement();
+    }
+
+private:
+    gauge_ptr<int64_t> _gauge;
+    std::function<void()> _callback;
+
+    DISALLOW_COPY_AND_ASSIGN(auto_count);
+};
+
+#define DEF_METRIC_BRIEF_SNAPSHOT(field)                                                           \
+    struct metric_brief_##field##_snapshot                                                         \
+    {                                                                                              \
+        std::string name;                                                                          \
+        double field = 0.0;                                                                        \
+                                                                                                   \
+        DEFINE_JSON_SERIALIZATION(name, field)                                                     \
+    }
+
+#define DEF_METRIC_ENTITY_BRIEF_SNAPSHOT(field)                                                    \
+    struct metric_entity_brief_##field##_snapshot                                                  \
+    {                                                                                              \
+        std::string type;                                                                          \
+        std::string id;                                                                            \
+        metric_entity::attr_map attributes;                                                        \
+        std::vector<metric_brief_##field##_snapshot> metrics;                                      \
+                                                                                                   \
+        DEFINE_JSON_SERIALIZATION(type, id, attributes, metrics)                                   \
+    }
+
+#define DEF_METRIC_QUERY_BRIEF_SNAPSHOT(field)                                                     \
+    struct metric_query_brief_##field##_snapshot                                                   \
+    {                                                                                              \
+        std::string cluster;                                                                       \
+        std::string role;                                                                          \
+        std::string host;                                                                          \
+        uint16_t port;                                                                             \
+        uint64_t timestamp_ns;                                                                     \
+        std::vector<metric_entity_brief_##field##_snapshot> entities;                              \
+                                                                                                   \
+        DEFINE_JSON_SERIALIZATION(cluster, role, host, port, timestamp_ns, entities)               \
+    }
+
+#define DEF_ALL_METRIC_BRIEF_SNAPSHOTS(field)                                                      \
+    DEF_METRIC_BRIEF_SNAPSHOT(field);                                                              \
+    DEF_METRIC_ENTITY_BRIEF_SNAPSHOT(field);                                                       \
+    DEF_METRIC_QUERY_BRIEF_SNAPSHOT(field)
+
+DEF_ALL_METRIC_BRIEF_SNAPSHOTS(value);
+
+DEF_ALL_METRIC_BRIEF_SNAPSHOTS(p99);
+
+// Deserialize the json string into the snapshot.
+template <typename TMetricSnapshot>
+inline error_s deserialize_metric_snapshot(const std::string &json_string,
+                                           TMetricSnapshot &snapshot)
+{
+    dsn::blob bb(json_string.data(), 0, json_string.size());
+    if (dsn_unlikely(!dsn::json::json_forwarder<TMetricSnapshot>::decode(bb, snapshot))) {
+        return FMT_ERR(dsn::ERR_INVALID_DATA, "invalid json string: {}", json_string);
+    }
+
+    return error_s::ok();
+}
+
+#define DESERIALIZE_METRIC_SNAPSHOT(json_string, query_snapshot)                                   \
+    do {                                                                                           \
+        const auto &res = deserialize_metric_snapshot(json_string, query_snapshot);                \
+        if (dsn_unlikely(!res)) {                                                                  \
+            return res;                                                                            \
+        }                                                                                          \
+    } while (0)
+
+// Deserialize the json string into the snapshot specially for metric query which is declared
+// internally.
+#define DESERIALIZE_METRIC_QUERY_BRIEF_SNAPSHOT(field, json_string, query_snapshot)                \
+    dsn::metric_query_brief_##field##_snapshot query_snapshot;                                     \
+    DESERIALIZE_METRIC_SNAPSHOT(json_string, query_snapshot)
+
+// Deserialize both json string samples into respective snapshots.
+template <typename TMetricSnapshot>
+inline error_s deserialize_metric_2_samples(const std::string &json_string_start,
+                                            const std::string &json_string_end,
+                                            TMetricSnapshot &snapshot_start,
+                                            TMetricSnapshot &snapshot_end)
+{
+    DESERIALIZE_METRIC_SNAPSHOT(json_string_start, snapshot_start);
+    DESERIALIZE_METRIC_SNAPSHOT(json_string_end, snapshot_end);
+    return error_s::ok();
+}
+
+// Deserialize both json string samples into respective snapshots specially for metric queries.
+template <typename TMetricQuerySnapshot>
+inline error_s deserialize_metric_query_2_samples(const std::string &json_string_start,
+                                                  const std::string &json_string_end,
+                                                  TMetricQuerySnapshot &snapshot_start,
+                                                  TMetricQuerySnapshot &snapshot_end)
+{
+    const auto &res = deserialize_metric_2_samples(
+        json_string_start, json_string_end, snapshot_start, snapshot_end);
+    if (!res) {
+        return res;
+    }
+
+    if (snapshot_end.timestamp_ns <= snapshot_start.timestamp_ns) {
+        return FMT_ERR(dsn::ERR_INVALID_DATA,
+                       "duration for metric samples should be > 0: timestamp_ns_start={}, "
+                       "timestamp_ns_end={}",
+                       snapshot_start.timestamp_ns,
+                       snapshot_end.timestamp_ns);
+    }
+
+    return error_s::ok();
+}
+
+// Deserialize both json string samples into respective snapshots specially for metric queries
+// which are declared internally.
+//
+// Currently only Gauge and Counter are considered to have "increase" and "rate", which means
+// samples are needed. Thus brief `value` field is enough.
+#define DESERIALIZE_METRIC_QUERY_BRIEF_2_SAMPLES(                                                  \
+    json_string_start, json_string_end, query_snapshot_start, query_snapshot_end)                  \
+    dsn::metric_query_brief_value_snapshot query_snapshot_start;                                   \
+    dsn::metric_query_brief_value_snapshot query_snapshot_end;                                     \
+                                                                                                   \
+    do {                                                                                           \
+        const auto &res = deserialize_metric_query_2_samples(                                      \
+            json_string_start, json_string_end, query_snapshot_start, query_snapshot_end);         \
+        if (dsn_unlikely(!res)) {                                                                  \
+            return res;                                                                            \
+        }                                                                                          \
+    } while (0)
+
+// Find the duration between the 2 timestamps, generally used for calculate the rates over the
+// metrics, such as QPS.
+inline double calc_metric_sample_duration_s(uint64_t timestamp_ns_start, uint64_t timestamp_ns_end)
+{
+    CHECK_LT(timestamp_ns_start, timestamp_ns_end);
+
+    const std::chrono::duration<double, std::nano> duration_ns(
+        static_cast<double>(timestamp_ns_end - timestamp_ns_start));
+    const std::chrono::duration<double> duration_s = duration_ns;
+    return duration_s.count();
+}
+
+// Parse the attributes as their original types.
+template <typename TAttrValue,
+          typename = typename std::enable_if<std::is_arithmetic<TAttrValue>::value>::type>
+inline error_s parse_metric_attribute(const metric_entity::attr_map &attrs,
+                                      const std::string &name,
+                                      TAttrValue &value)
+{
+    const auto *value_ptr = gutil::FindOrNull(attrs, name);
+    if (dsn_unlikely(value_ptr == nullptr)) {
+        return FMT_ERR(dsn::ERR_INVALID_DATA, "{} field was not found", name);
+    }
+
+    if (dsn_unlikely(!dsn::buf2numeric(*value_ptr, value))) {
+        return FMT_ERR(dsn::ERR_INVALID_DATA, "invalid {}: {}", name, *value_ptr);
+    }
+
+    return error_s::ok();
+}
+
+inline error_s parse_metric_table_id(const metric_entity::attr_map &attrs, int32_t &table_id)
+{
+    return parse_metric_attribute(attrs, "table_id", table_id);
+}
+
+inline error_s parse_metric_partition_id(const metric_entity::attr_map &attrs,
+                                         int32_t &partition_id)
+{
+    return parse_metric_attribute(attrs, "partition_id", partition_id);
+}
+
 } // namespace dsn
+
+// Since server_metric_entity() will be called in macros such as METRIC_VAR_INIT_server(), its
+// declaration should be put outside any namespace (for example dsn). server_metric_entity()
+// will not be qualified with any namespace. Once it was qualified with some namespace, its name
+// would not be resolved in any other namespace.
+dsn::metric_entity_ptr server_metric_entity();

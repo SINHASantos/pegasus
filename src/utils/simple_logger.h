@@ -26,10 +26,14 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cstdio>
-#include <thread>
+#include <string>
 
-#include "runtime/tool_api.h"
+#include "utils/api_utilities.h"
+#include "utils/logging_provider.h"
+#include "utils/ports.h"
+#include "utils/synchronize.h"
 
 namespace dsn {
 namespace tools {
@@ -40,28 +44,27 @@ namespace tools {
 class screen_logger : public logging_provider
 {
 public:
-    screen_logger(bool short_header);
-    screen_logger(const char *log_dir);
-    ~screen_logger() override;
+    explicit screen_logger(const char *, const char *);
+    ~screen_logger() override = default;
 
-    virtual void dsn_logv(const char *file,
-                          const char *function,
-                          const int line,
-                          dsn_log_level_t log_level,
-                          const char *fmt,
-                          va_list args);
-
-    virtual void dsn_log(const char *file,
-                         const char *function,
-                         const int line,
-                         dsn_log_level_t log_level,
-                         const char *str){};
+    void log(const char *file,
+             const char *function,
+             const int line,
+             log_level_t log_level,
+             const char *str) override;
 
     virtual void flush();
 
 private:
+    void print_header(log_level_t log_level);
+    void print_long_header(const char *file,
+                           const char *function,
+                           const int line,
+                           log_level_t log_level);
+    void print_body(const char *body, log_level_t log_level);
+
     ::dsn::utils::ex_lock_nr _lock;
-    bool _short_header;
+    const bool _short_header;
 };
 
 /*
@@ -71,36 +74,51 @@ private:
 class simple_logger : public logging_provider
 {
 public:
-    simple_logger(const char *log_dir);
+    // 'log_dir' is the directory to store log files, 'role_name' is the name of the process,
+    // such as 'replica_server', 'meta_server' in Pegasus.
+    simple_logger(const char *log_dir, const char *role_name);
     ~simple_logger() override;
 
-    void dsn_logv(const char *file,
-                  const char *function,
-                  const int line,
-                  dsn_log_level_t log_level,
-                  const char *fmt,
-                  va_list args) override;
-
-    void dsn_log(const char *file,
-                 const char *function,
-                 const int line,
-                 dsn_log_level_t log_level,
-                 const char *str) override;
+    void log(const char *file,
+             const char *function,
+             const int line,
+             log_level_t log_level,
+             const char *str) override;
 
     void flush() override;
 
 private:
+    void print_header(log_level_t log_level);
+    void print_long_header(const char *file,
+                           const char *function,
+                           const int line,
+                           log_level_t log_level);
+    void print_body(const char *body, log_level_t log_level);
+
+    inline void add_bytes_if_valid(int bytes)
+    {
+        if (dsn_likely(bytes > 0)) {
+            _file_bytes += static_cast<uint64_t>(bytes);
+        }
+    }
+
     void create_log_file();
+    void remove_redundant_files();
 
 private:
-    std::string _log_dir;
     ::dsn::utils::ex_lock _lock; // use recursive lock to avoid dead lock when flush() is called
                                  // in signal handler if cored for bad logging format reason.
+    // The directory to store log files.
+    const std::string _log_dir;
+    // The path of the symlink to the latest log file.
+    std::string _symlink_path;
+    // The prefix of the log file names. The actual log files are prefixed by '_file_name_prefix'
+    // and postfixed by timestamp.
+    std::string _file_name_prefix;
+    // The current log file descriptor.
     FILE *_log;
-    int _start_index;
-    int _index;
-    int _lines;
-    dsn_log_level_t _stderr_start_level;
+    // The byte size of the current log file.
+    uint64_t _file_bytes;
 };
 } // namespace tools
 } // namespace dsn

@@ -72,7 +72,6 @@ type MetaManager struct {
 	mu sync.RWMutex
 }
 
-//
 func NewMetaManager(addrs []string, creator NodeSessionCreator) *MetaManager {
 	metas := make([]*metaSession, len(addrs))
 	metaIPAddrs := make([]string, len(addrs))
@@ -95,10 +94,12 @@ func NewMetaManager(addrs []string, creator NodeSessionCreator) *MetaManager {
 
 func (m *MetaManager) call(ctx context.Context, callFunc metaCallFunc) (metaResponse, error) {
 	lead := m.getCurrentLeader()
-	call := newMetaCall(lead, m.metas, callFunc)
+	call := newMetaCall(lead, m.metas, callFunc, m.metaIPAddrs)
 	resp, err := call.Run(ctx)
 	if err == nil {
 		m.setCurrentLeader(int(call.newLead))
+		m.setNewMetas(call.metas)
+		m.setMetaIPAddrs(call.metaIPAddrs)
 	}
 	return resp, err
 }
@@ -130,6 +131,20 @@ func (m *MetaManager) setCurrentLeader(lead int) {
 	defer m.mu.Unlock()
 
 	m.currentLeader = lead
+}
+
+func (m *MetaManager) setNewMetas(metas []*metaSession) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.metas = metas
+}
+
+func (m *MetaManager) setMetaIPAddrs(metaIPAddrs []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.metaIPAddrs = metaIPAddrs
 }
 
 // Close the sessions.

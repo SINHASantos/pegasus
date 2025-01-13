@@ -26,12 +26,32 @@
 
 #pragma once
 
-#include "log_block.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <atomic>
+#include <memory>
+#include <string>
+#include <unordered_map>
 
+#include "aio/aio_task.h"
+#include "common/gpid.h"
+#include "common/replication_other_types.h"
+#include "runtime/api_task.h"
+#include "task/task_code.h"
+#include "utils/autoref_ptr.h"
+#include "utils/error_code.h"
 #include "utils/zlocks.h"
 
 namespace dsn {
+class binary_reader;
+class binary_writer;
+class blob;
+class disk_file;
+class task_tracker;
+
 namespace replication {
+class log_appender;
+class log_block;
 
 // each log file has a log_file_header stored at the beginning of the first block's data content
 struct log_file_header
@@ -45,9 +65,9 @@ struct log_file_header
 // a structure to record replica's log info
 struct replica_log_info
 {
-    int64_t max_decree;
+    decree max_decree;
     int64_t valid_start_offset; // valid start offset in global space
-    replica_log_info(int64_t d, int64_t o)
+    replica_log_info(decree d, int64_t o)
     {
         max_decree = d;
         valid_start_offset = o;
@@ -66,6 +86,7 @@ struct replica_log_info
 typedef std::unordered_map<gpid, replica_log_info> replica_log_info_map;
 
 class log_file;
+
 typedef dsn::ref_ptr<log_file> log_file_ptr;
 
 //
@@ -163,11 +184,14 @@ public:
     // file path
     const std::string &path() const { return _path; }
     // previous decrees
-    const replica_log_info_map &previous_log_max_decrees() { return _previous_log_max_decrees; }
+    const replica_log_info_map &previous_log_max_decrees() const
+    {
+        return _previous_log_max_decrees;
+    }
     // previous decree for speicified gpid
-    decree previous_log_max_decree(const gpid &pid);
+    decree previous_log_max_decree(const gpid &pid) const;
     // file header
-    log_file_header &header() { return _header; }
+    const log_file_header &header() const { return _header; }
 
     // read file header from reader, return byte count consumed
     int read_file_header(binary_reader &reader);
@@ -192,15 +216,16 @@ private:
     friend class mock_log_file;
 
     uint32_t _crc32;
-    int64_t _start_offset; // start offset in the global space
+    const int64_t _start_offset; // start offset in the global space
     std::atomic<int64_t>
         _end_offset; // end offset in the global space: end_offset = start_offset + file_size
     class file_streamer;
+
     std::unique_ptr<file_streamer> _stream;
     disk_file *_handle;        // file handle
     const bool _is_read;       // if opened for read or write
-    std::string _path;         // file path
-    int _index;                // file index
+    const std::string _path;   // file path
+    const int _index;          // file index
     log_file_header _header;   // file header
     uint64_t _last_write_time; // seconds from epoch time
 

@@ -24,22 +24,27 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     Unit-test for perf counter.
- *
- * Revision history:
- *     Nov., 2015, @shengofsun (Weijie Sun), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
-#include "runtime/tool_api.h"
-#include <gtest/gtest.h>
+// IWYU pragma: no_include <ext/alloc_traits.h>
+#include <stdlib.h>
+#include <algorithm>
+#include <chrono>
+#include <functional>
+#include <memory>
 #include <thread>
-#include <cmath>
 #include <vector>
 
+#include "gtest/gtest.h"
+#include "perf_counter/perf_counter.h"
 #include "perf_counter/perf_counter_atomic.h"
+#include "utils/autoref_ptr.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/shared_io_service.h"
+
+DSN_DEFINE_int32(components.simple_perf_counter,
+                 counter_computation_interval_seconds_for_testing,
+                 3,
+                 "period");
 
 using namespace dsn;
 using namespace dsn::tools;
@@ -90,36 +95,33 @@ TEST(perf_counter, perf_counter_atomic)
         vec[i] = rand() % 100;
     }
     std::vector<int> gen_numbers{1, 5, 1043};
-    int sleep_interval = (int)dsn_config_get_value_uint64(
-        "components.simple_perf_counter", "counter_computation_interval_seconds", 3, "period");
-
     perf_counter_ptr counter = new perf_counter_number_atomic(
         "", "", "", dsn_perf_counter_type_t::COUNTER_TYPE_NUMBER, "");
     perf_counter_inc_dec(counter);
     perf_counter_add(counter, vec);
-    LOG_INFO("%lf", counter->get_value());
+    LOG_INFO("{}", counter->get_value());
 
     counter = new perf_counter_volatile_number_atomic(
         "", "", "", dsn_perf_counter_type_t::COUNTER_TYPE_VOLATILE_NUMBER, "");
     perf_counter_inc_dec(counter);
     perf_counter_add(counter, vec);
-    LOG_INFO("%lf", counter->get_value());
+    LOG_INFO("{}", counter->get_value());
 
     counter =
         new perf_counter_rate_atomic("", "", "", dsn_perf_counter_type_t::COUNTER_TYPE_RATE, "");
     perf_counter_inc_dec(counter);
     perf_counter_add(counter, vec);
-    LOG_INFO("%lf", counter->get_value());
+    LOG_INFO("{}", counter->get_value());
 
     counter = new perf_counter_number_percentile_atomic(
         "", "", "", dsn_perf_counter_type_t::COUNTER_TYPE_NUMBER_PERCENTILES, "");
-    std::this_thread::sleep_for(std::chrono::seconds(sleep_interval));
+    std::this_thread::sleep_for(
+        std::chrono::seconds(FLAGS_counter_computation_interval_seconds_for_testing));
     for (auto &count : gen_numbers) {
         for (unsigned int i = 0; i != count; ++i)
             counter->set(rand() % 10000);
-        // std::this_thread::sleep_for(std::chrono::seconds(sleep_interval));
         for (int i = 0; i != COUNTER_PERCENTILE_COUNT; ++i)
-            LOG_INFO("%lf", counter->get_percentile((dsn_perf_counter_percentile_type_t)i));
+            LOG_INFO("{}", counter->get_percentile((dsn_perf_counter_percentile_type_t)i));
     }
 }
 

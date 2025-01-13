@@ -14,12 +14,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
----
-# Developer Notes:
-#
-# This config is for github actions. Before merging your changes of this file,
-# it's recommended to create a PR against the ci-test branch to test if it works
-# as expected.
 
 name: Cpp CI
 
@@ -33,89 +27,107 @@ on:
       - ci-test # testing branch for github action
       - '*dev'
     paths:
-      - '.github/workflows/lint_and_test_cpp.yaml'
-      - '.github/workflows/thirdparty-regular-push.yml'
-      - 'docker/thirdparties-src/**'
-      - 'docker/thirdparties-bin/**'
-      - 'CMakeLists.txt'
-      - 'run.sh'
-      - 'cmake_modules/**'
-      - 'src/**'
-      - 'thirdparty/**'
+      - .github/actions/**
+      - .github/workflows/lint_and_test_cpp.yaml
+      - .github/workflows/thirdparty-regular-push.yml
+      - build_tools/pack_server.sh
+      - build_tools/pack_tools.sh
+      - docker/thirdparties-bin/**
+      - docker/thirdparties-src/**
+      - CMakeLists.txt
+      - cmake_modules/**
+      - run.sh
+      - src/**
+      - thirdparty/**
 
   # for manually triggering workflow
   workflow_dispatch:
 
+env:
+  # Update the options to reduce the consumption of the disk space
+  ONEBOX_OPTS: disk_min_available_space_ratio=5
+  TEST_OPTS: disk_min_available_space_ratio=5;throttle_test_medium_value_kb=10;throttle_test_large_value_kb=25
+
 jobs:
   cpp_clang_format_linter:
-    name: Lint
-    runs-on: ubuntu-latest
-    container:
-      image: apache/pegasus:clang-format-3.9
+    name: Format
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-          submodules: true
+      - uses: actions/checkout@v4
       - name: clang-format
-        run: ./scripts/run-clang-format.py --clang-format-executable clang-format-3.9 -e ./src/shell/linenoise -e ./src/shell/sds -e ./thirdparty -r .
+        run: ./build_tools/run-clang-format.py --clang-format-executable clang-format-14 -e ./src/shell/linenoise -e ./src/shell/sds -e ./thirdparty -r .
+
+  cpp_clang_tidy_linter:
+    name: Tidy
+    runs-on: ubuntu-22.04
+    container:
+      image: apache/pegasus:thirdparties-bin-ubuntu2204-${{ github.base_ref }}
+    steps:
+      - name: Install Softwares
+        run: |
+          apt-get update
+          apt-get install clang-tidy -y
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rebuild thirdparty if needed
+        uses: "./.github/actions/rebuild_thirdparty_if_needed"
+      - name: clang-tidy
+        run: |
+          git config --global --add safe.directory $(pwd)
+          ./run.sh build --test --compiler clang-14,clang++-14 -t debug --skip_thirdparty -c --cmake_only
+          ./build_tools/clang_tidy.py --rev-range $(git log origin/${{ github.base_ref }} -n1 --format=format:"%H")
+        shell: bash
+
+  iwyu:
+    name: IWYU
+    needs:
+      - cpp_clang_format_linter
+    runs-on: ubuntu-latest
+    env:
+      USE_JEMALLOC: OFF
+    container:
+      image: apache/pegasus:thirdparties-bin-ubuntu2204-${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free Disk Space (Ubuntu)
+        run: |
+          .github/workflows/free_disk_space.sh
+      - name: Rebuild thirdparty if needed
+        uses: "./.github/actions/rebuild_thirdparty_if_needed"
+      - name: Build IWYU binary
+        run: |
+          mkdir iwyu && cd iwyu && git clone https://github.com/include-what-you-use/include-what-you-use.git
+          cd include-what-you-use && git checkout clang_14
+          cd .. && mkdir build && cd build && cmake -G "Unix Makefiles" -DCMAKE_PREFIX_PATH=/usr/lib/llvm-14 ../include-what-you-use
+          make -j $(nproc)
+      - name: Check IWYU
+        run: |
+          PWD=`pwd`
+          ./run.sh build --test --compiler clang-14,clang++-14 -j $(nproc) -t release --iwyu ${PWD}/iwyu/build/bin/include-what-you-use --skip_thirdparty
+          python3 iwyu/include-what-you-use/fix_includes.py --blank_lines --reorder --nocomments --nosafe_headers --separate_project_includes="<tld>" --ignore_re="thrift-gen|rrdb_types|layer2_types|metrics_test.cpp" --dry_run < build/latest/iwyu.out
+          python3 iwyu/include-what-you-use/fix_includes.py --blank_lines --reorder --nocomments --nosafe_headers --separate_project_includes="<tld>" --ignore_re="thrift-gen|rrdb_types|layer2_types|metrics_test.cpp" --dry_run < build/latest/iwyu.out | egrep "IWYU edited 0 files on your behalf"
 
   build_Release:
     name: Build Release
-    needs: cpp_clang_format_linter
+    needs:
+      - cpp_clang_format_linter
     runs-on: ubuntu-latest
+    env:
+      USE_JEMALLOC: OFF
+      ARTIFACT_NAME: release
+      BUILD_OPTIONS: -t release --test
     container:
-      image: apache/pegasus:thirdparties-bin-test-ubuntu1804-${{ github.base_ref }}
+      image: apache/pegasus:thirdparties-bin-test-ubuntu2204-${{ github.base_ref }}
     steps:
-      - uses: actions/checkout@v2
-      - name: Setup cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            /github/home/.ccache
-          key: release_ccache
-      - uses: dorny/paths-filter@v2
-        id: changes
-        with:
-          filters: |
-            thirdparty:
-              - '.github/workflows/thirdparty-regular-push.yml'
-              - 'docker/thirdparties-src/**'
-              - 'docker/thirdparties-bin/**'
-              - 'thirdparty/**'
-      - name: Unpack prebuilt third-parties
-        if: steps.changes.outputs.thirdparty == 'false'
-        run: unzip /root/thirdparties-bin.zip -d ./thirdparty
-      - name: Rebuild third-parties
-        if: steps.changes.outputs.thirdparty == 'true'
-        working-directory: thirdparty
-        run: |
-          mkdir build
-          cmake -DCMAKE_BUILD_TYPE=Release -DROCKSDB_PORTABLE=ON -B build/
-          cmake --build build/ -j $(nproc)
-          ../scripts/download_hadoop.sh hadoop-bin
-          ../scripts/download_zk.sh zookeeper-bin
-      - name: Compilation
-        run: |
-          ccache -p
-          ccache -z
-          ./run.sh build --test --skip_thirdparty -j $(nproc) -t release
-          ccache -s
-      - name: Pack Server
-        run: ./run.sh pack_server
-      - name: Pack Tools
-        run: ./run.sh pack_tools
-      - name: Tar files
-        run: |
-          mv thirdparty/hadoop-bin ./
-          mv thirdparty/zookeeper-bin ./
-          rm -rf thirdparty
-          tar -zcvhf release__builder.tar src/builder/output src/builder/bin src/builder/src/server/test/config.ini hadoop-bin zookeeper-bin --exclude='*CMakeFiles*'
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: release_artifact_${{ github.sha }}
-          path: release__builder.tar
+      - name: Clone code
+        uses: actions/checkout@v4
+      - name: Rebuild thirdparty if needed
+        uses: "./.github/actions/rebuild_thirdparty_if_needed"
+      - name: Build Pegasus
+        uses: "./.github/actions/build_pegasus"
+      - name: Upload artifact
+        uses: "./.github/actions/upload_artifact"
 
   test_Release:
     name: Test Release
@@ -127,24 +139,35 @@ jobs:
           - base_api_test
           - base_test
           - bulk_load_test
-          - detect_hotspot_test
+          # TODO(wangdan): Since the hotspot detection depends on the perf-counters system which
+          # is being replaced with the new metrics system, its test will fail. Temporarily disable
+          # the test and re-enable it after the hotspot detection is migrated to the new metrics
+          # system.
+          # - detect_hotspot_test
           - dsn_aio_test
           - dsn_block_service_test
+          - dsn_client_test
           - dsn.failure_detector.tests
           - dsn_http_test
           - dsn_meta_state_tests
           - dsn.meta.test
           - dsn_nfs_test
-          - dsn_perf_counter_test
+          # TODO(wangdan): Since builtin_counters (memused.virt and memused.res) for perf-counters
+          # have been removed and dsn_perf_counter_test depends on them, disable it.
+          # - dsn_perf_counter_test
+          - dsn_ranger_tests
           - dsn_replica_backup_test
           - dsn_replica_bulk_load_test
           - dsn_replica_dup_test
           - dsn_replica_split_test
+          - dsn_rpc_tests
           - dsn.replica.test
           - dsn_replication_common_test
           - dsn.replication.simple_kv
           - dsn.rep_tests.simple_kv
           - dsn_runtime_tests
+          - dsn_security_tests
+          - dsn_task_tests
           - dsn_utils_tests
           - dsn.zookeeper.tests
           # TODO(yingchun): Disable it because we find it's too flaky, we will re-enable it after
@@ -155,83 +178,41 @@ jobs:
           - pegasus_unit_test
           - recovery_test
           - restore_test
+          - security_test
           - throttle_test
     needs: build_Release
     runs-on: ubuntu-latest
+    env:
+      ARTIFACT_NAME: release
     container:
-      image: apache/pegasus:thirdparties-bin-test-ubuntu1804-${{ github.base_ref }}
+      image: apache/pegasus:thirdparties-bin-test-ubuntu2204-${{ github.base_ref }}
       options: --cap-add=SYS_PTRACE
     steps:
-      - uses: actions/checkout@v2
-      - name: Unpack prebuilt third-parties
-        run: unzip /root/thirdparties-bin.zip -d ./thirdparty
-      - name: Download Artifact
-        uses: actions/download-artifact@v3
-        with:
-          name: release_artifact_${{ github.sha }}
-          path: .
-      - name: Tar files
-        run: |
-          tar -zxvf release__builder.tar
-      - name: Unit Testing
-        run: |
-          export LD_LIBRARY_PATH=`pwd`/thirdparty/output/lib:/usr/lib/jvm/java-8-openjdk-amd64/jre/lib/amd64/server
-          ulimit -s unlimited
-          . ./scripts/config_hdfs.sh
-          ./run.sh test -m ${{ matrix.test_module }}
+      - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: "./.github/actions/download_artifact"
+      - name: Run server tests
+        uses: "./.github/actions/run_server_tests"
 
   build_ASAN:
     name: Build ASAN
-    needs: cpp_clang_format_linter
+    needs:
+      - cpp_clang_format_linter
     runs-on: ubuntu-latest
+    env:
+      USE_JEMALLOC: OFF
+      ARTIFACT_NAME: release_address
+      BUILD_OPTIONS: --sanitizer address --disable_gperf --test
     container:
-      image: apache/pegasus:thirdparties-bin-test-ubuntu1804-${{ github.base_ref }}
+      image: apache/pegasus:thirdparties-bin-test-ubuntu2204-${{ github.base_ref }}
     steps:
-      - uses: actions/checkout@v2
-      - name: Setup cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            /github/home/.ccache
-          key: asan_ccache
-      - uses: dorny/paths-filter@v2
-        id: changes
-        with:
-          filters: |
-            thirdparty:
-              - '.github/workflows/thirdparty-regular-push.yml'
-              - 'docker/thirdparties-src/**'
-              - 'docker/thirdparties-bin/**'
-              - 'thirdparty/**'
-      - name: Unpack prebuilt third-parties
-        if: steps.changes.outputs.thirdparty == 'false'
-        run: unzip /root/thirdparties-bin.zip -d ./thirdparty
-      - name: Rebuild third-parties
-        if: steps.changes.outputs.thirdparty == 'true'
-        working-directory: thirdparty
-        run: |
-          mkdir build
-          cmake -DCMAKE_BUILD_TYPE=Release -DROCKSDB_PORTABLE=ON -B build/
-          cmake --build build/ -j $(nproc)
-          ../scripts/download_hadoop.sh hadoop-bin
-          ../scripts/download_zk.sh zookeeper-bin
-      - name: Compilation
-        run: |
-          ccache -p
-          ccache -z
-          ./run.sh build --test --sanitizer address --skip_thirdparty --disable_gperf -j $(nproc)
-          ccache -s
-      - name: Tar files
-        run: |
-          mv thirdparty/hadoop-bin ./
-          mv thirdparty/zookeeper-bin ./
-          rm -rf thirdparty
-          tar -zcvhf release_address_builder.tar src/builder/output src/builder/bin src/builder/src/server/test/config.ini hadoop-bin zookeeper-bin --exclude='*CMakeFiles*'
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: release_address_artifact_${{ github.sha }}
-          path: release_address_builder.tar
+      - uses: actions/checkout@v4
+      - name: Rebuild thirdparty if needed
+        uses: "./.github/actions/rebuild_thirdparty_if_needed"
+      - name: Build Pegasus
+        uses: "./.github/actions/build_pegasus"
+      - name: Upload artifact
+        uses: "./.github/actions/upload_artifact"
 
   test_ASAN:
     name: Test ASAN
@@ -243,24 +224,35 @@ jobs:
           - base_api_test
           - base_test
           - bulk_load_test
-          - detect_hotspot_test
+          # TODO(wangdan): Since the hotspot detection depends on the perf-counters system which
+          # is being replaced with the new metrics system, its test will fail. Temporarily disable
+          # the test and re-enable it after the hotspot detection is migrated to the new metrics
+          # system.
+          # - detect_hotspot_test
           - dsn_aio_test
           - dsn_block_service_test
+          - dsn_client_test
           - dsn.failure_detector.tests
           - dsn_http_test
           - dsn_meta_state_tests
           - dsn.meta.test
           - dsn_nfs_test
-          - dsn_perf_counter_test
+          # TODO(wangdan): Since builtin_counters (memused.virt and memused.res) for perf-counters
+          # have been removed and dsn_perf_counter_test depends on them, disable it.
+          # - dsn_perf_counter_test
+          - dsn_ranger_tests
           - dsn_replica_backup_test
           - dsn_replica_bulk_load_test
           - dsn_replica_dup_test
           - dsn_replica_split_test
+          - dsn_rpc_tests
           - dsn.replica.test
           - dsn_replication_common_test
           - dsn.replication.simple_kv
           - dsn.rep_tests.simple_kv
           - dsn_runtime_tests
+          - dsn_security_tests
+          - dsn_task_tests
           - dsn_utils_tests
           - dsn.zookeeper.tests
           # TODO(yingchun): Disable it because we find it's too flaky, we will re-enable it after
@@ -271,88 +263,46 @@ jobs:
           - pegasus_unit_test
           - recovery_test
           - restore_test
+          - security_test
           # TODO(yingchun): Disable it because we find it's too flaky, we will re-enable it after
           # it has been optimized.
 #          - throttle_test
     needs: build_ASAN
     runs-on: ubuntu-latest
+    env:
+      ARTIFACT_NAME: release_address
     container:
-      image: apache/pegasus:thirdparties-bin-test-ubuntu1804-${{ github.base_ref }}
+      image: apache/pegasus:thirdparties-bin-test-ubuntu2204-${{ github.base_ref }}
       options: --cap-add=SYS_PTRACE
     steps:
-      - uses: actions/checkout@v2
-      - name: Unpack prebuilt third-parties
-        run: unzip /root/thirdparties-bin.zip -d ./thirdparty
-      - name: Download Artifact
-        uses: actions/download-artifact@v3
-        with:
-          name: release_address_artifact_${{ github.sha }}
-          path: .
-      - name: Tar files
-        run: |
-          tar -zxvf release_address_builder.tar
-      - name: Unit Testing
-        run: |
-          export LD_LIBRARY_PATH=`pwd`/thirdparty/output/lib:/usr/lib/jvm/java-8-openjdk-amd64/jre/lib/amd64/server
-          ulimit -s unlimited
-          . ./scripts/config_hdfs.sh
-          ./run.sh test -m ${{ matrix.test_module }}
+      - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: "./.github/actions/download_artifact"
+      - name: Run server tests
+        uses: "./.github/actions/run_server_tests"
 
 # TODO(yingchun): Build and test UBSAN version would cost a very long time, we will run these tests
 #                 when we are going to release a stable version. So we disable them in regular CI
 #                 before we find any way to reduce the time cost.
 #  build_UBSAN:
 #    name: Build UBSAN
-#    needs: cpp_clang_format_linter
+#    needs:
+#      - cpp_clang_format_linter
 #    runs-on: ubuntu-latest
+#    env:
+#      USE_JEMALLOC: OFF
+#      ARTIFACT_NAME: release_undefined
+#      BUILD_OPTIONS: --sanitizer undefined --disable_gperf --test
 #    container:
-#      image: apache/pegasus:thirdparties-bin-test-ubuntu1804-${{ github.base_ref }}
+#      image: apache/pegasus:thirdparties-bin-test-ubuntu2204-${{ github.base_ref }}
 #    steps:
-#      - uses: actions/checkout@v2
-#      - name: Setup cache
-#        uses: actions/cache@v3
-#        with:
-#          path: |
-#            /github/home/.ccache
-#          key: ubsan_ccache
-#      - uses: dorny/paths-filter@v2
-#        id: changes
-#        with:
-#          filters: |
-#            thirdparty:
-#              - '.github/workflows/thirdparty-regular-push.yml'
-#              - 'docker/thirdparties-src/**'
-#              - 'docker/thirdparties-bin/**'
-#              - 'thirdparty/**'
-#      - name: Unpack prebuilt third-parties
-#        if: steps.changes.outputs.thirdparty == 'false'
-#        run: unzip /root/thirdparties-bin.zip -d ./thirdparty
-#      - name: Rebuild third-parties
-#        if: steps.changes.outputs.thirdparty == 'true'
-#        working-directory: thirdparty
-#        run: |
-#          mkdir build
-#          cmake -DCMAKE_BUILD_TYPE=Release -DROCKSDB_PORTABLE=ON -B build/
-#          cmake --build build/ -j $(nproc)
-#          ../scripts/download_hadoop.sh hadoop-bin
-#          ../scripts/download_zk.sh zookeeper-bin
-#      - name: Compilation
-#        run: |
-#          ccache -p
-#          ccache -z
-#          ./run.sh build --test --sanitizer undefined --skip_thirdparty --disable_gperf -j $(nproc)
-#          ccache -s
-#      - name: Tar files
-#        run: |
-#          mv thirdparty/hadoop-bin ./
-#          mv thirdparty/zookeeper-bin ./
-#          rm -rf thirdparty
-#          tar -zcvhf release_undefined_builder.tar src/builder/output src/builder/bin src/builder/src/server/test/config.ini hadoop-bin zookeeper-bin --exclude='*CMakeFiles*'
-#      - name: Upload Artifact
-#        uses: actions/upload-artifact@v3
-#        with:
-#          name: release_undefined_artifact_${{ github.sha }}
-#          path: release_undefined_builder.tar
+#      - uses: actions/checkout@v4
+#      - name: Rebuild thirdparty if needed
+#        uses: "./.github/actions/rebuild_thirdparty_if_needed"
+#      - name: Build Pegasus
+#        uses: "./.github/actions/build_pegasus"
+#      - name: Upload artifact
+#        uses: "./.github/actions/upload_artifact"
 #
 #  test_UBSAN:
 #    name: Test UBSAN
@@ -364,24 +314,35 @@ jobs:
 #          - base_api_test
 #          - base_test
 #          - bulk_load_test
-#          - detect_hotspot_test
+#          # TODO(wangdan): Since the hotspot detection depends on the perf-counters system which
+#          # is being replaced with the new metrics system, its test will fail. Temporarily disable
+#          # the test and re-enable it after the hotspot detection is migrated to the new metrics
+#          # system.
+#          # - detect_hotspot_test
 #          - dsn_aio_test
 #          - dsn_block_service_test
+#          - dsn_client_test
 #          - dsn.failure_detector.tests
 #          - dsn_http_test
 #          - dsn_meta_state_tests
 #          - dsn.meta.test
 #          - dsn_nfs_test
-#          - dsn_perf_counter_test
+#          # TODO(wangdan): Since builtin_counters (memused.virt and memused.res) for perf-counters
+#          # have been removed and dsn_perf_counter_test depends on them, disable it.
+#          # - dsn_perf_counter_test
+#          - dsn_ranger_tests
 #          - dsn_replica_backup_test
 #          - dsn_replica_bulk_load_test
 #          - dsn_replica_dup_test
 #          - dsn_replica_split_test
+#          - dsn_rpc_tests
 #          - dsn.replica.test
 #          - dsn_replication_common_test
 #          - dsn.replication.simple_kv
 #          - dsn.rep_tests.simple_kv
 #          - dsn_runtime_tests
+#          - dsn_security_tests
+#          - dsn_task_tests
 #          - dsn_utils_tests
 #          - dsn.zookeeper.tests
 #          - partition_split_test
@@ -390,87 +351,42 @@ jobs:
 #          - pegasus_unit_test
 #          - recovery_test
 #          - restore_test
+#          - security_test
 #          - throttle_test
 #    needs: build_UBSAN
 #    runs-on: ubuntu-latest
+#    env:
+#      ARTIFACT_NAME: release_undefined
 #    container:
-#      image: apache/pegasus:thirdparties-bin-test-ubuntu1804-${{ github.base_ref }}
+#      image: apache/pegasus:thirdparties-bin-test-ubuntu2204-${{ github.base_ref }}
 #      options: --cap-add=SYS_PTRACE
 #    steps:
-#      - uses: actions/checkout@v2
-#      - name: Unpack prebuilt third-parties
-#        run: unzip /root/thirdparties-bin.zip -d ./thirdparty
-#      - name: Download Artifact
-#        uses: actions/download-artifact@v3
-#        with:
-#          name: release_undefined_artifact_${{ github.sha }}
-#          path: .
-#      - name: Tar files
-#        run: |
-#          tar -zxvf release_undefined_builder.tar
-#      - name: Unit Testing
-#        run: |
-#          export LD_LIBRARY_PATH=`pwd`/thirdparty/output/lib:/usr/lib/jvm/java-8-openjdk-amd64/jre/lib/amd64/server
-#          ulimit -s unlimited
-#          . ./scripts/config_hdfs.sh
-#          ./run.sh test -m ${{ matrix.test_module }}
+#      - uses: actions/checkout@v4
+#      - name: Download artifact
+#        uses: "./.github/actions/download_artifact"
+#      - name: Run server tests
+#        uses: "./.github/actions/run_server_tests"
 
   build_with_jemalloc:
     name: Build with jemalloc
-    needs: cpp_clang_format_linter
+    needs:
+      - cpp_clang_format_linter
     runs-on: ubuntu-latest
+    env:
+      USE_JEMALLOC: ON
+      ARTIFACT_NAME: release_jemalloc
+      BUILD_OPTIONS: -t release --use_jemalloc --test
     container:
-      image: apache/pegasus:thirdparties-bin-test-jemallc-ubuntu1804-${{ github.base_ref }}
+      image: apache/pegasus:thirdparties-bin-test-jemallc-ubuntu2204-${{ github.base_ref }}
     steps:
-      - uses: actions/checkout@v2
-      - name: Setup cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            /github/home/.ccache
-          key: jemalloc_ccache
-      - uses: dorny/paths-filter@v2
-        id: changes
-        with:
-          filters: |
-            thirdparty:
-              - '.github/workflows/thirdparty-regular-push.yml'
-              - 'docker/thirdparties-src/**'
-              - 'docker/thirdparties-bin/**'
-              - 'thirdparty/**'
-      - name: Unpack prebuilt third-parties
-        if: steps.changes.outputs.thirdparty == 'false'
-        run: unzip /root/thirdparties-bin.zip -d ./thirdparty
-      - name: Rebuild third-parties
-        if: steps.changes.outputs.thirdparty == 'true'
-        working-directory: thirdparty
-        run: |
-          mkdir build
-          cmake -DCMAKE_BUILD_TYPE=Release -DROCKSDB_PORTABLE=ON -DUSE_JEMALLOC=ON -B build/
-          cmake --build build/ -j $(nproc)
-          ../scripts/download_hadoop.sh hadoop-bin
-          ../scripts/download_zk.sh zookeeper-bin
-      - name: Compilation
-        run: |
-          ccache -p
-          ccache -z
-          ./run.sh build --test --skip_thirdparty -j $(nproc) -t release --use_jemalloc
-          ccache -s
-      - name: Pack Server
-        run: ./run.sh pack_server -j
-      - name: Pack Tools
-        run: ./run.sh pack_tools -j
-      - name: Tar files
-        run: |
-          mv thirdparty/hadoop-bin ./
-          mv thirdparty/zookeeper-bin ./
-          rm -rf thirdparty
-          tar -zcvhf release_jemalloc_builder.tar src/builder/output src/builder/bin src/builder/src/server/test/config.ini hadoop-bin zookeeper-bin --exclude='*CMakeFiles*'
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: release_jemalloc_artifact_${{ github.sha }}
-          path: release_jemalloc_builder.tar
+      - uses: actions/checkout@v4
+      - name: Rebuild thirdparty if needed
+        uses: "./.github/actions/rebuild_thirdparty_if_needed"
+      # TODO(yingchun): Append "-m dsn_utils_tests" to the command if not needed to pack server or tools, for example, the dependencies are static linked.
+      - name: Build Pegasus
+        uses: "./.github/actions/build_pegasus"
+      - name: Upload artifact
+        uses: "./.github/actions/upload_artifact"
 
   test_with_jemalloc:
     name: Test with jemallc
@@ -481,44 +397,30 @@ jobs:
           - dsn_utils_tests
     needs: build_with_jemalloc
     runs-on: ubuntu-latest
+    env:
+      ARTIFACT_NAME: release_jemalloc
     container:
-      image: apache/pegasus:thirdparties-bin-test-jemallc-ubuntu1804-${{ github.base_ref }}
+      image: apache/pegasus:thirdparties-bin-test-jemallc-ubuntu2204-${{ github.base_ref }}
       options: --cap-add=SYS_PTRACE
     steps:
-      - uses: actions/checkout@v2
-      - name: Unpack prebuilt third-parties
-        run: unzip /root/thirdparties-bin.zip -d ./thirdparty
-      - name: Download Artifact
-        uses: actions/download-artifact@v3
-        with:
-          name: release_jemalloc_artifact_${{ github.sha }}
-          path: .
-      - name: Tar files
-        run: |
-          tar -zxvf release_jemalloc_builder.tar
-      - name: Unit Testing
-        run: |
-          export LD_LIBRARY_PATH=`pwd`/thirdparty/output/lib:/usr/lib/jvm/java-8-openjdk-amd64/jre/lib/amd64/server
-          ulimit -s unlimited
-          . ./scripts/config_hdfs.sh
-          ./run.sh test -m ${{ matrix.test_module }}
+      - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: "./.github/actions/download_artifact"
+      - name: Run server tests
+        uses: "./.github/actions/run_server_tests"
 
-  build_pegasus_on_macos:
-    name: macOS
-    needs: cpp_clang_format_linter
-    runs-on: macos-12
-    env:
-      OPENSSL_ROOT_DIR: /usr/local/opt/openssl
+  build_release_on_macos:
+    name: Build Release on macOS
+    needs:
+      - cpp_clang_format_linter
+    runs-on: macos-15
     steps:
       - name: Install Softwares
         run: |
-          # Preinstalled softwares: https://github.com/actions/virtual-environments/blob/main/images/macos/macos-12-Readme.md
+          # Preinstalled softwares: https://github.com/actions/virtual-environments/blob/main/images/macos/macos-15-Readme.md
           brew install ccache
-          brew install snappy
-          brew install lz4
-          brew install zstd
           brew install openssl@1.1
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Setup cache
         uses: actions/cache@v3
         with:
@@ -527,13 +429,13 @@ jobs:
           key: macos_build_ccache
           restore-keys: |
             macos_build_ccache
-            macos-12-thirdparty-bins
+            macos-15-thirdparty-bins
       - name: Build thirdparty
         working-directory: thirdparty
         run: |
           export JAVA_HOME="${JAVA_HOME_8_X64}"
           mkdir -p build
-          cmake -DCMAKE_BUILD_TYPE=Release -B build/ -DMACOS_OPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}
+          cmake -DCMAKE_BUILD_TYPE=Release -B build/ -DROCKSDB_PORTABLE=1
           cmake --build build/ -j $(sysctl -n hw.physicalcpu)
       - name: Compilation
         run: |
@@ -541,3 +443,22 @@ jobs:
           ccache -z
           ./run.sh build --test --skip_thirdparty -j $(sysctl -n hw.physicalcpu)
           ccache -s
+
+  build_debug_on_rockylinux9:
+    name: Build Debug on Rockylinux 9
+    needs:
+      - cpp_clang_format_linter
+    runs-on: ubuntu-latest
+    env:
+      USE_JEMALLOC: OFF
+      BUILD_OPTIONS: -t debug --test --separate_servers
+      PACK_OPTIONS: --separate_servers
+    container:
+      image: apache/pegasus:thirdparties-bin-rockylinux9-${{ github.base_ref }}
+    steps:
+      - name: Clone code
+        uses: actions/checkout@v3
+      - name: Rebuild thirdparty if needed
+        uses: "./.github/actions/rebuild_thirdparty_if_needed"
+      - name: Build Pegasus
+        uses: "./.github/actions/build_pegasus"

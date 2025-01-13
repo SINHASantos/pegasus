@@ -24,23 +24,31 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     distributed lock service implemented with zookeeper
- *
- * Revision history:
- *     2015-12-04, @shengofsun (sunweijie@xiaomi.com)
- */
 #pragma once
 
-#include "utils/distributed_lock_service.h"
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "boost/container/detail/std_fwd.hpp"
 #include "lock_types.h"
+#include "task/future_types.h"
+#include "task/task.h"
+#include "task/task_code.h"
+#include "utils/autoref_ptr.h"
+#include "utils/distributed_lock_service.h"
+#include "utils/error_code.h"
+#include "utils/synchronize.h"
 
 namespace dsn {
 namespace dist {
 
 class zookeeper_session;
+
 class distributed_lock_service_zookeeper : public distributed_lock_service, public ref_counter
 {
 public:
@@ -118,5 +126,5 @@ private:
 
     friend class lock_struct;
 };
-}
-}
+} // namespace dist
+} // namespace dsn

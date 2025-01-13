@@ -17,7 +17,21 @@
 
 #pragma once
 
+#include <stdint.h>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "common/gpid.h"
+#include "dsn.layer2_types.h"
+#include "meta_admin_types.h"
 #include "meta_data.h"
+#include "rpc/rpc_host_port.h"
+#include "utils/command_manager.h"
+#include "utils/zlocks.h"
 
 namespace dsn {
 namespace replication {
@@ -40,7 +54,6 @@ public:
     cure(meta_view view, const dsn::gpid &gpid, configuration_proposal_action &action);
     void reconfig(meta_view view, const configuration_update_request &request);
     void register_ctrl_commands();
-    void unregister_ctrl_commands();
     void get_ddd_partitions(const gpid &pid, std::vector<ddd_partition_info> &partitions);
     void clear_ddd_partitions()
     {
@@ -61,7 +74,6 @@ private:
     void finish_cure_proposal(meta_view &view,
                               const dsn::gpid &gpid,
                               const configuration_proposal_action &action);
-    std::string ctrl_assign_delay_ms(const std::vector<std::string> &args);
     std::string ctrl_assign_secondary_black_list(const std::vector<std::string> &args);
 
     void set_ddd_partition(ddd_partition_info &&partition)
@@ -70,14 +82,13 @@ private:
         _ddd_partitions[partition.config.pid] = std::move(partition);
     }
 
-    bool in_black_list(dsn::rpc_address addr)
+    bool in_black_list(const dsn::host_port &hp)
     {
         dsn::zauto_read_lock l(_black_list_lock);
-        return _assign_secondary_black_list.count(addr) != 0;
+        return _assign_secondary_black_list.count(hp) != 0;
     }
 
     meta_service *_svc;
-    perf_counter_wrapper _recent_choose_primary_fail_count;
 
     mutable zlock _ddd_partitions_lock; // [
     std::map<gpid, ddd_partition_info> _ddd_partitions;
@@ -87,11 +98,11 @@ private:
     // but when adding secondary, the black list is accessed in THREADPOOL_META_STATE
     // so we need a lock to protect it
     dsn::zrwlock_nr _black_list_lock; // [
-    std::set<dsn::rpc_address> _assign_secondary_black_list;
+    std::set<dsn::host_port> _assign_secondary_black_list;
     // ]
 
     std::vector<std::unique_ptr<command_deregister>> _cmds;
-    uint64_t _replica_assign_delay_ms_for_dropouts;
+    int64_t _replica_assign_delay_ms_for_dropouts;
 
     friend class meta_partition_guardian_test;
 };

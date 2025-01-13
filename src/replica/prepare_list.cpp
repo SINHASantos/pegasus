@@ -26,8 +26,15 @@
 
 #include "prepare_list.h"
 
-#include "utils/latency_tracer.h"
+#include <memory>
+#include <utility>
+
+#include "common/replication_enums.h"
+#include "consensus_types.h"
+#include "replica/mutation_cache.h"
+#include "utils/autoref_ptr.h"
 #include "utils/fmt_logging.h"
+#include "utils/latency_tracer.h"
 
 namespace dsn {
 namespace replication {
@@ -100,22 +107,22 @@ error_code prepare_list::prepare(mutation_ptr &mu,
         CHECK_EQ_PREFIX_MSG(mutation_cache::put(mu), ERR_OK, "mutation_cache::put failed");
         return ERR_OK;
 
-    //// delayed commit - only when capacity is an issue
-    // case partition_status::PS_POTENTIAL_SECONDARY:
-    //    while (true)
-    //    {
-    //        error_code err = mutation_cache::put(mu);
-    //        if (err == ERR_CAPACITY_EXCEEDED)
-    //        {
-    //            CHECK_GE(mu->data.header.last_committed_decree, min_decree());
-    //            commit (min_decree(), true);
-    //            pop_min();
-    //        }
-    //        else
-    //            break;
-    //    }
-    //    CHECK_EQ(err, ERR_OK);
-    //    return ERR_OK;
+        //// delayed commit - only when capacity is an issue
+        // case partition_status::PS_POTENTIAL_SECONDARY:
+        //    while (true)
+        //    {
+        //        error_code err = mutation_cache::put(mu);
+        //        if (err == ERR_CAPACITY_EXCEEDED)
+        //        {
+        //            CHECK_GE(mu->data.header.last_committed_decree, min_decree());
+        //            commit (min_decree(), true);
+        //            pop_min();
+        //        }
+        //        else
+        //            break;
+        //    }
+        //    CHECK_EQ(err, ERR_OK);
+        //    return ERR_OK;
 
     case partition_status::PS_INACTIVE: // only possible during init
         if (mu->data.header.last_committed_decree > max_decree()) {
@@ -176,17 +183,16 @@ void prepare_list::commit(decree d, commit_type ct)
         return;
     }
     case COMMIT_ALL_READY: {
-        if (d != last_committed_decree() + 1)
+        if (d != last_committed_decree() + 1) {
             return;
+        }
 
-        int count = 0;
         mutation_ptr mu = get_mutation_by_decree(last_committed_decree() + 1);
 
         while (mu != nullptr && mu->is_ready_for_commit() && mu->data.header.ballot >= last_bt) {
             _last_committed_decree++;
             last_bt = mu->data.header.ballot;
             _committer(mu);
-            count++;
             mu = mutation_cache::get_mutation_by_decree(_last_committed_decree + 1);
         }
 

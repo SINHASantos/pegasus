@@ -17,32 +17,54 @@
  * under the License.
  */
 
-#include "geo/lib/geo_client.h"
-#include <gtest/gtest.h>
-#include <s2/s2cap.h>
-#include <s2/s2testing.h>
-#include <s2/s2earth.h>
-#include <s2/s2cell.h>
-#include "utils/strings.h"
-#include "utils/string_conv.h"
 #include <base/pegasus_key_schema.h>
-#include "utils/fmt_logging.h"
-#include "common/replication_other_types.h"
+#include <math.h>
+#include <pegasus/error.h>
+#include <s2/s1angle.h>
+#include <s2/s2cap.h>
+#include <s2/s2cell.h>
+#include <s2/s2cell_id.h>
+#include <s2/s2earth.h>
+#include <s2/s2latlng.h>
+#include <s2/s2testing.h>
+#include <stdint.h>
+#include <list>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "client/replication_ddl_client.h"
-#include "base/pegasus_const.h"
+#include "common/common.h"
+#include "common/replication_other_types.h"
+#include "geo/lib/geo_client.h"
+#include "gtest/gtest.h"
+#include "pegasus/client.h"
+#include "rpc/rpc_host_port.h"
+#include "utils/blob.h"
+#include "utils/error_code.h"
+#include "utils/flags.h"
+#include "utils/fmt_logging.h"
+#include "utils/string_conv.h"
+
+DSN_DECLARE_int32(min_level);
 
 namespace pegasus {
 namespace geo {
 
+// TODO(yingchun): it doesn't make sense to derive from pegasus::encrypt_data_test_base to test
+//  encryption or non-encryption senarios, because the Pegasus cluster has been started with a
+//  fixed value of FLAGS_encrypt_data_at_rest.
+//  We can test the senarios after clearing and restarting the cluster.
 class geo_client_test : public ::testing::Test
 {
 public:
     geo_client_test()
     {
-        std::vector<dsn::rpc_address> meta_list;
-        bool ok = dsn::replication::replica_helper::load_meta_servers(
-            meta_list, PEGASUS_CLUSTER_SECTION_NAME.c_str(), "onebox");
-        CHECK(ok, "load_meta_servers failed");
+        std::vector<dsn::host_port> meta_list;
+        CHECK(dsn::replication::replica_helper::load_servers_from_config(
+                  dsn::PEGASUS_CLUSTER_SECTION_NAME, "onebox", meta_list),
+              "load_servers_from_config failed");
         auto ddl_client = new dsn::replication::replication_ddl_client(meta_list);
         dsn::error_code error = ddl_client->create_app("temp_geo", "pegasus", 4, 3, {}, false);
         CHECK_EQ(dsn::ERR_OK, error);
@@ -51,8 +73,6 @@ public:
 
     pegasus_client *common_data_client() { return _geo_client->_common_data_client; }
     pegasus::geo::geo_client *geo_client() { return _geo_client.get(); }
-
-    int min_level() { return _geo_client->_min_level; }
 
     bool generate_geo_keys(const std::string &hash_key,
                            const std::string &sort_key,
@@ -405,7 +425,7 @@ TEST_F(geo_client_test, generate_and_restore_geo_keys)
 
     ASSERT_TRUE(
         generate_geo_keys(test_hash_key, test_sort_key, test_value, geo_hash_key, geo_sort_key));
-    ASSERT_EQ(min_level() + 2, geo_hash_key.length());
+    ASSERT_EQ(FLAGS_min_level + 2, geo_hash_key.length());
     ASSERT_EQ(leaf_cell_id.substr(0, geo_hash_key.length()), geo_hash_key);
     ASSERT_EQ(leaf_cell_id.substr(geo_hash_key.length()),
               geo_sort_key.substr(0, leaf_cell_id.length() - geo_hash_key.length()));

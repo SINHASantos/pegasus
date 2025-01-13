@@ -24,32 +24,36 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     Replication testing framework.
- *
- * Revision history:
- *     Nov., 2015, @qinzuoyan (Zuoyan Qin), first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #include "case.h"
-#include "simple_kv.server.impl.h"
-#include "checker.h"
 
-#include <fmt/printf.h>
-
-#include "runtime/task/task.h"
-#include "runtime/rpc/rpc_message.h"
-#include "replica/replica_stub.h"
-#include "runtime/service_engine.h"
-#include "meta/server_load_balancer.h"
-
-#include <iostream>
-#include <string>
-#include <cstdio>
+#include <boost/algorithm/string/case_conv.hpp>
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/trim.hpp>
+#include <boost/cstdint.hpp>
+#include <boost/iterator/iterator_facade.hpp>
 #include <boost/lexical_cast.hpp>
-#include <boost/algorithm/string.hpp>
+#include <fmt/core.h>
+#include <fmt/printf.h>
+#include <inttypes.h>
+#include <algorithm>
+#include <cstdio>
+#include <iostream>
+#include <set>
+#include <string>
+#include <utility>
+
+#include "aio/aio_task.h"
+#include "checker.h"
+#include "replica/replica_stub.h"
+#include "replica/storage/simple_kv/test/common.h"
+#include "rpc/rpc_message.h"
+#include "runtime/service_engine.h"
+#include "task/task.h"
+#include "task/task_code.h"
+#include "simple_kv.server.impl.h"
+#include "utils/fmt_logging.h"
+#include "utils/ports.h"
+#include "utils/strings.h"
 
 namespace dsn {
 namespace replication {
@@ -259,12 +263,7 @@ std::string exit_case_line::to_string() const
 
 bool exit_case_line::parse(const std::string &params) { return true; }
 
-std::string state_case_line::to_string() const
-{
-    std::ostringstream oss;
-    oss << name() << ":" << _state.to_string();
-    return oss.str();
-}
+std::string state_case_line::to_string() const { return fmt::format("{}:{}", name(), _state); }
 
 bool state_case_line::parse(const std::string &params) { return _state.from_string(params); }
 
@@ -281,12 +280,7 @@ bool state_case_line::check_state(const state_snapshot &cur_state, bool &forward
     return false;
 }
 
-std::string config_case_line::to_string() const
-{
-    std::ostringstream oss;
-    oss << name() << ":" << _config.to_string();
-    return oss.str();
-}
+std::string config_case_line::to_string() const { return fmt::format("{}:{}", name(), _config); }
 
 bool config_case_line::parse(const std::string &params) { return _config.from_string(params); }
 
@@ -540,8 +534,10 @@ void event_on_rpc::init(message_ex *msg, task *tsk)
     if (msg != nullptr) {
         _trace_id = fmt::sprintf("%016llx", msg->header->trace_id);
         _rpc_name = msg->header->rpc_name;
-        _from = address_to_node(msg->header->from_address);
-        _to = address_to_node(msg->to_address);
+        const auto hp = host_port::from_address(msg->header->from_address);
+        CHECK(hp, "'{}' can not be reverse resolved", msg->header->from_address);
+        _from = address_to_node(hp);
+        _to = address_to_node(msg->to_host_port);
     }
 }
 
@@ -674,7 +670,10 @@ void event_on_aio_enqueue::init(aio_task *tsk)
     _transferred_size = boost::lexical_cast<std::string>(tsk->get_transferred_size());
 }
 
-std::string event_case_line::to_string() const { return name() + ":" + _event_cond->to_string(); }
+std::string event_case_line::to_string() const
+{
+    return fmt::format("{}:{}", name(), *_event_cond);
+}
 
 bool event_case_line::parse(const std::string &params)
 {
@@ -745,11 +744,11 @@ std::string client_case_line::to_string() const
         break;
     }
     case end_write: {
-        oss << "id=" << _id << ",err=" << _err.to_string() << ",resp=" << _write_resp;
+        oss << "id=" << _id << ",err=" << _err << ",resp=" << _write_resp;
         break;
     }
     case end_read: {
-        oss << "id=" << _id << ",err=" << _err.to_string() << ",resp=" << _read_resp;
+        oss << "id=" << _id << ",err=" << _err << ",resp=" << _read_resp;
         break;
     }
     case replica_config: {
@@ -818,8 +817,7 @@ bool client_case_line::parse(const std::string &params)
         _config_receiver = node_to_address(kv_map["receiver"]);
         _config_type = parse_config_command(kv_map["type"]);
         _config_node = node_to_address(kv_map["node"]);
-        if (_config_receiver.is_invalid() || _config_type == config_type::CT_INVALID ||
-            _config_node.is_invalid())
+        if (!_config_receiver || _config_type == config_type::CT_INVALID || !_config_node)
             parse_ok = false;
         break;
     }
@@ -884,7 +882,7 @@ dsn::replication::config_type::type
 client_case_line::parse_config_command(const std::string &command_name) const
 {
     for (int i = 0; s_replica_config_commands[i] != nullptr; ++i) {
-        if (boost::iequals(command_name.c_str(), s_replica_config_commands[i])) {
+        if (boost::iequals(command_name, s_replica_config_commands[i])) {
             return (dsn::replication::config_type::type)i;
         }
     }
@@ -917,9 +915,9 @@ void client_case_line::get_read_params(int &id, std::string &key, int &timeout_m
     timeout_ms = _timeout;
 }
 
-void client_case_line::get_replica_config_params(rpc_address &receiver,
+void client_case_line::get_replica_config_params(host_port &receiver,
                                                  dsn::replication::config_type::type &type,
-                                                 rpc_address &node) const
+                                                 host_port &node) const
 {
     CHECK_EQ(_type, replica_config);
     receiver = _config_receiver;
@@ -1029,7 +1027,7 @@ bool test_case::init(const std::string &case_input)
 
     forward();
 
-    LOG_INFO("=== init %s succeed", _name.c_str());
+    LOG_INFO("=== init {} succeed", _name);
 
     s_inited = true;
     return true;
@@ -1046,7 +1044,7 @@ void test_case::forward()
                 output(cl->to_string());
                 print(cl, "");
             }
-            LOG_INFO("=== on_case_forward:[%d]%s", cl->line_no(), cl->to_string().c_str());
+            LOG_INFO("=== on_case_forward:[{}]{}", cl->line_no(), *cl);
         }
         _next++;
         if (_next >= _case_lines.size()) {
@@ -1081,7 +1079,7 @@ void test_case::fail(const std::string &other)
     case_line *cl = _case_lines[_next];
     output(other);
     print(cl, other);
-    LOG_ERROR("=== on_case_failure:line=%d,case=%s", cl->line_no(), cl->to_string().c_str());
+    LOG_ERROR("=== on_case_failure:line={},case={}", cl->line_no(), cl->to_string());
     g_fail = true;
     g_done = true;
     notify_check_client();
@@ -1109,7 +1107,7 @@ void test_case::print(case_line *cl, const std::string &other, bool is_skip)
     {
         char buf[100];
         sprintf(buf, "%5d  ", cl->line_no());
-        std::cout << buf << cl->to_string() << std::endl;
+        std::cout << buf << *cl << std::endl;
         if (!other.empty()) {
             std::cout << " <==>  " << other << std::endl;
         }
@@ -1128,7 +1126,7 @@ bool test_case::check_skip(bool consume_one)
     skip_case_line *cl = static_cast<skip_case_line *>(c);
     if (consume_one) {
         cl->skip_one();
-        LOG_INFO("=== on_skip_one:skipped=%d/%d", cl->skipped(), cl->count());
+        LOG_INFO("=== on_skip_one:skipped={}/{}", cl->skipped(), cl->count());
     }
     if (cl->is_skip_done()) {
         forward();
@@ -1169,9 +1167,9 @@ bool test_case::check_client_write(int &id, std::string &key, std::string &value
     return true;
 }
 
-bool test_case::check_replica_config(rpc_address &receiver,
+bool test_case::check_replica_config(host_port &receiver,
                                      dsn::replication::config_type::type &type,
-                                     rpc_address &node)
+                                     host_port &node)
 {
     if (!check_client_instruction(client_case_line::replica_config))
         return false;
@@ -1205,7 +1203,7 @@ void test_case::on_end_write(int id, ::dsn::error_code err, int32_t resp)
                err.to_string(),
                resp);
 
-    LOG_INFO("=== on_end_write:id=%d,err=%s,resp=%d", id, err.to_string(), resp);
+    LOG_INFO("=== on_end_write:id={}, err={}, resp={}", id, err, resp);
 
     if (check_skip(true)) {
         output(buf);
@@ -1247,7 +1245,7 @@ void test_case::on_end_read(int id, ::dsn::error_code err, const std::string &re
                err.to_string(),
                resp.c_str());
 
-    LOG_INFO("=== on_end_read:id=%d,err=%s,resp=%s", id, err.to_string(), resp.c_str());
+    LOG_INFO("=== on_end_read:id={}, err={}, resp={}", id, err, resp);
 
     if (check_skip(true)) {
         output(buf);
@@ -1280,7 +1278,7 @@ bool test_case::on_event(const event *ev)
     if (g_done)
         return true;
 
-    LOG_INFO("=== %s", ev->to_string().c_str());
+    LOG_INFO("=== {}", *ev);
 
     if (check_skip(false))
         return true;
@@ -1327,8 +1325,8 @@ void test_case::on_config_change(const parti_config &last, const parti_config &c
 
     _null_loop_count = 0; // reset null loop count
 
-    std::string buf = std::string(config_case_line::NAME()) + ":" + cur.to_string();
-    LOG_INFO("=== on_config_change:%s", cur.to_string().c_str());
+    std::string buf = fmt::format("{}:{}", config_case_line::NAME(), cur);
+    LOG_INFO("=== on_config_change: {}", cur);
 
     if (check_skip(true)) {
         output(buf);
@@ -1363,8 +1361,8 @@ void test_case::on_state_change(const state_snapshot &last, const state_snapshot
 
     _null_loop_count = 0; // reset null loop count
 
-    std::string buf = std::string(state_case_line::NAME()) + ":" + cur.to_string();
-    LOG_INFO("=== on_state_change:%s\n%s", cur.to_string().c_str(), cur.diff_string(last).c_str());
+    std::string buf = fmt::format("{}:{}", state_case_line::NAME(), cur);
+    LOG_INFO("=== on_state_change: {}\n{}", cur, cur.diff_string(last));
 
     if (check_skip(true)) {
         output(buf);
@@ -1397,6 +1395,6 @@ void test_case::internal_register_creator(const std::string &name, case_line_cre
     CHECK(_creators.find(name) == _creators.end(), "");
     _creators[name] = creator;
 }
-}
-}
-}
+} // namespace test
+} // namespace replication
+} // namespace dsn

@@ -26,22 +26,30 @@
 
 #pragma once
 
-#include "runtime/task/task_tracker.h"
-#include "utils/zlocks.h"
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "common/serialization_helper/dsn.layer2_types.h"
+#include <stdint.h>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <unordered_map>
+
 #include "client/partition_resolver.h"
+#include "common/serialization_helper/dsn.layer2_types.h"
+#include "rpc/rpc_host_port.h"
+#include "task/task.h"
+#include "task/task_tracker.h"
+#include "utils/autoref_ptr.h"
+#include "utils/error_code.h"
+#include "utils/zlocks.h"
 
 namespace dsn {
+class message_ex;
+
 namespace replication {
 
 class partition_resolver_simple : public partition_resolver
 {
 public:
-    partition_resolver_simple(rpc_address meta_server, const char *app_name);
+    partition_resolver_simple(host_port meta_server, const char *app_name);
 
     virtual ~partition_resolver_simple();
 
@@ -51,15 +59,13 @@ public:
 
     virtual void on_access_failure(int partition_index, error_code err) override;
 
-    virtual int get_partition_index(int partition_count, uint64_t partition_hash) override;
-
     int get_partition_count() const { return _app_partition_count; }
 
 private:
     struct partition_info
     {
         int timeout_count;
-        ::dsn::partition_configuration config;
+        ::dsn::partition_configuration pc;
     };
     mutable dsn::zrwlock_nr _config_lock;
     std::unordered_map<int, std::unique_ptr<partition_info>> _config_cache;
@@ -101,8 +107,8 @@ private:
 
 private:
     // local routines
-    rpc_address get_address(const partition_configuration &config) const;
-    error_code get_address(int partition_index, /*out*/ rpc_address &addr);
+    host_port get_host_port(const partition_configuration &pc) const;
+    error_code get_host_port(int partition_index, /*out*/ host_port &hp);
     void handle_pending_requests(std::deque<request_context_ptr> &reqs, error_code err);
     void clear_all_pending_requests();
 
@@ -112,7 +118,7 @@ private:
     // request_context_ptr rc);
     void end_request(request_context_ptr &&request,
                      error_code err,
-                     rpc_address addr,
+                     host_port addr,
                      bool called_by_timer = false) const;
     void on_timeout(request_context_ptr &&rc) const;
 

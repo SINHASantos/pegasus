@@ -20,7 +20,9 @@
 package org.apache.pegasus.client;
 
 import java.io.Closeable;
+import java.util.List;
 import java.util.Map;
+import org.apache.pegasus.replication.app_info;
 
 public interface PegasusAdminClientInterface extends Closeable {
   /**
@@ -34,10 +36,20 @@ public interface PegasusAdminClientInterface extends Closeable {
    * @param envs Environment variables of pegasus app, you can see the supported envs in the website
    *     : https://pegasus.apache.org/administration/table-env
    * @param timeoutMs The timeout of the interface, milli-seconds
+   * @param successIfExist whether return success if app exist
    * @throws PException if rpc to the pegasus server cause timeout or other error happens in the
    *     server side, or the newly created app is not fully healthy when the 'timeoutMs' has
    *     elapsed, the interface will throw exception
    */
+  public void createApp(
+      String appName,
+      int partitionCount,
+      int replicaCount,
+      Map<String, String> envs,
+      long timeoutMs,
+      boolean successIfExist)
+      throws PException;
+
   public void createApp(
       String appName,
       int partitionCount,
@@ -60,6 +72,16 @@ public interface PegasusAdminClientInterface extends Closeable {
   public boolean isAppHealthy(String appName, int replicaCount) throws PException;
 
   public void dropApp(String appName, int reserveSeconds) throws PException;
+
+  /**
+   * Get app infos in the Pegasus cluster
+   *
+   * @param listAppInfoType 'LT_AVAILABLE_APPS' means to return only available tables, 'LT_ALL_APPS'
+   *     means to return all tables, including dropped but currently reserved tables
+   * @return List of 'app_info' in the Pegasus cluster
+   * @throws PException
+   */
+  public List<app_info> listApps(ListAppInfoType listAppInfoType) throws PException;
 
   /** close the client */
   @Override

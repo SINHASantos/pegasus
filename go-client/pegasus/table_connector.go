@@ -192,6 +192,8 @@ type TableConnector interface {
 	// NOTE: this operation is not guaranteed to be atomic
 	BatchGet(ctx context.Context, keys []CompositeKey) (values [][]byte, err error)
 
+	// Deprecated: danger operation: table is managed by client and should only be Close once when client is exiting.
+	// this operation will kill all table-related loops
 	Close() error
 }
 
@@ -701,6 +703,7 @@ func (p *pegasusTableConnector) handleReplicaError(err error, replica *session.R
 
 		case base.ERR_TIMEOUT:
 		case context.DeadlineExceeded:
+			confUpdate = true
 		case context.Canceled:
 			// timeout will not trigger a configuration update
 
@@ -724,6 +727,7 @@ func (p *pegasusTableConnector) handleReplicaError(err error, replica *session.R
 			err = errors.New(err.Error() + " Rate of requests exceeds the throughput limit")
 		case base.ERR_INVALID_STATE:
 			err = errors.New(err.Error() + " The target replica is not primary")
+			retry = false
 		case base.ERR_OBJECT_NOT_FOUND:
 			err = errors.New(err.Error() + " The replica server doesn't serve this partition")
 		case base.ERR_SPLITTING:

@@ -16,7 +16,8 @@
 // under the License.
 
 #include "utils/binary_reader.h"
-#include <gtest/gtest.h>
+
+#include "gtest/gtest.h"
 #include "utils/defer.h"
 
 namespace dsn {

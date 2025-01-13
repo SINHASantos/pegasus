@@ -1,31 +1,49 @@
 /*
-* Licensed to the Apache Software Foundation (ASF) under one
-* or more contributor license agreements.  See the NOTICE file
-* distributed with this work for additional information
-* regarding copyright ownership.  The ASF licenses this file
-* to you under the Apache License, Version 2.0 (the
-* "License"); you may not use this file except in compliance
-* with the License.  You may obtain a copy of the License at
-*
-*   http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing,
-* software distributed under the License is distributed on an
-* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-* KIND, either express or implied.  See the License for the
-* specific language governing permissions and limitations
-* under the License.
-*/
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
 #include "replica_follower.h"
-#include "replica/replica_stub.h"
-#include "utils/filesystem.h"
-#include "common/duplication_common.h"
 
-#include <boost/algorithm/string.hpp>
-#include "runtime/rpc/group_address.h"
+#include <stddef.h>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <string_view>
+#include <utility>
+
+#include "common/duplication_common.h"
+#include "common/fs_manager.h"
+#include "common/replication.codes.h"
+#include "consensus_types.h"
 #include "nfs/nfs_node.h"
+#include "replica/replica.h"
+#include "replica/replica_stub.h"
+#include "rpc/dns_resolver.h"
+#include "rpc/group_host_port.h"
+#include "rpc/rpc_host_port.h"
+#include "rpc/rpc_message.h"
+#include "rpc/serialization.h"
+#include "task/async_calls.h"
 #include "utils/fail_point.h"
+#include "utils/filesystem.h"
+#include "utils/fmt_logging.h"
+#include "utils/ports.h"
+#include "utils/strings.h"
 
 namespace dsn {
 namespace replication {
@@ -42,23 +60,31 @@ void replica_follower::init_master_info()
 {
     const auto &envs = _replica->get_app_info()->envs;
 
-    if (envs.find(duplication_constants::kDuplicationEnvMasterClusterKey) == envs.end() ||
-        envs.find(duplication_constants::kDuplicationEnvMasterMetasKey) == envs.end()) {
+    const auto &cluster_name = envs.find(duplication_constants::kEnvMasterClusterKey);
+    const auto &metas = envs.find(duplication_constants::kEnvMasterMetasKey);
+    if (cluster_name == envs.end() || metas == envs.end()) {
         return;
     }
 
     need_duplicate = true;
 
-    _master_cluster_name = envs.at(duplication_constants::kDuplicationEnvMasterClusterKey);
-    _master_app_name = _replica->get_app_info()->app_name;
+    _master_cluster_name = cluster_name->second;
 
-    const auto &meta_list_str = envs.at(duplication_constants::kDuplicationEnvMasterMetasKey);
-    std::vector<std::string> metas;
-    boost::split(metas, meta_list_str, boost::is_any_of(","));
-    CHECK(!metas.empty(), "master cluster meta list is invalid!");
-    for (const auto &meta : metas) {
-        dsn::rpc_address node;
-        CHECK(node.from_string_ipv4(meta.c_str()), "{} is invalid meta address", meta);
+    const auto &app_name = envs.find(duplication_constants::kEnvMasterAppNameKey);
+    if (app_name == envs.end()) {
+        // The version of meta server of master cluster is old(< v2.6.0), thus the app name of
+        // the follower cluster is the same with master cluster.
+        _master_app_name = _replica->get_app_info()->app_name;
+    } else {
+        _master_app_name = app_name->second;
+    }
+
+    std::vector<std::string> master_metas;
+    dsn::utils::split_args(metas->second.c_str(), master_metas, ',');
+    CHECK(!master_metas.empty(), "master cluster meta list is invalid!");
+    for (const auto &meta : master_metas) {
+        const auto node = host_port::from_string(meta);
+        CHECK(node, "{} is invalid meta host_port", meta);
         _master_meta_list.emplace_back(std::move(node));
     }
 }
@@ -89,11 +115,11 @@ error_code replica_follower::duplicate_checkpoint()
 // ThreadPool: THREAD_POOL_DEFAULT
 void replica_follower::async_duplicate_checkpoint_from_master_replica()
 {
-    rpc_address meta_servers;
+    host_port meta_servers;
     meta_servers.assign_group(_master_cluster_name.c_str());
-    meta_servers.group_address()->add_list(_master_meta_list);
+    meta_servers.group_host_port()->add_list(_master_meta_list);
 
-    configuration_query_by_index_request meta_config_request;
+    query_cfg_request meta_config_request;
     meta_config_request.app_name = _master_app_name;
     // just fetch the same partition config
     meta_config_request.partition_indices = {get_gpid().get_partition_index()};
@@ -102,17 +128,17 @@ void replica_follower::async_duplicate_checkpoint_from_master_replica()
     dsn::message_ex *msg = dsn::message_ex::create_request(
         RPC_CM_QUERY_PARTITION_CONFIG_BY_INDEX, 0, get_gpid().thread_hash());
     dsn::marshall(msg, meta_config_request);
-    rpc::call(meta_servers,
+    rpc::call(dsn::dns_resolver::instance().resolve_address(meta_servers),
               msg,
               &_tracker,
-              [&](error_code err, configuration_query_by_index_response &&resp) mutable {
-                  FAIL_POINT_INJECT_F("duplicate_checkpoint_ok", [&](string_view s) -> void {
+              [&](error_code err, query_cfg_response &&resp) mutable {
+                  FAIL_POINT_INJECT_F("duplicate_checkpoint_ok", [&](std::string_view s) -> void {
                       _tracker.set_tasks_success();
                       return;
                   });
 
                   FAIL_POINT_INJECT_F("duplicate_checkpoint_failed",
-                                      [&](string_view s) -> void { return; });
+                                      [&](std::string_view s) -> void { return; });
                   if (update_master_replica_config(err, std::move(resp)) == ERR_OK) {
                       copy_master_replica_checkpoint();
                   }
@@ -120,14 +146,11 @@ void replica_follower::async_duplicate_checkpoint_from_master_replica()
 }
 
 // ThreadPool: THREAD_POOL_DEFAULT
-error_code
-replica_follower::update_master_replica_config(error_code err,
-                                               configuration_query_by_index_response &&resp)
+error_code replica_follower::update_master_replica_config(error_code err, query_cfg_response &&resp)
 {
     error_code err_code = err != ERR_OK ? err : resp.err;
     if (dsn_unlikely(err_code != ERR_OK)) {
-        LOG_ERROR_PREFIX(
-            "query master[{}] config failed: {}", master_replica_name(), err_code.to_string());
+        LOG_ERROR_PREFIX("query master[{}] config failed: {}", master_replica_name(), err_code);
         return err_code;
     }
 
@@ -155,18 +178,18 @@ replica_follower::update_master_replica_config(error_code err,
         return ERR_INCONSISTENT_STATE;
     }
 
-    if (dsn_unlikely(resp.partitions[0].primary == rpc_address::s_invalid_address)) {
+    if (dsn_unlikely(!resp.partitions[0].hp_primary)) {
         LOG_ERROR_PREFIX("master[{}] partition address is invalid", master_replica_name());
         return ERR_INVALID_STATE;
     }
 
     // since the request just specify one partition, the result size is single
-    _master_replica_config = resp.partitions[0];
+    _pc = resp.partitions[0];
     LOG_INFO_PREFIX(
         "query master[{}] config successfully and update local config: remote={}, gpid={}",
         master_replica_name(),
-        _master_replica_config.primary.to_string(),
-        _master_replica_config.pid.to_string());
+        FMT_HOST_PORT_AND_IP(_pc, primary),
+        _pc.pid);
     return ERR_OK;
 }
 
@@ -176,16 +199,13 @@ void replica_follower::copy_master_replica_checkpoint()
     LOG_INFO_PREFIX("query master[{}] replica checkpoint info and start use nfs copy the data",
                     master_replica_name());
     learn_request request;
-    request.pid = _master_replica_config.pid;
-    dsn::message_ex *msg = dsn::message_ex::create_request(
-        RPC_QUERY_LAST_CHECKPOINT_INFO, 0, _master_replica_config.pid.thread_hash());
+    request.pid = _pc.pid;
+    dsn::message_ex *msg =
+        dsn::message_ex::create_request(RPC_QUERY_LAST_CHECKPOINT_INFO, 0, _pc.pid.thread_hash());
     dsn::marshall(msg, request);
-    rpc::call(_master_replica_config.primary,
-              msg,
-              &_tracker,
-              [&](error_code err, learn_response &&resp) mutable {
-                  nfs_copy_checkpoint(err, std::move(resp));
-              });
+    rpc::call(_pc.primary, msg, &_tracker, [&](error_code err, learn_response &&resp) mutable {
+        nfs_copy_checkpoint(err, std::move(resp));
+    });
 }
 
 // ThreadPool: THREAD_POOL_DEFAULT
@@ -195,7 +215,7 @@ error_code replica_follower::nfs_copy_checkpoint(error_code err, learn_response 
     if (dsn_unlikely(err_code != ERR_OK)) {
         LOG_ERROR_PREFIX("query master[{}] replica checkpoint info failed, err = {}",
                          master_replica_name(),
-                         err_code.to_string());
+                         err_code);
         return err_code;
     }
 
@@ -207,13 +227,16 @@ error_code replica_follower::nfs_copy_checkpoint(error_code err, learn_response 
         return ERR_FILE_OPERATION_FAILED;
     }
 
+    host_port hp_learnee;
+    GET_HOST_PORT(resp, learnee, hp_learnee);
+
     nfs_copy_remote_files(
-        resp.address, resp.replica_disk_tag, resp.base_local_dir, resp.state.files, dest);
+        hp_learnee, resp.replica_disk_tag, resp.base_local_dir, resp.state.files, dest);
     return ERR_OK;
 }
 
 // ThreadPool: THREAD_POOL_DEFAULT
-void replica_follower::nfs_copy_remote_files(const rpc_address &remote_node,
+void replica_follower::nfs_copy_remote_files(const host_port &remote_node,
                                              const std::string &remote_disk,
                                              const std::string &remote_dir,
                                              std::vector<std::string> &file_list,
@@ -226,7 +249,7 @@ void replica_follower::nfs_copy_remote_files(const rpc_address &remote_node,
     request->source_disk_tag = remote_disk;
     request->source_dir = remote_dir;
     request->files = file_list;
-    request->dest_disk_tag = _replica->get_replica_disk_tag();
+    request->dest_disk_tag = _replica->get_dir_node()->tag;
     request->dest_dir = dest_dir;
     request->overwrite = true;
     request->high_priority = false;
@@ -237,13 +260,13 @@ void replica_follower::nfs_copy_remote_files(const rpc_address &remote_node,
         &_tracker,
         [&, remote_dir](error_code err, size_t size) mutable {
             FAIL_POINT_INJECT_NOT_RETURN_F("nfs_copy_ok",
-                                           [&](string_view s) -> void { err = ERR_OK; });
+                                           [&](std::string_view s) -> void { err = ERR_OK; });
 
             if (dsn_unlikely(err != ERR_OK)) {
                 LOG_ERROR_PREFIX("nfs copy master[{}] checkpoint failed: checkpoint = {}, err = {}",
                                  master_replica_name(),
                                  remote_dir,
-                                 err.to_string());
+                                 err);
                 return;
             }
             LOG_INFO_PREFIX("nfs copy master[{}] checkpoint completed: checkpoint = {}, size = {}",

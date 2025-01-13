@@ -26,13 +26,16 @@
 
 #pragma once
 
-#include "utils/ports.h"
-#include "runtime/rpc/rpc_message.h"
-#include "runtime/rpc/message_parser.h"
-#include <vector>
-#include <queue>
-
 #include <nodejs/http_parser.h>
+#include <stddef.h>
+#include <memory>
+#include <queue>
+#include <string>
+
+#include "rpc/message_parser.h"
+#include "rpc/rpc_message.h"
+#include "task/task_spec.h"
+#include "utils/customizable_id.h"
 
 namespace dsn {
 

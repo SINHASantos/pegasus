@@ -19,21 +19,21 @@
 
 #pragma once
 
-#include "runtime/task/task_code.h"
-#include "runtime/task/task_tracker.h"
+#include "task/task_code.h"
+#include "task/task_tracker.h"
 #include "runtime/api_task.h"
 #include "runtime/api_layer1.h"
 #include "runtime/app_model.h"
 #include "utils/api_utilities.h"
 #include "utils/error_code.h"
 #include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
+#include "task/task_code.h"
 #include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
+#include "rpc/serialization.h"
+#include "rpc/rpc_stream.h"
 #include "runtime/serverlet.h"
 #include "runtime/service_app.h"
-#include "runtime/rpc/rpc_address.h"
+#include "rpc/rpc_address.h"
 #include "common/replication_other_types.h"
 #include "common/replication.codes.h"
 #include <functional>
@@ -238,8 +238,8 @@ struct upload_request
  */
 struct upload_response
 {
-    dsn::error_code err;
-    uint64_t uploaded_size;
+    dsn::error_code err = ERR_OK;
+    uint64_t uploaded_size = 0;
 };
 typedef std::function<void(const upload_response &)> upload_callback;
 typedef future_task<upload_response> upload_future;
@@ -378,6 +378,8 @@ public:
                                 const write_callback &cb,
                                 dsn::task_tracker *tracker = nullptr) = 0;
 
+    // TODO(yingchun): it seems every read() will read the whole file, consider to read the whole
+    //  file directly.
     /**
      * @brief read
      * @param req, ref {@link #read_request}
@@ -420,6 +422,6 @@ public:
 protected:
     std::string _name;
 };
-}
-}
-}
+} // namespace block_service
+} // namespace dist
+} // namespace dsn

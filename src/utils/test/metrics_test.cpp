@@ -17,15 +17,34 @@
 
 #include "utils/metrics.h"
 
+#include <fmt/core.h>
+// IWYU pragma: no_include <gtest/gtest-message.h>
+// IWYU pragma: no_include <gtest/gtest-param-test.h>
+// IWYU pragma: no_include <gtest/gtest-test-part.h>
+#include <gtest/gtest.h>
+#include <rapidjson/document.h>
+#include <rapidjson/error/error.h>
 #include <chrono>
-#include <sstream>
+#include <cstdint>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <map>
 #include <thread>
 #include <vector>
 
-#include <gtest/gtest.h>
-
+#include "http/http_message_parser.h"
 #include "percentile_utils.h"
+#include "rpc/message_parser.h"
+#include "rpc/rpc_message.h"
+#include "utils/errors.h"
+#include "utils/flags.h"
+#include "gutil/map_util.h"
 #include "utils/rand.h"
+#include "utils/strings.h"
+#include "utils/test/nth_element_utils.h"
+
+DSN_DECLARE_uint64(entity_retirement_delay_ms);
 
 namespace dsn {
 
@@ -65,6 +84,11 @@ METRIC_DEFINE_entity(my_server);
 METRIC_DEFINE_entity(my_table);
 METRIC_DEFINE_entity(my_replica);
 
+#define METRIC_VAR_INIT_my_replica(name) METRIC_VAR_INIT(name, my_replica)
+
+// Dedicated entity for getting metrics by http service.
+METRIC_DEFINE_entity(my_app);
+
 METRIC_DEFINE_my_gauge(my_server,
                        my_server_latency,
                        dsn::metric_unit::kMicroSeconds,
@@ -84,44 +108,94 @@ METRIC_DEFINE_my_gauge(my_replica,
                        "a replica-level duration for test");
 
 METRIC_DEFINE_gauge_int64(my_server,
-                          test_gauge_int64,
+                          test_server_gauge_int64,
                           dsn::metric_unit::kMilliSeconds,
                           "a server-level gauge of int64 type for test");
 
+METRIC_DEFINE_gauge_int64(my_table,
+                          test_table_gauge_int64,
+                          dsn::metric_unit::kMilliSeconds,
+                          "a table-level gauge of int64 type for test");
+
+METRIC_DEFINE_gauge_int64(my_replica,
+                          test_replica_gauge_int64,
+                          dsn::metric_unit::kMilliSeconds,
+                          "a replica-level gauge of int64 type for test");
+
+METRIC_DEFINE_gauge_int64(my_app,
+                          test_app_gauge_int64,
+                          dsn::metric_unit::kMilliSeconds,
+                          "an app-level gauge of int64 type for test");
+
 METRIC_DEFINE_gauge_double(my_server,
-                           test_gauge_double,
+                           test_server_gauge_double,
                            dsn::metric_unit::kSeconds,
                            "a server-level gauge of double type for test");
 
 METRIC_DEFINE_counter(my_server,
-                      test_counter,
+                      test_server_counter,
                       dsn::metric_unit::kRequests,
                       "a server-level counter for test");
 
+METRIC_DEFINE_counter(my_table,
+                      test_table_counter,
+                      dsn::metric_unit::kRequests,
+                      "a table-level counter for test");
+
+METRIC_DEFINE_counter(my_replica,
+                      test_replica_counter,
+                      dsn::metric_unit::kRequests,
+                      "a replica-level counter for test");
+
+METRIC_DEFINE_counter(my_app,
+                      test_app_counter,
+                      dsn::metric_unit::kRequests,
+                      "an app-level counter for test");
+
 METRIC_DEFINE_concurrent_counter(my_server,
-                                 test_concurrent_counter,
+                                 test_server_concurrent_counter,
                                  dsn::metric_unit::kRequests,
                                  "a server-level concurrent_counter for test");
 
 METRIC_DEFINE_volatile_counter(my_server,
-                               test_volatile_counter,
+                               test_server_volatile_counter,
                                dsn::metric_unit::kRequests,
                                "a server-level volatile_counter for test");
 
 METRIC_DEFINE_concurrent_volatile_counter(my_server,
-                                          test_concurrent_volatile_counter,
+                                          test_server_concurrent_volatile_counter,
                                           dsn::metric_unit::kRequests,
                                           "a server-level concurrent_volatile_counter for test");
 
 METRIC_DEFINE_percentile_int64(my_server,
-                               test_percentile_int64,
+                               test_server_percentile_int64,
                                dsn::metric_unit::kNanoSeconds,
                                "a server-level percentile of int64 type for test");
 
 METRIC_DEFINE_percentile_double(my_server,
-                                test_percentile_double,
+                                test_server_percentile_double,
                                 dsn::metric_unit::kNanoSeconds,
                                 "a server-level percentile of double type for test");
+
+METRIC_DEFINE_percentile_int64(my_replica,
+                               test_replica_percentile_int64_ns,
+                               dsn::metric_unit::kNanoSeconds,
+                               "a replica-level percentile of int64 type in nanoseconds for test");
+
+METRIC_DEFINE_percentile_int64(my_replica,
+                               test_replica_percentile_int64_us,
+                               dsn::metric_unit::kMicroSeconds,
+                               "a replica-level percentile of int64 type in microseconds for test");
+
+METRIC_DEFINE_percentile_int64(my_replica,
+                               test_replica_percentile_int64_ms,
+                               dsn::metric_unit::kMilliSeconds,
+                               "a replica-level percentile of int64 type in milliseconds for test");
+
+METRIC_DEFINE_percentile_int64(my_replica,
+                               test_replica_percentile_int64_s,
+                               dsn::metric_unit::kSeconds,
+                               "a replica-level percentile of int64 type in seconds for test");
 
 namespace dsn {
 
@@ -173,7 +247,7 @@ TEST(metrics_test, create_entity)
         auto attrs = entity->attributes();
         ASSERT_EQ(attrs, test.entity_attrs);
 
-        ASSERT_EQ(entities.find(test.entity_id), entities.end());
+        ASSERT_TRUE(!gutil::ContainsKey(entities, test.entity_id));
         entities[test.entity_id] = entity;
     }
 
@@ -240,25 +314,21 @@ TEST(metrics_test, create_metric)
             my_metric = test.prototype->instantiate(test.entity, test.value);
         }
 
-        ASSERT_EQ(my_metric->value(), test.value);
+        ASSERT_EQ(test.value, my_metric->value());
 
-        auto iter = expected_entities.find(test.entity.get());
-        if (iter == expected_entities.end()) {
-            expected_entities[test.entity.get()] = {{test.prototype, my_metric}};
-        } else {
-            iter->second[test.prototype] = my_metric;
-        }
+        auto &iter = gutil::LookupOrInsert(&expected_entities, test.entity.get(), {});
+        iter.emplace(test.prototype, my_metric);
     }
 
     entity_map actual_entities;
-    auto entities = metric_registry::instance().entities();
-    for (const auto &entity : entities) {
-        if (expected_entities.find(entity.second.get()) != expected_entities.end()) {
-            actual_entities[entity.second.get()] = entity.second->metrics();
+    const auto entities = metric_registry::instance().entities();
+    for (const auto &[_, entity] : entities) {
+        if (gutil::ContainsKey(expected_entities, entity.get())) {
+            actual_entities[entity.get()] = entity->metrics();
         }
     }
 
-    ASSERT_EQ(actual_entities, expected_entities);
+    ASSERT_EQ(expected_entities, actual_entities);
 }
 
 TEST(metrics_test, recreate_metric)
@@ -295,9 +365,10 @@ TEST(metrics_test, gauge_int64)
 
         gauge_ptr<int64_t> my_metric;
         if (test.use_default_value) {
-            my_metric = METRIC_test_gauge_int64.instantiate(my_server_entity);
+            my_metric = METRIC_test_server_gauge_int64.instantiate(my_server_entity);
         } else {
-            my_metric = METRIC_test_gauge_int64.instantiate(my_server_entity, test.initial_value);
+            my_metric =
+                METRIC_test_server_gauge_int64.instantiate(my_server_entity, test.initial_value);
         }
 
         ASSERT_EQ(my_metric->value(), test.initial_value);
@@ -306,10 +377,11 @@ TEST(metrics_test, gauge_int64)
         ASSERT_EQ(my_metric->value(), test.new_value);
 
         auto metrics = my_server_entity->metrics();
-        ASSERT_EQ(metrics[&METRIC_test_gauge_int64].get(), static_cast<metric *>(my_metric.get()));
+        ASSERT_EQ(metrics[&METRIC_test_server_gauge_int64].get(),
+                  static_cast<metric *>(my_metric.get()));
 
         ASSERT_EQ(my_metric->prototype(),
-                  static_cast<const metric_prototype *>(&METRIC_test_gauge_int64));
+                  static_cast<const metric_prototype *>(&METRIC_test_server_gauge_int64));
     }
 }
 
@@ -336,9 +408,10 @@ TEST(metrics_test, gauge_double)
 
         gauge_ptr<double> my_metric;
         if (test.use_default_value) {
-            my_metric = METRIC_test_gauge_double.instantiate(my_server_entity);
+            my_metric = METRIC_test_server_gauge_double.instantiate(my_server_entity);
         } else {
-            my_metric = METRIC_test_gauge_double.instantiate(my_server_entity, test.initial_value);
+            my_metric =
+                METRIC_test_server_gauge_double.instantiate(my_server_entity, test.initial_value);
         }
 
         ASSERT_DOUBLE_EQ(my_metric->value(), test.initial_value);
@@ -347,10 +420,11 @@ TEST(metrics_test, gauge_double)
         ASSERT_DOUBLE_EQ(my_metric->value(), test.new_value);
 
         auto metrics = my_server_entity->metrics();
-        ASSERT_EQ(metrics[&METRIC_test_gauge_double].get(), static_cast<metric *>(my_metric.get()));
+        ASSERT_EQ(metrics[&METRIC_test_server_gauge_double].get(),
+                  static_cast<metric *>(my_metric.get()));
 
         ASSERT_EQ(my_metric->prototype(),
-                  static_cast<const metric_prototype *>(&METRIC_test_gauge_double));
+                  static_cast<const metric_prototype *>(&METRIC_test_server_gauge_double));
     }
 }
 
@@ -488,7 +562,7 @@ void run_gauge_increment_cases(dsn::gauge_prototype<int64_t> *prototype)
     run_gauge_increment_cases(prototype, 4);
 }
 
-TEST(metrics_test, gauge_increment) { run_gauge_increment_cases(&METRIC_test_gauge_int64); }
+TEST(metrics_test, gauge_increment) { run_gauge_increment_cases(&METRIC_test_server_gauge_int64); }
 
 template <typename Adder>
 void run_counter_cases(dsn::counter_prototype<Adder> *prototype, int64_t num_threads)
@@ -536,8 +610,8 @@ void run_counter_cases(dsn::counter_prototype<Adder> *prototype)
 TEST(metrics_test, counter)
 {
     // Test both kinds of counter
-    run_counter_cases<striped_long_adder>(&METRIC_test_counter);
-    run_counter_cases<concurrent_long_adder>(&METRIC_test_concurrent_counter);
+    run_counter_cases<striped_long_adder>(&METRIC_test_server_counter);
+    run_counter_cases<concurrent_long_adder>(&METRIC_test_server_concurrent_counter);
 }
 
 template <typename Adder>
@@ -654,8 +728,9 @@ void run_volatile_counter_cases(dsn::volatile_counter_prototype<Adder> *prototyp
 TEST(metrics_test, volatile_counter)
 {
     // Test both kinds of volatile counter
-    run_volatile_counter_cases<striped_long_adder>(&METRIC_test_volatile_counter);
-    run_volatile_counter_cases<concurrent_long_adder>(&METRIC_test_concurrent_volatile_counter);
+    run_volatile_counter_cases<striped_long_adder>(&METRIC_test_server_volatile_counter);
+    run_volatile_counter_cases<concurrent_long_adder>(
+        &METRIC_test_server_concurrent_volatile_counter);
 }
 
 template <typename T, typename Prototype, typename Checker>
@@ -681,9 +756,7 @@ void run_percentile(const metric_entity_ptr &my_entity,
     auto my_metric = prototype.instantiate(my_entity, interval_ms, kth_percentiles, sample_size);
 
     // Preload zero in current thread.
-    for (size_t i = 0; i < num_preload; ++i) {
-        my_metric->set(0);
-    }
+    my_metric->set(num_preload, 0);
 
     // Load other data in each spawned thread evenly.
     const size_t num_operations = data.size() / num_threads;
@@ -702,7 +775,7 @@ void run_percentile(const metric_entity_ptr &my_entity,
     std::vector<T> actual_elements;
     for (const auto &kth : kAllKthPercentileTypes) {
         T value;
-        if (kth_percentiles.find(kth) == kth_percentiles.end()) {
+        if (!gutil::ContainsKey(kth_percentiles, kth)) {
             ASSERT_FALSE(my_metric->get(kth, value));
             checker(value, 0);
         } else {
@@ -870,7 +943,7 @@ TEST(metrics_test, percentile_int64)
     run_percentile_cases<value_type,
                          percentile_prototype<value_type>,
                          integral_percentile_case_generator<value_type>,
-                         integral_checker<value_type>>(METRIC_test_percentile_int64);
+                         integral_checker<value_type>>(METRIC_test_server_percentile_int64);
 }
 
 template <typename T>
@@ -898,26 +971,19 @@ TEST(metrics_test, percentile_double)
     run_percentile_cases<value_type,
                          floating_percentile_prototype<value_type>,
                          floating_percentile_case_generator<value_type>,
-                         floating_checker<value_type>>(METRIC_test_percentile_double);
+                         floating_checker<value_type>>(METRIC_test_server_percentile_double);
 }
 
 template <typename T>
 std::string take_snapshot_and_get_json_string(T *m, const metric_filters &filters)
 {
-    std::stringstream out;
-    rapidjson::OStreamWrapper wrapper(out);
-    metric_json_writer writer(wrapper);
-
-    m->take_snapshot(writer, filters);
-
-    auto out_str = out.str();
+    auto out_str = take_snapshot_as_json(m, filters);
     if (out_str.empty()) {
         std::cout << "The json string is empty." << std::endl;
     } else {
         std::cout << "The json string is: " << std::endl;
         std::cout << out_str << std::endl;
     }
-
     return out_str;
 }
 
@@ -1030,8 +1096,7 @@ void compare_floating_metric_value_map(const metric_value_map<T> &actual_value_m
         filters.with_metric_fields = metric_fields;                                                \
                                                                                                    \
         metric_value_map<value_type> expected_value_map;                                           \
-        if (expected_metric_fields.find(kMetricSingleValueField) !=                                \
-            expected_metric_fields.end()) {                                                        \
+        if (gutil::ContainsKey(expected_metric_fields, kMetricSingleValueField)) {                 \
             expected_value_map[kMetricSingleValueField] = test.expected_value;                     \
         }                                                                                          \
                                                                                                    \
@@ -1051,6 +1116,9 @@ metric_filters::metric_fields_type get_all_single_value_metric_fields()
     fields.insert(kMetricSingleValueField);
     return fields;
 }
+
+const metric_filters::metric_fields_type kAllSingleValueMetricFields =
+    get_all_single_value_metric_fields();
 
 // Test cases:
 // - with_metric_fields is empty
@@ -1078,8 +1146,6 @@ metric_filters::metric_fields_type get_all_single_value_metric_fields()
 #define RUN_CASES_WITH_SINGLE_VALUE_SNAPSHOT(                                                      \
     metric_prototype, updater, value_type, is_integral, value, value_map_comparator)               \
     do {                                                                                           \
-        static const metric_filters::metric_fields_type kAllSingleValueMetricFields =              \
-            get_all_single_value_metric_fields();                                                  \
         struct test_case                                                                           \
         {                                                                                          \
             std::string entity_id;                                                                 \
@@ -1150,34 +1216,37 @@ metric_filters::metric_fields_type get_all_single_value_metric_fields()
 TEST(metrics_test, take_snapshot_gauge_int64)
 {
     RUN_CASES_WITH_GAUGE_SNAPSHOT(
-        METRIC_test_gauge_int64, int64_t, true, 5, compare_integral_metric_value_map);
+        METRIC_test_server_gauge_int64, int64_t, true, 5, compare_integral_metric_value_map);
 }
 
 TEST(metrics_test, take_snapshot_gauge_double)
 {
     RUN_CASES_WITH_GAUGE_SNAPSHOT(
-        METRIC_test_gauge_double, double, false, 6.789, compare_floating_metric_value_map);
+        METRIC_test_server_gauge_double, double, false, 6.789, compare_floating_metric_value_map);
 }
 
 #define RUN_CASES_WITH_COUNTER_SNAPSHOT(metric_prototype)                                          \
     RUN_CASES_WITH_SINGLE_VALUE_SNAPSHOT(                                                          \
         metric_prototype, increment_by, int64_t, true, 10, compare_integral_metric_value_map)
 
-TEST(metrics_test, take_snapshot_counter) { RUN_CASES_WITH_COUNTER_SNAPSHOT(METRIC_test_counter); }
+TEST(metrics_test, take_snapshot_counter)
+{
+    RUN_CASES_WITH_COUNTER_SNAPSHOT(METRIC_test_server_counter);
+}
 
 TEST(metrics_test, take_snapshot_concurrent_counter)
 {
-    RUN_CASES_WITH_COUNTER_SNAPSHOT(METRIC_test_concurrent_counter);
+    RUN_CASES_WITH_COUNTER_SNAPSHOT(METRIC_test_server_concurrent_counter);
 }
 
 TEST(metrics_test, take_snapshot_volatile_counter)
 {
-    RUN_CASES_WITH_COUNTER_SNAPSHOT(METRIC_test_volatile_counter);
+    RUN_CASES_WITH_COUNTER_SNAPSHOT(METRIC_test_server_volatile_counter);
 }
 
 TEST(metrics_test, take_snapshot_concurrent_volatile_counter)
 {
-    RUN_CASES_WITH_COUNTER_SNAPSHOT(METRIC_test_concurrent_volatile_counter);
+    RUN_CASES_WITH_COUNTER_SNAPSHOT(METRIC_test_server_concurrent_volatile_counter);
 }
 
 // Set to percentile metric with values output by case generator, and generate the expected
@@ -1210,7 +1279,7 @@ void generate_metric_value_map(MetricType *my_metric,
     for (const auto &type : kth_percentiles) {
         auto name = kth_percentile_to_name(type);
         // Only add the chosen fields to the expected value map.
-        if (expected_metric_fields.find(name) != expected_metric_fields.end()) {
+        if (gutil::ContainsKey(expected_metric_fields, name)) {
             value_map[name] = *value;
         }
         ++value;
@@ -1371,7 +1440,7 @@ metric_filters::metric_fields_type get_all_kth_percentile_fields()
 
 TEST(metrics_test, take_snapshot_percentile_int64)
 {
-    RUN_CASES_WITH_PERCENTILE_SNAPSHOT(METRIC_test_percentile_int64,
+    RUN_CASES_WITH_PERCENTILE_SNAPSHOT(METRIC_test_server_percentile_int64,
                                        integral_percentile_case_generator<int64_t>,
                                        true,
                                        compare_integral_metric_value_map);
@@ -1379,11 +1448,16 @@ TEST(metrics_test, take_snapshot_percentile_int64)
 
 TEST(metrics_test, take_snapshot_percentile_double)
 {
-    RUN_CASES_WITH_PERCENTILE_SNAPSHOT(METRIC_test_percentile_double,
+    RUN_CASES_WITH_PERCENTILE_SNAPSHOT(METRIC_test_server_percentile_double,
                                        floating_percentile_case_generator<double>,
                                        false,
                                        compare_floating_metric_value_map);
 }
+
+const std::unordered_set<std::string> kAllMetricEntityFields = {kMetricEntityTypeField,
+                                                                kMetricEntityIdField,
+                                                                kMetricEntityAttrsField,
+                                                                kMetricEntityMetricsField};
 
 void check_entity_from_json_string(metric_entity *my_entity,
                                    const std::string &json_string,
@@ -1457,18 +1531,17 @@ void check_entity_from_json_string(metric_entity *my_entity,
         actual_fields.emplace(elem.name.GetString());
     }
 
-    static const std::unordered_set<std::string> kAllMetricEntityFields = {
-        kMetricEntityTypeField,
-        kMetricEntityIdField,
-        kMetricEntityAttrsField,
-        kMetricEntityMetricsField};
     ASSERT_EQ(actual_fields, kAllMetricEntityFields);
 }
 
 TEST(metrics_test, take_snapshot_entity)
 {
-    static const std::unordered_set<std::string> kAllEntityMetrics = {"test_gauge_int64",
-                                                                      "test_counter"};
+    static const std::unordered_set<std::string> kAllServerEntityMetrics = {
+        "test_server_gauge_int64", "test_server_counter"};
+    static const std::unordered_set<std::string> kAllTableEntityMetrics = {"test_table_gauge_int64",
+                                                                           "test_table_counter"};
+    static const std::unordered_set<std::string> kAllReplicaEntityMetrics = {
+        "test_replica_gauge_int64", "test_replica_counter"};
 
     // Test cases:
     // - both attributes and filters are empty
@@ -1547,31 +1620,31 @@ TEST(metrics_test, take_snapshot_entity)
         metric_filters::entity_metrics_type filter_entity_metrics;
     } tests[] = {
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_81",
          {},
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          {},
          {},
          {},
          {}},
         {&METRIC_ENTITY_my_table,
-         kAllEntityMetrics,
+         kAllTableEntityMetrics,
          "my_table",
          "table_1",
          {{"table", "test_table_1"}},
-         kAllEntityMetrics,
+         kAllTableEntityMetrics,
          {},
          {},
          {},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_1.0",
          {{"table", "test_table_1"}, {"partition", "0"}},
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          {},
          {},
          {},
@@ -1587,17 +1660,17 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_82",
          {},
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          {"my_server"},
          {},
          {},
          {}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_83",
          {},
@@ -1607,17 +1680,17 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_84",
          {},
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          {"another_server", "my_server"},
          {},
          {},
          {}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_85",
          {},
@@ -1627,17 +1700,17 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_86",
          {},
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          {},
          {"server_86"},
          {},
          {}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_87",
          {},
@@ -1647,17 +1720,17 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_88",
          {},
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          {},
          {"another_server_88", "server_88"},
          {},
          {}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_89",
          {},
@@ -1667,7 +1740,7 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_90",
          {},
@@ -1677,7 +1750,7 @@ TEST(metrics_test, take_snapshot_entity)
          {"attr_name_1", "attr_value_1"},
          {}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_91",
          {},
@@ -1687,17 +1760,17 @@ TEST(metrics_test, take_snapshot_entity)
          {"attr_name_1", "attr_value_1", "attr_name_2", "attr_value_2"},
          {}},
         {&METRIC_ENTITY_my_table,
-         kAllEntityMetrics,
+         kAllTableEntityMetrics,
          "my_table",
          "table_2",
          {{"table", "test_table_2"}},
-         kAllEntityMetrics,
+         kAllTableEntityMetrics,
          {},
          {},
          {"table", "test_table_2"},
          {}},
         {&METRIC_ENTITY_my_table,
-         kAllEntityMetrics,
+         kAllTableEntityMetrics,
          "my_table",
          "table_3",
          {{"table", "test_table_3"}},
@@ -1707,7 +1780,7 @@ TEST(metrics_test, take_snapshot_entity)
          {"another_table", "test_table_3"},
          {}},
         {&METRIC_ENTITY_my_table,
-         kAllEntityMetrics,
+         kAllTableEntityMetrics,
          "my_table",
          "table_4",
          {{"table", "test_table_4"}},
@@ -1717,7 +1790,7 @@ TEST(metrics_test, take_snapshot_entity)
          {"table", "another_test_table_4"},
          {}},
         {&METRIC_ENTITY_my_table,
-         kAllEntityMetrics,
+         kAllTableEntityMetrics,
          "my_table",
          "table_5",
          {{"table", "test_table_5"}},
@@ -1727,17 +1800,17 @@ TEST(metrics_test, take_snapshot_entity)
          {"another_table", "another_test_table_5"},
          {}},
         {&METRIC_ENTITY_my_table,
-         kAllEntityMetrics,
+         kAllTableEntityMetrics,
          "my_table",
          "table_6",
          {{"table", "test_table_6"}},
-         kAllEntityMetrics,
+         kAllTableEntityMetrics,
          {},
          {},
          {"another_table", "another_test_table_6", "table", "test_table_6"},
          {}},
         {&METRIC_ENTITY_my_table,
-         kAllEntityMetrics,
+         kAllTableEntityMetrics,
          "my_table",
          "table_7",
          {{"table", "test_table_7"}},
@@ -1747,17 +1820,17 @@ TEST(metrics_test, take_snapshot_entity)
          {"another_table", "test_table_7", "table", "another_test_table_7"},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_1.2",
          {{"table", "test_table_1"}, {"partition", "2"}},
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          {},
          {},
          {"table", "test_table_1"},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_1.3",
          {{"table", "test_table_1"}, {"partition", "3"}},
@@ -1767,7 +1840,7 @@ TEST(metrics_test, take_snapshot_entity)
          {"another_partition", "3"},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_1.4",
          {{"table", "test_table_1"}, {"partition", "4"}},
@@ -1777,7 +1850,7 @@ TEST(metrics_test, take_snapshot_entity)
          {"table", "another_test_table_1"},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_1.5",
          {{"table", "test_table_1"}, {"partition", "5"}},
@@ -1787,27 +1860,27 @@ TEST(metrics_test, take_snapshot_entity)
          {"another_table", "another_test_table_1"},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_1.6",
          {{"table", "test_table_1"}, {"partition", "6"}},
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          {},
          {},
          {"table", "test_table_1", "partition", "6"},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_1.7",
          {{"table", "test_table_1"}, {"partition", "7"}},
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          {},
          {},
          {"another_table", "another_test_table_1", "partition", "7"},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_2.0",
          {{"table", "test_table_2"}, {"partition", "0"}},
@@ -1825,7 +1898,7 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {},
          {},
-         {"test_gauge_int64"}},
+         {"test_server_gauge_int64"}},
         {&METRIC_ENTITY_my_server,
          {},
          "my_server",
@@ -1835,19 +1908,19 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {},
          {},
-         {"test_gauge_int64", "test_counter"}},
+         {"test_server_gauge_int64", "test_server_counter"}},
         {&METRIC_ENTITY_my_server,
-         {"test_gauge_int64"},
+         {"test_server_gauge_int64"},
          "my_server",
          "server_94",
          {},
-         {"test_gauge_int64"},
+         {"test_server_gauge_int64"},
          {},
          {},
          {},
-         {"test_gauge_int64"}},
+         {"test_server_gauge_int64"}},
         {&METRIC_ENTITY_my_server,
-         {"test_gauge_int64"},
+         {"test_server_gauge_int64"},
          "my_server",
          "server_95",
          {},
@@ -1855,19 +1928,19 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {},
          {},
-         {"test_counter"}},
+         {"test_server_counter"}},
         {&METRIC_ENTITY_my_server,
-         {"test_gauge_int64"},
+         {"test_server_gauge_int64"},
          "my_server",
          "server_96",
          {},
-         {"test_gauge_int64"},
+         {"test_server_gauge_int64"},
          {},
          {},
          {},
-         {"test_gauge_int64", "test_counter"}},
+         {"test_server_gauge_int64", "test_server_counter"}},
         {&METRIC_ENTITY_my_server,
-         {"test_gauge_int64"},
+         {"test_server_gauge_int64"},
          "my_server",
          "server_97",
          {},
@@ -1875,19 +1948,19 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {},
          {},
-         {"test_gauge_double", "test_counter"}},
+         {"test_server_gauge_double", "test_server_counter"}},
         {&METRIC_ENTITY_my_server,
-         {"test_gauge_int64", "test_counter"},
+         {"test_server_gauge_int64", "test_server_counter"},
          "my_server",
          "server_98",
          {},
-         {"test_counter"},
+         {"test_server_counter"},
          {},
          {},
          {},
-         {"test_counter"}},
+         {"test_server_counter"}},
         {&METRIC_ENTITY_my_server,
-         {"test_gauge_int64", "test_counter"},
+         {"test_server_gauge_int64", "test_server_counter"},
          "my_server",
          "server_99",
          {},
@@ -1895,29 +1968,29 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {},
          {},
-         {"test_gauge_double"}},
+         {"test_server_gauge_double"}},
         {&METRIC_ENTITY_my_server,
-         {"test_gauge_int64", "test_counter"},
+         {"test_server_gauge_int64", "test_server_counter"},
          "my_server",
          "server_100",
          {},
-         {"test_gauge_int64", "test_counter"},
+         {"test_server_gauge_int64", "test_server_counter"},
          {},
          {},
          {},
-         {"test_gauge_int64", "test_counter"}},
+         {"test_server_gauge_int64", "test_server_counter"}},
         {&METRIC_ENTITY_my_server,
-         {"test_gauge_int64", "test_counter"},
+         {"test_server_gauge_int64", "test_server_counter"},
          "my_server",
          "server_101",
          {},
-         {"test_gauge_int64"},
+         {"test_server_gauge_int64"},
          {},
          {},
          {},
-         {"test_gauge_int64", "test_gauge_double"}},
+         {"test_server_gauge_int64", "test_server_gauge_double"}},
         {&METRIC_ENTITY_my_server,
-         {"test_gauge_int64", "test_counter"},
+         {"test_server_gauge_int64", "test_server_counter"},
          "my_server",
          "server_102",
          {},
@@ -1925,19 +1998,19 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {},
          {},
-         {"test_gauge_double", "test_concurrent_counter"}},
+         {"test_server_gauge_double", "test_server_concurrent_counter"}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_103",
          {},
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          {"another_server", "my_server"},
          {"another_server_103", "server_103"},
          {},
          {}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_104",
          {},
@@ -1947,17 +2020,17 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_2.1",
          {{"table", "test_table_2"}, {"partition", "1"}},
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          {"another_replica", "my_replica"},
          {},
          {"table", "test_table_2", "partition", "1"},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_2.2",
          {{"table", "test_table_2"}, {"partition", "2"}},
@@ -1967,37 +2040,37 @@ TEST(metrics_test, take_snapshot_entity)
          {"table", "another_test_table_2", "another_partition", "2"},
          {}},
         {&METRIC_ENTITY_my_server,
-         {"test_gauge_int64", "test_counter"},
+         {"test_server_gauge_int64", "test_server_counter"},
          "my_server",
          "server_105",
          {},
-         {"test_gauge_int64", "test_counter"},
+         {"test_server_gauge_int64", "test_server_counter"},
          {"another_server", "my_server"},
          {},
          {},
-         {"test_gauge_int64", "test_counter"}},
+         {"test_server_gauge_int64", "test_server_counter"}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_106",
          {},
-         {"test_counter"},
+         {"test_server_counter"},
          {"another_server", "my_server"},
          {},
          {},
-         {"test_gauge_double", "test_counter"}},
+         {"test_server_gauge_double", "test_server_counter"}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_2.3",
          {{"table", "test_table_2"}, {"partition", "3"}},
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          {},
          {"another_replica_2.3", "replica_2.3"},
          {"table", "another_test_table_2", "partition", "3"},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_2.4",
          {{"table", "test_table_2"}, {"partition", "4"}},
@@ -2007,17 +2080,17 @@ TEST(metrics_test, take_snapshot_entity)
          {"table", "another_test_table_2", "another_partition", "4"},
          {}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_107",
          {},
-         {"test_gauge_int64"},
+         {"test_server_gauge_int64"},
          {},
          {"another_server_107", "server_107"},
          {},
-         {"test_gauge_int64", "test_gauge_double"}},
+         {"test_server_gauge_int64", "test_server_gauge_double"}},
         {&METRIC_ENTITY_my_server,
-         kAllEntityMetrics,
+         kAllServerEntityMetrics,
          "my_server",
          "server_108",
          {},
@@ -2025,19 +2098,19 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {"another_server_108", "server_108"},
          {},
-         {"test_gauge_double", "test_concurrent_counter"}},
+         {"test_server_gauge_double", "test_server_concurrent_counter"}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_2.5",
          {{"table", "test_table_2"}, {"partition", "5"}},
-         {"test_gauge_int64"},
+         {"test_replica_gauge_int64"},
          {},
          {},
          {"table", "another_test_table_2", "partition", "5"},
-         {"test_gauge_int64", "test_gauge_double"}},
+         {"test_replica_gauge_int64", "test_replica_gauge_double"}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_2.6",
          {{"table", "test_table_2"}, {"partition", "6"}},
@@ -2045,19 +2118,19 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {},
          {"table", "test_table_2", "partition", "6"},
-         {"test_gauge_double", "test_concurrent_counter"}},
+         {"test_replica_gauge_double", "test_replica_concurrent_counter"}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_2.7",
          {{"table", "test_table_2"}, {"partition", "7"}},
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          {"another_replica", "my_replica"},
          {"another_replica_2.7", "replica_2.7"},
          {"table", "another_test_table_2", "partition", "7"},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_3.0",
          {{"table", "test_table_3"}, {"partition", "0"}},
@@ -2067,17 +2140,17 @@ TEST(metrics_test, take_snapshot_entity)
          {"table", "another_test_table_3", "another_partition", "0"},
          {}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_3.1",
          {},
-         {"test_counter"},
+         {"test_replica_counter"},
          {"another_replica", "my_replica"},
          {"another_replica_3.1", "replica_3.1"},
          {},
-         {"test_gauge_double", "test_counter"}},
+         {"test_replica_gauge_double", "test_replica_counter"}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_3.2",
          {},
@@ -2085,19 +2158,19 @@ TEST(metrics_test, take_snapshot_entity)
          {"another_replica", "my_replica"},
          {"another_replica_3.2", "replica_3.2"},
          {},
-         {"test_gauge_double", "test_concurrent_counter"}},
+         {"test_replica_gauge_double", "test_replica_concurrent_counter"}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_3.3",
          {{"table", "test_table_3"}, {"partition", "3"}},
-         {"test_gauge_int64"},
+         {"test_replica_gauge_int64"},
          {"another_replica", "my_replica"},
          {},
          {"table", "test_table_3", "another_partition", "3"},
-         {"test_gauge_int64", "test_gauge_double"}},
+         {"test_replica_gauge_int64", "test_replica_gauge_double"}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_3.4",
          {{"table", "test_table_3"}, {"partition", "4"}},
@@ -2105,19 +2178,19 @@ TEST(metrics_test, take_snapshot_entity)
          {"another_replica", "my_replica"},
          {},
          {"table", "another_test_table_3", "partition", "4"},
-         {"test_gauge_double", "test_concurrent_counter"}},
+         {"test_replica_gauge_double", "test_replica_concurrent_counter"}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_3.5",
          {{"table", "test_table_3"}, {"partition", "5"}},
-         {"test_counter"},
+         {"test_replica_counter"},
          {},
          {"another_replica_3.5", "replica_3.5"},
          {"table", "test_table_3", "another_partition", "5"},
-         {"test_gauge_double", "test_counter"}},
+         {"test_replica_gauge_double", "test_replica_counter"}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_3.6",
          {{"table", "test_table_3"}, {"partition", "6"}},
@@ -2125,19 +2198,19 @@ TEST(metrics_test, take_snapshot_entity)
          {},
          {"another_replica_3.6", "replica_3.6"},
          {"table", "another_test_table_3", "partition", "6"},
-         {"test_gauge_double", "test_concurrent_counter"}},
+         {"test_replica_gauge_double", "test_replica_concurrent_counter"}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_3.7",
          {{"table", "test_table_3"}, {"partition", "7"}},
-         {"test_gauge_int64"},
+         {"test_replica_gauge_int64"},
          {"another_replica", "my_replica"},
          {"another_replica_3.7", "replica_3.7"},
          {"table", "test_table_3", "another_partition", "7"},
-         {"test_gauge_int64", "test_gauge_double"}},
+         {"test_replica_gauge_int64", "test_replica_gauge_double"}},
         {&METRIC_ENTITY_my_replica,
-         kAllEntityMetrics,
+         kAllReplicaEntityMetrics,
          "my_replica",
          "replica_4.0",
          {{"table", "test_table_4"}, {"partition", "0"}},
@@ -2145,21 +2218,33 @@ TEST(metrics_test, take_snapshot_entity)
          {"another_replica", "my_replica"},
          {"another_replica_4.0", "replica_4.0"},
          {"table", "another_test_table_4", "partition", "0"},
-         {"test_gauge_double", "test_concurrent_counter"}},
+         {"test_replica_gauge_double", "test_replica_concurrent_counter"}},
     };
 
     for (const auto &test : tests) {
         auto my_entity =
             test.entity_prototype->instantiate(test.expected_entity_id, test.expected_entity_attrs);
 
-        if (test.entity_metrics.find("test_gauge_int64") != test.entity_metrics.end()) {
-            auto my_gauge_int64 = METRIC_test_gauge_int64.instantiate(my_entity);
-            my_gauge_int64->set(5);
-        }
-
-        if (test.entity_metrics.find("test_counter") != test.entity_metrics.end()) {
-            auto my_counter = METRIC_test_counter.instantiate(my_entity);
-            my_counter->increment();
+        for (const auto &entity_metric : test.entity_metrics) {
+            if (entity_metric == "test_server_gauge_int64") {
+                auto my_metric = METRIC_test_server_gauge_int64.instantiate(my_entity);
+                my_metric->set(5);
+            } else if (entity_metric == "test_table_gauge_int64") {
+                auto my_metric = METRIC_test_table_gauge_int64.instantiate(my_entity);
+                my_metric->set(5);
+            } else if (entity_metric == "test_replica_gauge_int64") {
+                auto my_metric = METRIC_test_replica_gauge_int64.instantiate(my_entity);
+                my_metric->set(5);
+            } else if (entity_metric == "test_server_counter") {
+                auto my_metric = METRIC_test_server_counter.instantiate(my_entity);
+                my_metric->increment();
+            } else if (entity_metric == "test_table_counter") {
+                auto my_metric = METRIC_test_table_counter.instantiate(my_entity);
+                my_metric->increment();
+            } else if (entity_metric == "test_replica_counter") {
+                auto my_metric = METRIC_test_replica_counter.instantiate(my_entity);
+                my_metric->increment();
+            }
         }
 
         metric_filters filters;
@@ -2178,22 +2263,36 @@ TEST(metrics_test, take_snapshot_entity)
     }
 }
 
-void check_entities_from_json_string(const std::string &json_string,
-                                     const std::unordered_set<std::string> &expected_entity_ids)
+const std::unordered_set<std::string> kAllMetricQueryFields = {kMetricClusterField,
+                                                               kMetricRoleField,
+                                                               kMetricHostField,
+                                                               kMetricPortField,
+                                                               kMetricTimestampNsField,
+                                                               kMetricEntitiesField};
+
+void check_entity_ids_from_json_string(const std::string &json_string,
+                                       const std::unordered_set<std::string> &expected_entity_ids)
 {
-    // Even if there is not any entity selected, `json_string` should be "{}".
+    // Even if there is not any entity selected, `json_string` should not be empty.
     ASSERT_FALSE(json_string.empty());
 
     rapidjson::Document doc;
     rapidjson::ParseResult result = doc.Parse(json_string.c_str());
     ASSERT_FALSE(result.IsError());
 
-    // Actual entity ids parsed from json string for entities.
+    // The root struct should be an object.
+    ASSERT_TRUE(doc.IsObject());
+    for (const auto &field : kAllMetricQueryFields) {
+        ASSERT_TRUE(doc.HasMember(field.c_str()));
+    }
+
+    // Actual entity ids parsed from json string.
     std::unordered_set<std::string> actual_entity_ids;
 
     // The json format for entities should be an array.
-    ASSERT_TRUE(doc.IsArray());
-    for (const auto &entity : doc.GetArray()) {
+    const auto &entities = doc.FindMember(kMetricEntitiesField.c_str())->value;
+    ASSERT_TRUE(entities.IsArray());
+    for (const auto &entity : entities.GetArray()) {
         // The json format for each entity should be an object.
         ASSERT_TRUE(entity.IsObject());
 
@@ -2225,7 +2324,7 @@ void check_entities_from_json_string(const std::string &json_string,
                 }
 
                 static const std::unordered_set<std::string> kExpectedEntityMetrics = {
-                    "test_gauge_int64", "test_counter"};
+                    "test_server_gauge_int64", "test_server_counter"};
                 ASSERT_EQ(kExpectedEntityMetrics, actual_entity_metrics);
             } else {
                 ASSERT_TRUE(false) << "invalid field name: " << elem.name.GetString();
@@ -2243,10 +2342,10 @@ void check_registry_json_string(const std::unordered_set<std::string> &entity_id
     for (const auto &id : entity_ids) {
         auto my_entity = METRIC_ENTITY_my_server.instantiate(id);
 
-        auto my_gauge_int64 = METRIC_test_gauge_int64.instantiate(my_entity);
+        auto my_gauge_int64 = METRIC_test_server_gauge_int64.instantiate(my_entity);
         my_gauge_int64->set(5);
 
-        auto my_counter = METRIC_test_counter.instantiate(my_entity);
+        auto my_counter = METRIC_test_server_counter.instantiate(my_entity);
         my_counter->increment();
     }
 
@@ -2255,7 +2354,7 @@ void check_registry_json_string(const std::unordered_set<std::string> &entity_id
 
     auto &registery = metric_registry::instance();
     auto json_string = take_snapshot_and_get_json_string(&registery, filters);
-    check_entities_from_json_string(json_string, expected_entity_ids);
+    check_entity_ids_from_json_string(json_string, expected_entity_ids);
 }
 
 TEST(metrics_test, take_snapshot_registry)
@@ -2282,10 +2381,972 @@ TEST(metrics_test, take_snapshot_registry)
          {"server_113", "server_114", "server_115"},
          {"server_113", "server_114"}},
     };
+
     for (const auto &test : tests) {
         check_registry_json_string(
             test.entity_ids, test.filter_entity_ids, test.expected_entity_ids);
     }
 }
+
+struct entity_properties
+{
+    std::string type;
+    metric_entity::attr_map attrs;
+    std::unordered_set<std::string> metrics;
+};
+
+bool operator==(const entity_properties &lhs, const entity_properties &rhs)
+{
+    if (lhs.type != rhs.type) {
+        return false;
+    }
+
+    if (lhs.attrs != rhs.attrs) {
+        return false;
+    }
+
+    return lhs.metrics == rhs.metrics;
+}
+
+using entity_container = std::unordered_map<std::string, entity_properties>;
+
+void check_entities_from_json_string(const std::string &json_string,
+                                     const http_status_code expected_status_code,
+                                     const entity_container &expected_entities,
+                                     const std::unordered_set<std::string> &expected_metric_fields)
+{
+    // Should not be empty for both success and error response.
+    ASSERT_FALSE(json_string.empty());
+
+    rapidjson::Document doc;
+    rapidjson::ParseResult result = doc.Parse(json_string.c_str());
+    ASSERT_FALSE(result.IsError());
+
+    if (expected_status_code != http_status_code::kOk) {
+        // Error response is an object in essence.
+        ASSERT_TRUE(doc.IsObject());
+
+        for (const auto &elem : doc.GetObject()) {
+            // Each name must be a string.
+            ASSERT_TRUE(elem.name.IsString());
+
+            // There is only one field for error response.
+            ASSERT_STREQ("error_message", elem.name.GetString());
+
+            ASSERT_TRUE(elem.value.IsString());
+            std::cout << "error_message: " << elem.value.GetString() << std::endl;
+        }
+        return;
+    }
+
+    // The successful response should be an object.
+    ASSERT_TRUE(doc.IsObject());
+    for (const auto &field : kAllMetricQueryFields) {
+        ASSERT_TRUE(doc.HasMember(field.c_str()));
+    }
+
+    // Actual entities parsed from json string.
+    entity_container actual_entities;
+
+    // The json format for entities should be an array.
+    const auto &entities = doc.FindMember(kMetricEntitiesField.c_str())->value;
+    ASSERT_TRUE(entities.IsArray());
+    for (const auto &entity : entities.GetArray()) {
+        // The json format for each entity should be an object.
+        ASSERT_TRUE(entity.IsObject());
+
+        // Actual properties parsed from json string for each entity.
+        std::string id;
+        entity_properties actual_entity;
+
+        // Actual fields parsed from json string for each entity.
+        std::unordered_set<std::string> actual_entity_fields;
+
+        for (const auto &elem : entity.GetObject()) {
+            // Each name must be a string.
+            ASSERT_TRUE(elem.name.IsString());
+
+            if (kMetricEntityTypeField == elem.name.GetString()) {
+                ASSERT_TRUE(elem.value.IsString());
+                actual_entity.type = elem.value.GetString();
+            } else if (kMetricEntityIdField == elem.name.GetString()) {
+                ASSERT_TRUE(elem.value.IsString());
+                id = elem.value.GetString();
+            } else if (kMetricEntityAttrsField == elem.name.GetString()) {
+                ASSERT_TRUE(elem.value.IsObject());
+
+                for (const auto &attr : elem.value.GetObject()) {
+                    // Each name must be a string.
+                    ASSERT_TRUE(attr.name.IsString());
+                    ASSERT_TRUE(attr.value.IsString());
+                    actual_entity.attrs.emplace(attr.name.GetString(), attr.value.GetString());
+                }
+            } else if (kMetricEntityMetricsField == elem.name.GetString()) {
+                ASSERT_TRUE(elem.value.IsArray());
+
+                for (const auto &m : elem.value.GetArray()) {
+                    ASSERT_TRUE(m.IsObject());
+
+                    // Actual fields for each metric.
+                    std::unordered_set<std::string> actual_metric_fields;
+
+                    bool has_metric_name_field = false;
+                    for (const auto &field : m.GetObject()) {
+                        // Each name must be a string.
+                        ASSERT_TRUE(field.name.IsString());
+                        if (kMetricNameField == field.name.GetString()) {
+                            ASSERT_TRUE(field.value.IsString());
+                            actual_entity.metrics.emplace(field.value.GetString());
+                            has_metric_name_field = true;
+                        }
+                        actual_metric_fields.emplace(field.name.GetString());
+                    }
+                    ASSERT_TRUE(has_metric_name_field)
+                        << "metric name must be included in the fields";
+
+                    // Check if all parsed fields for each metric are expected.
+                    ASSERT_EQ(expected_metric_fields, actual_metric_fields);
+                }
+            } else {
+                ASSERT_TRUE(false) << "invalid field name: " << elem.name.GetString();
+            }
+
+            actual_entity_fields.emplace(elem.name.GetString());
+        }
+
+        // Check if all parsed fields for each entity are expected.
+        ASSERT_EQ(kAllMetricEntityFields, actual_entity_fields);
+
+        actual_entities.emplace(id, actual_entity);
+    }
+
+    // Check if the contents of all entities are identical with the expected.
+    ASSERT_EQ(expected_entities, actual_entities);
+}
+
+void test_get_metrics_handler(const http_request &req, http_response &resp)
+{
+    metric_registry::instance()._http_service.get_metrics_handler(req, resp);
+}
+
+void test_http_get_metrics(const std::string &request_string,
+                           const http_status_code expected_status_code,
+                           const entity_container &expected_entities,
+                           const std::unordered_set<std::string> &expected_metric_fields)
+{
+    std::cout << "request_string: " << request_string << std::endl;
+
+    message_reader reader(64);
+    char *buf = reader.read_buffer_ptr(request_string.size());
+    std::memcpy(buf, request_string.data(), request_string.size());
+    reader.mark_read(request_string.size());
+
+    http_message_parser parser;
+    int read_next = 0;
+    message_ptr msg(parser.get_message_on_receive(&reader, read_next));
+    ASSERT_NE(msg, nullptr);
+
+    const auto &req_res = http_request::parse(msg.get());
+    ASSERT_TRUE(req_res.is_ok());
+
+    const auto &req = req_res.get_value();
+    std::cout << "method: " << enum_to_string(req.method) << std::endl;
+
+    http_response resp;
+    test_get_metrics_handler(req, resp);
+
+    ASSERT_EQ(expected_status_code, resp.status_code);
+    check_entities_from_json_string(
+        resp.body, expected_status_code, expected_entities, expected_metric_fields);
+}
+
+TEST(metrics_test, http_get_metrics)
+{
+    struct loaded_test_entity
+    {
+        metric_entity_prototype *prototype;
+        std::string id;
+        metric_entity::attr_map attrs;
+    } test_entities[] = {
+        {&METRIC_ENTITY_my_replica, "replica_5.0", {{"table", "test_app_5"}, {"partition", "5.0"}}},
+        {&METRIC_ENTITY_my_replica, "replica_5.1", {{"table", "test_app_5"}, {"partition", "5.1"}}},
+        {&METRIC_ENTITY_my_app, "app_5", {{"table", "test_app_5"}}},
+        {&METRIC_ENTITY_my_app, "app_6", {{"table", "test_app_6"}}},
+        {&METRIC_ENTITY_my_server, "server_116", {}},
+    };
+
+    for (const auto &entity : test_entities) {
+        auto my_entity = entity.prototype->instantiate(entity.id, entity.attrs);
+
+        if (utils::equals(entity.prototype->name(), "my_server")) {
+            static const std::set<kth_percentile_type> kPercentileTypes = {
+                kth_percentile_type::P95, kth_percentile_type::P99};
+            auto my_metric = METRIC_test_server_percentile_int64.instantiate(
+                my_entity, 50UL, kPercentileTypes, 4096UL);
+            my_metric->set(5);
+            continue;
+        }
+
+        gauge_ptr<int64_t> my_gauge_int64;
+        counter_ptr<> my_counter;
+        if (utils::equals(entity.prototype->name(), "my_replica")) {
+            my_gauge_int64 = METRIC_test_replica_gauge_int64.instantiate(my_entity);
+            my_counter = METRIC_test_replica_counter.instantiate(my_entity);
+        } else if (utils::equals(entity.prototype->name(), "my_app")) {
+            my_gauge_int64 = METRIC_test_app_gauge_int64.instantiate(my_entity);
+            my_counter = METRIC_test_app_counter.instantiate(my_entity);
+        } else {
+            ASSERT_TRUE(false);
+        }
+
+        // Set metrics with arbitrary values.
+        my_gauge_int64->set(5);
+        my_counter->increment();
+    }
+
+// Do not use leading '#' for `fields` to replace with the literal text, since clang-format
+// will keep a space before and after '=' in `fields`. Just use double quotes "" instead.
+#define REQUEST_STRING(method, fields) (#method " /metrics?" fields " HTTP/1.1\r\n\r\n")
+
+    static const metric_filters::metric_fields_type kBriefSingleValueMetricFields = {
+        kMetricNameField, kMetricSingleValueField};
+
+    auto percentile_metric_fields = kAllPrototypeMetricFields;
+    percentile_metric_fields.emplace("p95");
+    percentile_metric_fields.emplace("p99");
+
+    // Test cases:
+    // - get all metrics that belong to an entity type of "my_app"
+    // - request by POST method
+    // - request with an unknown field name in query string
+    // - request for an entity types which does not exist
+    // - request for 2 entity types one of which does not exist
+    // - request for 2 entity types both of which exist
+    // - request for 2 entity types both of which do not exist
+    // - request for an entity id which exists
+    // - request for an entity id which does not exist
+    // - request for 2 entity ids both of which exist
+    // - request for 2 entity ids one of which does not exist
+    // - request for 2 entity ids both of which do not exist
+    // - request for 1 pair of entity attribute that exists
+    // - request for 1 pair of entity attribute that does not exist
+    // - 2 pairs of entity attributes both of which exist have the different keys
+    // - 2 pairs of entity attributes both of which exist have the same key
+    // - 2 pair of entity attribute one of which does not exist have the different keys
+    // - 2 pair of entity attribute one of which does not exist have the same keys
+    // - the number of arguments for entity attributes in query string is odd(1)
+    // - the number of arguments for entity attributes in query string is odd(3)
+    // - request for a metric which exists
+    // - request for a metric which does not exist
+    // - request for 2 metrics ids both of which exist
+    // - request for 2 metrics one of which does not exist
+    // - request for 2 metrics both of which do not exist
+    // - request for one metric field
+    // - request for 2 metric fields
+    // - filter with types and ids
+    // - filter with types, ids and attributes
+    // - filter with ids and attributes
+    // - filter with ids and metrics
+    // - filter with attributes and metrics
+    // - filter with ids, attributes and metrics
+    // - filter with types, ids, attributes and metrics while request for specified fields
+    // - request gauge and counter with specified fields while detail=false
+    // - request gauge and counter with specified fields while detail=true
+    // - request gauge and counter while detail=false
+    // - request gauge and counter while detail=true
+    // - request percentile with specified fields for default detail
+    // - request percentile with specified fields while detail=false
+    // - request percentile with specified fields while detail=true
+    // - request percentile for default detail
+    // - request percentile while detail=false
+    // - request percentile while detail=true
+    struct test_case
+    {
+        std::string request_string;
+        http_status_code expected_status_code;
+        std::unordered_map<std::string, std::unordered_set<std::string>> expected_entity_metrics;
+        std::unordered_set<std::string> expected_metric_fields;
+    } tests[] = {
+        {REQUEST_STRING(GET, "types=my_app"),
+         http_status_code::kOk,
+         {{"app_5", {"test_app_gauge_int64", "test_app_counter"}},
+          {"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(POST, "types=my_app"), http_status_code::kBadRequest, {}, {}},
+        {REQUEST_STRING(POST, "invalid_field=unknown_value"),
+         http_status_code::kBadRequest,
+         {},
+         {}},
+        {REQUEST_STRING(GET, "types=unknown_type"), http_status_code::kOk, {}, {}},
+        {REQUEST_STRING(GET, "types=unknown_type,my_app"),
+         http_status_code::kOk,
+         {{"app_5", {"test_app_gauge_int64", "test_app_counter"}},
+          {"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "types=my_app,my_replica&attributes=table,test_app_5"),
+         http_status_code::kOk,
+         {{"replica_5.0", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"replica_5.1", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"app_5", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "types=unknown_type_1,unknown_type_2"), http_status_code::kOk, {}, {}},
+        {REQUEST_STRING(GET, "ids=replica_5.1"),
+         http_status_code::kOk,
+         {{"replica_5.1", {"test_replica_gauge_int64", "test_replica_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "ids=another_replica_5.1"), http_status_code::kOk, {}, {}},
+        {REQUEST_STRING(GET, "ids=replica_5.1,app_6"),
+         http_status_code::kOk,
+         {{"replica_5.1", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "ids=another_replica_5.1,app_6"),
+         http_status_code::kOk,
+         {{"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "ids=another_replica_5.1,another_app_6"),
+         http_status_code::kOk,
+         {},
+         {}},
+        {REQUEST_STRING(GET, "attributes=table,test_app_5"),
+         http_status_code::kOk,
+         {{"replica_5.0", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"replica_5.1", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"app_5", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "attributes=table,another_test_app_5"), http_status_code::kOk, {}, {}},
+        {REQUEST_STRING(GET, "attributes=table,test_app_5,partition,5.1"),
+         http_status_code::kOk,
+         {{"replica_5.0", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"replica_5.1", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"app_5", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "attributes=table,test_app_5,table,test_app_6"),
+         http_status_code::kOk,
+         {{"replica_5.0", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"replica_5.1", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"app_5", {"test_app_gauge_int64", "test_app_counter"}},
+          {"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "attributes=table,test_app_5,partition,another_5.1"),
+         http_status_code::kOk,
+         {{"replica_5.0", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"replica_5.1", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"app_5", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "attributes=table,test_app_5,table,another_test_app_6"),
+         http_status_code::kOk,
+         {{"replica_5.0", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"replica_5.1", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"app_5", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "attributes=table"), http_status_code::kBadRequest, {}, {}},
+        {REQUEST_STRING(GET, "attributes=table,test_app_5,partition"),
+         http_status_code::kBadRequest,
+         {},
+         {}},
+        {REQUEST_STRING(GET, "metrics=test_app_gauge_int64"),
+         http_status_code::kOk,
+         {{"app_5", {"test_app_gauge_int64"}}, {"app_6", {"test_app_gauge_int64"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "metrics=another_test_app_gauge_int64"),
+         http_status_code::kOk,
+         {},
+         {}},
+        {REQUEST_STRING(GET, "metrics=test_app_gauge_int64,test_app_counter"),
+         http_status_code::kOk,
+         {{"app_5", {"test_app_gauge_int64", "test_app_counter"}},
+          {"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "metrics=test_app_gauge_int64,another_test_app_gauge_int64"),
+         http_status_code::kOk,
+         {{"app_5", {"test_app_gauge_int64"}}, {"app_6", {"test_app_gauge_int64"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "metrics=another_test_app_gauge_int64,another_test_app_counter"),
+         http_status_code::kOk,
+         {},
+         {}},
+        {REQUEST_STRING(GET, "types=my_app&with_metric_fields=name"),
+         http_status_code::kOk,
+         {{"app_5", {"test_app_gauge_int64", "test_app_counter"}},
+          {"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         {kMetricNameField}},
+        {REQUEST_STRING(GET, "types=my_app&with_metric_fields=name,value"),
+         http_status_code::kOk,
+         {{"app_5", {"test_app_gauge_int64", "test_app_counter"}},
+          {"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         {kMetricNameField, kMetricSingleValueField}},
+        {REQUEST_STRING(GET, "types=my_app,my_replica&ids=replica_5.1,app_6"),
+         http_status_code::kOk,
+         {{"replica_5.1", {"test_replica_gauge_int64", "test_replica_counter"}},
+          {"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(
+             GET, "types=my_app,my_replica&ids=replica_5.1,app_6&attributes=table,test_app_5"),
+         http_status_code::kOk,
+         {{"replica_5.1", {"test_replica_gauge_int64", "test_replica_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "ids=replica_5.1,app_6&attributes=table,test_app_6"),
+         http_status_code::kOk,
+         {{"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET,
+                        "ids=replica_5.1,app_6&metrics=test_replica_gauge_int64,test_app_counter"),
+         http_status_code::kOk,
+         {{"replica_5.1", {"test_replica_gauge_int64"}}, {"app_6", {"test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(
+             GET, "attributes=table,test_app_5&metrics=test_replica_counter,test_app_gauge_int64"),
+         http_status_code::kOk,
+         {{"replica_5.0", {"test_replica_counter"}},
+          {"replica_5.1", {"test_replica_counter"}},
+          {"app_5", {"test_app_gauge_int64"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET,
+                        "ids=replica_5.1,app_5&attributes=table,test_app_5&metrics=test_"
+                        "replica_counter,test_app_counter"),
+         http_status_code::kOk,
+         {{"replica_5.1", {"test_replica_counter"}}, {"app_5", {"test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(
+             GET,
+             "types=my_app,ids=replica_5.1,app_6&attributes=table,test_app_6&"
+             "metrics=test_replica_counter,test_app_counter&with_metric_fields=name,value"),
+         http_status_code::kOk,
+         {{"app_6", {"test_app_counter"}}},
+         {kMetricNameField, kMetricSingleValueField}},
+        {REQUEST_STRING(GET, "types=my_app&with_metric_fields=name,desc&detail=false"),
+         http_status_code::kOk,
+         {{"app_5", {"test_app_gauge_int64", "test_app_counter"}},
+          {"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         {kMetricNameField, kMetricDescField}},
+        {REQUEST_STRING(GET, "types=my_app&with_metric_fields=name,desc&detail=true"),
+         http_status_code::kOk,
+         {{"app_5", {"test_app_gauge_int64", "test_app_counter"}},
+          {"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         {kMetricNameField, kMetricDescField}},
+        {REQUEST_STRING(GET, "types=my_app&detail=false"),
+         http_status_code::kOk,
+         {{"app_5", {"test_app_gauge_int64", "test_app_counter"}},
+          {"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         kBriefSingleValueMetricFields},
+        {REQUEST_STRING(GET, "types=my_app&detail=true"),
+         http_status_code::kOk,
+         {{"app_5", {"test_app_gauge_int64", "test_app_counter"}},
+          {"app_6", {"test_app_gauge_int64", "test_app_counter"}}},
+         kAllSingleValueMetricFields},
+        {REQUEST_STRING(GET, "ids=server_116&with_metric_fields=name,desc"),
+         http_status_code::kOk,
+         {{"server_116", {"test_server_percentile_int64"}}},
+         {kMetricNameField, kMetricDescField}},
+        {REQUEST_STRING(GET, "ids=server_116&with_metric_fields=name,desc&detail=false"),
+         http_status_code::kOk,
+         {{"server_116", {"test_server_percentile_int64"}}},
+         {kMetricNameField, kMetricDescField}},
+        {REQUEST_STRING(GET, "ids=server_116&with_metric_fields=name,desc&detail=true"),
+         http_status_code::kOk,
+         {{"server_116", {"test_server_percentile_int64"}}},
+         {kMetricNameField, kMetricDescField}},
+        {REQUEST_STRING(GET, "ids=server_116"),
+         http_status_code::kOk,
+         {{"server_116", {"test_server_percentile_int64"}}},
+         {kMetricNameField, "p95", "p99"}},
+        {REQUEST_STRING(GET, "ids=server_116&detail=false"),
+         http_status_code::kOk,
+         {{"server_116", {"test_server_percentile_int64"}}},
+         {kMetricNameField, "p95", "p99"}},
+        {REQUEST_STRING(GET, "ids=server_116&detail=true"),
+         http_status_code::kOk,
+         {{"server_116", {"test_server_percentile_int64"}}},
+         percentile_metric_fields},
+    };
+
+#undef REQUEST_STRING
+
+    const auto &entities = metric_registry::instance().entities();
+    for (const auto &test : tests) {
+        entity_container expected_entities;
+        for (const auto &entity_pair : test.expected_entity_metrics) {
+            const auto *entity = gutil::FindOrNull(entities, entity_pair.first);
+            ASSERT_NE(entity, nullptr);
+            expected_entities.emplace((*entity)->id(),
+                                      entity_properties{(*entity)->prototype()->name(),
+                                                        (*entity)->attributes(),
+                                                        entity_pair.second});
+        }
+
+        test_http_get_metrics(test.request_string,
+                              test.expected_status_code,
+                              expected_entities,
+                              test.expected_metric_fields);
+    }
+}
+
+struct metric_filters_query_string_case
+{
+    metric_filters::metric_fields_type with_metric_fields;
+    metric_filters::entity_types_type entity_types;
+    metric_filters::entity_ids_type entity_ids;
+    metric_filters::entity_attrs_type entity_attrs;
+    metric_filters::entity_metrics_type entity_metrics;
+    size_t expected_fields;
+};
+
+class MetricFiltersQueryStringTest : public testing::TestWithParam<metric_filters_query_string_case>
+{
+};
+
+const std::vector<metric_filters_query_string_case> metric_filters_query_string_tests = {
+    // Empty query string.
+    {{}, {}, {}, {}, {}, 0},
+    // Some fields were missing in the query string.
+    {{"name", "value"}, {"replica"}, {}, {}, {"rdb_total_sst_files", "rdb_total_sst_size_mb"}, 3},
+    // All fields were present.
+    {{"name", "value"},
+     {"replica"},
+     {"replica5.2"},
+     {"table_id", "partition_id"},
+     {"rdb_total_sst_files", "rdb_total_sst_size_mb"},
+     5},
+};
+
+TEST_P(MetricFiltersQueryStringTest, BuildQueryString)
+{
+    const auto &query_string_case = GetParam();
+
+    metric_filters filters;
+
+#define COPY_CONTAINER(field) filters.field = query_string_case.field
+
+    // Copy the data of the case to the tested metric filters.
+    COPY_CONTAINER(with_metric_fields);
+    COPY_CONTAINER(entity_types);
+    COPY_CONTAINER(entity_ids);
+    COPY_CONTAINER(entity_attrs);
+    COPY_CONTAINER(entity_metrics);
+
+#undef COPY_CONTAINER
+
+    // Build the http query string based on the tested metric filters.
+    const auto &query_string = filters.to_query_string();
+    std::cout << "query string: " << query_string << std::endl;
+
+    // There should not be any space character in the query string.
+    ASSERT_FALSE(utils::has_space(query_string));
+
+    // Extract each field name/value pair from the query string and check the number of
+    // the fields.
+    std::vector<std::string> fields;
+    utils::split_args(query_string.c_str(), fields, '&');
+    ASSERT_EQ(query_string_case.expected_fields, fields.size());
+
+    size_t i = 0;
+
+#define CHECK_FIELD(name, type, field)                                                             \
+    do {                                                                                           \
+        if (query_string_case.field.empty()) {                                                     \
+            break;                                                                                 \
+        }                                                                                          \
+                                                                                                   \
+        ASSERT_LT(i, query_string_case.expected_fields);                                           \
+                                                                                                   \
+        std::vector<std::string> kvs;                                                              \
+        utils::split_args(fields[i].c_str(), kvs, '=');                                            \
+        ASSERT_EQ(2, kvs.size());                                                                  \
+        ASSERT_STREQ(#name, kvs[0].c_str());                                                       \
+                                                                                                   \
+        type actual_field;                                                                         \
+        utils::split_args(kvs[1].c_str(), actual_field, ',');                                      \
+        ASSERT_EQ(query_string_case.field, actual_field);                                          \
+        ++i;                                                                                       \
+    } while (0)
+
+    // Check each field name/value extracted from the query string is exactly equal to the
+    // original metric filters.
+    CHECK_FIELD(with_metric_fields, metric_filters::metric_fields_type, with_metric_fields);
+    CHECK_FIELD(types, metric_filters::entity_types_type, entity_types);
+    CHECK_FIELD(ids, metric_filters::entity_ids_type, entity_ids);
+    CHECK_FIELD(attributes, metric_filters::entity_attrs_type, entity_attrs);
+    CHECK_FIELD(metrics, metric_filters::entity_metrics_type, entity_metrics);
+
+#undef CHECK_FIELD
+
+    // All of the fields should have been checked.
+    ASSERT_EQ(query_string_case.expected_fields, i);
+}
+
+INSTANTIATE_TEST_SUITE_P(MetricsTest,
+                         MetricFiltersQueryStringTest,
+                         testing::ValuesIn(metric_filters_query_string_tests));
+
+using surviving_metrics_case = std::tuple<std::string, bool, bool, bool, bool>;
+
+class MetricsRetirementTest : public testing::TestWithParam<surviving_metrics_case>
+{
+public:
+    // For higher version of googletest, use `static void SetUpTestSuite()` instead.
+    static void SetUpTestCase()
+    {
+        // Restart the timer of registry with shorter interval to reduce the test time.
+        _reserved_entity_retirement_delay_ms = FLAGS_entity_retirement_delay_ms;
+        restart_metric_registry_timer(kEntityRetirementDelayMsForTest);
+    }
+
+    // For higher version of googletest, use `static void TearDownTestSuite()` instead.
+    static void TearDownTestCase()
+    {
+        // Recover the timer of registry with the original interval.
+        restart_metric_registry_timer(_reserved_entity_retirement_delay_ms);
+    }
+
+    static const uint64_t kEntityRetirementDelayMsForTest;
+
+private:
+    static void restart_metric_registry_timer(uint64_t interval_ms)
+    {
+        metric_registry::instance().stop_timer();
+        FLAGS_entity_retirement_delay_ms = interval_ms;
+        metric_registry::instance().start_timer();
+
+        std::cout << "restart the timer of metric registry at interval " << interval_ms << " ms."
+                  << std::endl;
+    }
+
+    static uint64_t _reserved_entity_retirement_delay_ms;
+};
+
+const uint64_t MetricsRetirementTest::kEntityRetirementDelayMsForTest = 100;
+uint64_t MetricsRetirementTest::_reserved_entity_retirement_delay_ms;
+
+// This class helps to test retirement of metrics and entities, by creating temporary
+// variables or reference them as members of this class to control their lifetime.
+class scoped_entity
+{
+public:
+    // Use the raw pointer to hold metric without any reference which may affect the test results.
+    using surviving_metric_map = std::unordered_map<const metric_prototype *, const metric *>;
+
+    scoped_entity(const std::string &entity_id,
+                  bool is_entity_surviving,
+                  bool is_gauge_surviving,
+                  bool is_counter_surviving,
+                  bool is_percentile_surviving);
+
+    // After a long enough time, check if temporary entity is retired with its own metrics while
+    // long-life one still survive.
+    void test_survival_after_retirement() const;
+
+private:
+    template <typename MetricPrototype, typename MetricPtr>
+    void instantiate_metric(const metric_entity_ptr &my_entity,
+                            bool is_surviving,
+                            const MetricPrototype &prototype,
+                            MetricPtr &m)
+    {
+        // Create a temporary variable for the metric.
+        auto temp_m = prototype.instantiate(my_entity);
+        _expected_all_metrics.emplace(&prototype, temp_m.get());
+
+        if (!is_surviving) {
+            return;
+        }
+
+        // Extend the lifetime of the metric since it's marked as "surviving".
+        m = temp_m;
+    }
+
+    surviving_metric_map get_actual_surviving_metrics(const metric_entity_ptr &my_entity) const;
+
+    // Check if the entity still survive with its own metrics no matter whether they are temporary
+    // or long-life.
+    void test_survival_immediately_after_initialization() const;
+
+    std::string _my_entity_id;
+    metric_entity *_expected_my_entity_raw_ptr;
+    metric_entity_ptr _my_entity;
+
+    gauge_ptr<int64_t> _my_gauge_int64;
+    counter_ptr<> _my_counter;
+    percentile_ptr<int64_t> _my_percentile_int64;
+
+    surviving_metric_map _expected_all_metrics;
+    surviving_metric_map _expected_surviving_metrics;
+};
+
+scoped_entity::scoped_entity(const std::string &entity_id,
+                             bool is_entity_surviving,
+                             bool is_gauge_surviving,
+                             bool is_counter_surviving,
+                             bool is_percentile_surviving)
+    : _my_entity_id(entity_id)
+{
+    // Create a temporary variabl for the entity.
+    auto my_entity = METRIC_ENTITY_my_server.instantiate(entity_id);
+    _expected_my_entity_raw_ptr = my_entity.get();
+
+    // Create temporary or long-life variables for metrics, depending on what is_*_surviving is.
+    instantiate_metric(
+        my_entity, is_gauge_surviving, METRIC_test_server_gauge_int64, _my_gauge_int64);
+    instantiate_metric(my_entity, is_counter_surviving, METRIC_test_server_counter, _my_counter);
+    instantiate_metric(my_entity,
+                       is_percentile_surviving,
+                       METRIC_test_server_percentile_int64,
+                       _my_percentile_int64);
+
+    if (is_entity_surviving) {
+        // Extend the lifetime of the entity since it's marked as "surviving".
+        _my_entity = my_entity;
+        _expected_surviving_metrics = _expected_all_metrics;
+    }
+
+    test_survival_immediately_after_initialization();
+}
+
+scoped_entity::surviving_metric_map
+scoped_entity::get_actual_surviving_metrics(const metric_entity_ptr &my_entity) const
+{
+    surviving_metric_map actual_surviving_metrics;
+
+    utils::auto_read_lock l(my_entity->_lock);
+
+    // Use internal member directly instead of calling metrics(). We don't want to have
+    // any reference which may affect the test results.
+    for (const auto &m : my_entity->_metrics) {
+        actual_surviving_metrics.emplace(m.first, m.second.get());
+    }
+
+    return actual_surviving_metrics;
+}
+
+void scoped_entity::test_survival_immediately_after_initialization() const
+{
+    utils::auto_read_lock l(metric_registry::instance()._lock);
+
+    // Use internal member directly instead of calling entities(). We don't want to have
+    // any reference which may affect the test results.
+    const auto &entities = metric_registry::instance()._entities;
+    const auto *entity = gutil::FindOrNull(entities, _my_entity_id);
+    ASSERT_NE(entity, nullptr);
+    ASSERT_EQ(_expected_my_entity_raw_ptr, entity->get());
+
+    const auto &actual_surviving_metrics = get_actual_surviving_metrics(*entity);
+    ASSERT_EQ(_expected_all_metrics, actual_surviving_metrics);
+}
+
+void scoped_entity::test_survival_after_retirement() const
+{
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(MetricsRetirementTest::kEntityRetirementDelayMsForTest * 2));
+
+    utils::auto_read_lock l(metric_registry::instance()._lock);
+
+    // Use internal member directly instead of calling entities(). We don't want to have
+    // any reference which may affect the test results.
+    const auto &entities = metric_registry::instance()._entities;
+    const auto *iter = gutil::FindOrNull(entities, _my_entity_id);
+    if (_my_entity == nullptr) {
+        // The entity has been retired.
+        ASSERT_EQ(iter, nullptr);
+        ASSERT_TRUE(_expected_surviving_metrics.empty());
+        return;
+    }
+
+    ASSERT_NE(iter, nullptr);
+    ASSERT_EQ(_expected_my_entity_raw_ptr, iter->get());
+
+    const auto &actual_surviving_metrics = get_actual_surviving_metrics(*iter);
+    ASSERT_EQ(_expected_surviving_metrics, actual_surviving_metrics);
+}
+
+TEST_P(MetricsRetirementTest, RetireOldMetrics)
+{
+    std::string entity_id;
+    bool is_entity_surviving;
+    bool is_gauge_surviving;
+    bool is_counter_surviving;
+    bool is_percentile_surviving;
+    std::tie(entity_id,
+             is_entity_surviving,
+             is_gauge_surviving,
+             is_counter_surviving,
+             is_percentile_surviving) = GetParam();
+
+    scoped_entity entity(entity_id,
+                         is_entity_surviving,
+                         is_gauge_surviving,
+                         is_counter_surviving,
+                         is_percentile_surviving);
+    entity.test_survival_after_retirement();
+}
+
+const std::vector<surviving_metrics_case> metrics_retirement_tests = {
+    {std::string("server_117"), true, true, true, true},
+    {std::string("server_118"), true, true, true, false},
+    {std::string("server_119"), true, true, false, false},
+    {std::string("server_120"), true, false, false, false},
+    {std::string("server_121"), false, false, false, false},
+};
+
+INSTANTIATE_TEST_SUITE_P(MetricsTest,
+                         MetricsRetirementTest,
+                         testing::ValuesIn(metrics_retirement_tests));
+
+class MetricVarTest : public testing::Test
+{
+protected:
+    MetricVarTest();
+
+    void SetUp() override
+    {
+        METRIC_VAR_SET(test_replica_gauge_int64, 0);
+        METRIC_VAR_NAME(test_replica_counter)->reset();
+        METRIC_VAR_NAME(test_replica_percentile_int64_ns)->reset_tail_for_test();
+        METRIC_VAR_NAME(test_replica_percentile_int64_us)->reset_tail_for_test();
+        METRIC_VAR_NAME(test_replica_percentile_int64_ms)->reset_tail_for_test();
+        METRIC_VAR_NAME(test_replica_percentile_int64_s)->reset_tail_for_test();
+    }
+
+    const metric_entity_ptr &my_replica_metric_entity() const { return _my_replica_metric_entity; }
+
+    void test_set_percentile(const std::vector<int64_t> &expected_samples);
+    void test_set_percentile(size_t n, int64_t val);
+
+    void test_auto_count();
+
+    const metric_entity_ptr _my_replica_metric_entity;
+    METRIC_VAR_DECLARE_gauge_int64(test_replica_gauge_int64);
+    METRIC_VAR_DECLARE_counter(test_replica_counter);
+    METRIC_VAR_DECLARE_percentile_int64(test_replica_percentile_int64_ns);
+    METRIC_VAR_DECLARE_percentile_int64(test_replica_percentile_int64_us);
+    METRIC_VAR_DECLARE_percentile_int64(test_replica_percentile_int64_ms);
+    METRIC_VAR_DECLARE_percentile_int64(test_replica_percentile_int64_s);
+
+    DISALLOW_COPY_AND_ASSIGN(MetricVarTest);
+};
+
+MetricVarTest::MetricVarTest()
+    : _my_replica_metric_entity(METRIC_ENTITY_my_replica.instantiate("replica_var_test")),
+      METRIC_VAR_INIT_my_replica(test_replica_gauge_int64),
+      METRIC_VAR_INIT_my_replica(test_replica_counter),
+      METRIC_VAR_INIT_my_replica(test_replica_percentile_int64_ns),
+      METRIC_VAR_INIT_my_replica(test_replica_percentile_int64_us),
+      METRIC_VAR_INIT_my_replica(test_replica_percentile_int64_ms),
+      METRIC_VAR_INIT_my_replica(test_replica_percentile_int64_s)
+{
+}
+
+#define METRIC_VAR_SAMPLES(name) METRIC_VAR_NAME(name)->samples_for_test()
+
+void MetricVarTest::test_set_percentile(const std::vector<int64_t> &expected_samples)
+{
+    for (const auto &val : expected_samples) {
+        METRIC_VAR_SET(test_replica_percentile_int64_ns, val);
+    }
+    EXPECT_EQ(expected_samples, METRIC_VAR_SAMPLES(test_replica_percentile_int64_ns));
+}
+
+void MetricVarTest::test_set_percentile(size_t n, int64_t val)
+{
+    METRIC_VAR_SET(test_replica_percentile_int64_ns, n, val);
+    EXPECT_EQ(std::vector<int64_t>(n, val), METRIC_VAR_SAMPLES(test_replica_percentile_int64_ns));
+}
+
+void MetricVarTest::test_auto_count()
+{
+    ASSERT_EQ(0, METRIC_VAR_VALUE(test_replica_gauge_int64));
+
+    {
+        METRIC_VAR_AUTO_COUNT(test_replica_gauge_int64, [this]() {
+            ASSERT_EQ(1, METRIC_VAR_VALUE(test_replica_gauge_int64));
+        });
+    }
+
+    ASSERT_EQ(0, METRIC_VAR_VALUE(test_replica_gauge_int64));
+}
+
+#define TEST_METRIC_VAR_INCREMENT(name)                                                            \
+    do {                                                                                           \
+        ASSERT_EQ(0, METRIC_VAR_VALUE(name));                                                      \
+                                                                                                   \
+        METRIC_VAR_INCREMENT(name);                                                                \
+        ASSERT_EQ(1, METRIC_VAR_VALUE(name));                                                      \
+                                                                                                   \
+        METRIC_VAR_INCREMENT(name);                                                                \
+        ASSERT_EQ(2, METRIC_VAR_VALUE(name));                                                      \
+                                                                                                   \
+        METRIC_VAR_INCREMENT_BY(name, 5);                                                          \
+        ASSERT_EQ(7, METRIC_VAR_VALUE(name));                                                      \
+                                                                                                   \
+        METRIC_VAR_INCREMENT_BY(name, 18);                                                         \
+        ASSERT_EQ(25, METRIC_VAR_VALUE(name));                                                     \
+    } while (0);
+
+TEST_F(MetricVarTest, IncrementGauge) { TEST_METRIC_VAR_INCREMENT(test_replica_gauge_int64); }
+
+TEST_F(MetricVarTest, IncrementCounter) { TEST_METRIC_VAR_INCREMENT(test_replica_counter); }
+
+#define TEST_METRIC_VAR_DECREMENT(name)                                                            \
+    do {                                                                                           \
+        ASSERT_EQ(0, METRIC_VAR_VALUE(name));                                                      \
+                                                                                                   \
+        METRIC_VAR_INCREMENT_BY(name, 11);                                                         \
+        ASSERT_EQ(11, METRIC_VAR_VALUE(name));                                                     \
+                                                                                                   \
+        METRIC_VAR_DECREMENT(name);                                                                \
+        ASSERT_EQ(10, METRIC_VAR_VALUE(name));                                                     \
+                                                                                                   \
+        METRIC_VAR_DECREMENT(name);                                                                \
+        ASSERT_EQ(9, METRIC_VAR_VALUE(name));                                                      \
+                                                                                                   \
+        METRIC_VAR_INCREMENT(name);                                                                \
+        ASSERT_EQ(10, METRIC_VAR_VALUE(name));                                                     \
+                                                                                                   \
+        METRIC_VAR_DECREMENT(name);                                                                \
+        ASSERT_EQ(9, METRIC_VAR_VALUE(name));                                                      \
+    } while (0);
+
+TEST_F(MetricVarTest, DecrementGauge) { TEST_METRIC_VAR_DECREMENT(test_replica_gauge_int64); }
+
+TEST_F(MetricVarTest, SetGauge)
+{
+    ASSERT_EQ(0, METRIC_VAR_VALUE(test_replica_gauge_int64));
+
+    METRIC_VAR_SET(test_replica_gauge_int64, 5);
+    ASSERT_EQ(5, METRIC_VAR_VALUE(test_replica_gauge_int64));
+
+    METRIC_VAR_SET(test_replica_gauge_int64, 18);
+    ASSERT_EQ(18, METRIC_VAR_VALUE(test_replica_gauge_int64));
+}
+
+TEST_F(MetricVarTest, SetPercentileIndividually) { test_set_percentile({20, 50, 10, 25, 16}); }
+
+TEST_F(MetricVarTest, SetPercentileRepeatedly) { test_set_percentile(5, 100); }
+
+#define TEST_METRIC_VAR_AUTO_LATENCY(unit_abbr, factor)                                            \
+    do {                                                                                           \
+        auto start_time_ns = dsn_now_ns();                                                         \
+        uint64_t actual_latency_ns = 0;                                                            \
+        {                                                                                          \
+            METRIC_VAR_AUTO_LATENCY(test_replica_percentile_int64_##unit_abbr,                     \
+                                    start_time_ns,                                                 \
+                                    [&actual_latency_ns](uint64_t latency) mutable {               \
+                                        actual_latency_ns = latency * factor;                      \
+                                    });                                                            \
+        }                                                                                          \
+                                                                                                   \
+        uint64_t expected_latency_ns = dsn_now_ns() - start_time_ns;                               \
+        ASSERT_GE(expected_latency_ns, actual_latency_ns);                                         \
+        EXPECT_LT(expected_latency_ns - actual_latency_ns, 1000 * 1000);                           \
+    } while (0)
+
+TEST_F(MetricVarTest, AutoLatencyNanoSeconds) { TEST_METRIC_VAR_AUTO_LATENCY(ns, 1); }
+
+TEST_F(MetricVarTest, AutoLatencyMicroSeconds) { TEST_METRIC_VAR_AUTO_LATENCY(us, 1000); }
+
+TEST_F(MetricVarTest, AutoLatencyMilliSeconds) { TEST_METRIC_VAR_AUTO_LATENCY(ms, 1000 * 1000); }
+
+TEST_F(MetricVarTest, AutoLatencySeconds) { TEST_METRIC_VAR_AUTO_LATENCY(s, 1000 * 1000 * 1000); }
+
+TEST_F(MetricVarTest, AutoCount) { ASSERT_NO_FATAL_FAILURE(test_auto_count()); }
 
 } // namespace dsn

@@ -19,7 +19,14 @@
 
 #pragma once
 
+#include <rocksdb/slice.h>
+#include <memory>
+#include <string>
+
 #include "pegasus_value_schema.h"
+#include "utils/blob.h"
+#include <string_view>
+#include "value_field.h"
 
 namespace pegasus {
 /**
@@ -31,7 +38,7 @@ class value_schema_v2 : public value_schema
 public:
     value_schema_v2() = default;
 
-    std::unique_ptr<value_field> extract_field(dsn::string_view value,
+    std::unique_ptr<value_field> extract_field(std::string_view value,
                                                value_field_type type) override;
     dsn::blob extract_user_data(std::string &&value) override;
     void update_field(std::string &value, std::unique_ptr<value_field> field) override;
@@ -39,8 +46,8 @@ public:
     data_version version() const override { return data_version::VERSION_2; }
 
 private:
-    std::unique_ptr<value_field> extract_timestamp(dsn::string_view value);
-    std::unique_ptr<value_field> extract_time_tag(dsn::string_view value);
+    std::unique_ptr<value_field> extract_timestamp(std::string_view value);
+    std::unique_ptr<value_field> extract_time_tag(std::string_view value);
     void update_expire_ts(std::string &value, std::unique_ptr<value_field> field);
 };
 } // namespace pegasus

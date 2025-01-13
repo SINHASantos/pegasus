@@ -24,15 +24,6 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 
 #include "utils/singleton.h"
@@ -129,5 +120,5 @@ private:
 };
 
 //------------- inline implementation ----------
-}
-} // end namespace dsn::utils
+} // namespace utils
+} // namespace dsn

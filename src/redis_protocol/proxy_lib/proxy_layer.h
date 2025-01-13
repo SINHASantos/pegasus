@@ -19,22 +19,22 @@
 
 #pragma once
 
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
-#include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
-#include "runtime/serverlet.h"
-#include "runtime/service_app.h"
-#include "runtime/rpc/rpc_address.h"
-#include "utils/zlocks.h"
-#include <unordered_map>
+#include <atomic>
 #include <functional>
+#include <memory>
+#include <string>
+#include <unordered_map>
+
+#include "rpc/rpc_address.h"
+#include "rpc/rpc_host_port.h"
+#include "runtime/serverlet.h"
+#include "task/task_code.h"
+#include "utils/threadpool_code.h"
+#include "utils/zlocks.h"
+
+namespace dsn {
+class message_ex;
+} // namespace dsn
 
 namespace pegasus {
 namespace proxy {
@@ -45,6 +45,7 @@ DEFINE_TASK_CODE_RPC(RPC_CALL_RAW_SESSION_DISCONNECT,
 DEFINE_TASK_CODE_RPC(RPC_CALL_RAW_MESSAGE, TASK_PRIORITY_COMMON, ::dsn::THREAD_POOL_DEFAULT)
 
 class proxy_stub;
+
 class proxy_session : public std::enable_shared_from_this<proxy_session>
 {
 public:
@@ -70,6 +71,8 @@ protected:
     virtual bool parse(dsn::message_ex *msg) = 0;
     dsn::message_ex *create_response();
 
+    const char *log_prefix() const { return _session_remote_str.c_str(); }
+
 protected:
     proxy_stub *_stub;
     std::atomic_bool _is_session_reset;
@@ -77,8 +80,10 @@ protected:
     // when get message from raw parser, request & response of "dsn::message_ex*" are not in couple.
     // we need to backup one request to create a response struct.
     dsn::message_ex *_backup_one_request;
-    // the client address for which this session served
-    dsn::rpc_address _remote_address;
+    // The client for which this session served for.
+    // The source IP address is possible to be reverse un-resolved, so use rpc_address directly.
+    dsn::rpc_address _session_remote;
+    std::string _session_remote_str;
 };
 
 class proxy_stub : public ::dsn::serverlet<proxy_stub>
@@ -111,9 +116,10 @@ private:
     void on_recv_remove_session_request(dsn::message_ex *);
 
     ::dsn::zrwlock_nr _lock;
+    // The source IP address is possible to be un-reverse resolved, so use rpc_address.
     std::unordered_map<::dsn::rpc_address, std::shared_ptr<proxy_session>> _sessions;
     proxy_session::factory _factory;
-    ::dsn::rpc_address _uri_address;
+    ::dsn::host_port _uri_address;
     std::string _cluster;
     std::string _app;
     std::string _geo_app;

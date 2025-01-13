@@ -18,7 +18,13 @@
  */
 
 #include <pegasus/client.h>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "../base/pegasus_utils.h"
+#include "utils/enum_helper.h"
 
 using namespace ::dsn;
 
@@ -84,4 +90,4 @@ void pegasus_client::mutations::get_mutations(std::vector<mutate> &mutations) co
         mutations[pair.first].set_expire_ts_seconds = pair.second + current_time;
     }
 }
-}
+} // namespace pegasus

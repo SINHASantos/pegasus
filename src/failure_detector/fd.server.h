@@ -24,15 +24,6 @@
  * THE SOFTWARE.
  */
 
-/*
- * Description:
- *     What is this file about?
- *
- * Revision history:
- *     xxxx-xx-xx, author, first version
- *     xxxx-xx-xx, author, fix bug about xxx
- */
-
 #pragma once
 #include "fd.code.definition.h"
 #include <iostream>
@@ -64,5 +55,5 @@ public:
 
     void close_service() { this->unregister_rpc_handler(RPC_FD_FAILURE_DETECTOR_PING); }
 };
-}
-}
+} // namespace fd
+} // namespace dsn

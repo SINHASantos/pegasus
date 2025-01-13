@@ -26,19 +26,30 @@
 
 #pragma once
 
-#include "utils/zlocks.h"
-#include "block_service/block_service.h"
-#include "common/json_helper.h"
+#include <stdint.h>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 
+#include "bulk_load_types.h"
+#include "common/gpid.h"
+#include "common/replication_common.h"
+#include "common/replication_other_types.h"
+#include "consensus_types.h"
+#include "dsn.layer2_types.h"
+#include "metadata_types.h"
 #include "mutation.h"
-
-class replication_service_test_app;
+#include "rpc/rpc_host_port.h"
+#include "runtime/api_layer1.h"
+#include "task/task.h"
+#include "utils/autoref_ptr.h"
+#include "utils/fmt_logging.h"
 
 namespace dsn {
 namespace replication {
 
 class replica;
-class replica_stub;
 
 struct remote_learner_state
 {
@@ -48,7 +59,7 @@ struct remote_learner_state
     std::string last_learn_log_file;
 };
 
-typedef std::unordered_map<::dsn::rpc_address, remote_learner_state> learner_map;
+typedef std::unordered_map<::dsn::host_port, remote_learner_state> learner_map;
 
 #define CLEANUP_TASK(task_, force)                                                                 \
     {                                                                                              \
@@ -74,6 +85,7 @@ typedef std::unordered_map<::dsn::rpc_address, remote_learner_state> learner_map
         }                                                                                          \
     }
 
+// Context of the primary replica.
 class primary_context
 {
 public:
@@ -88,27 +100,27 @@ public:
     void cleanup(bool clean_pending_mutations = true);
     bool is_cleaned();
 
-    void reset_membership(const partition_configuration &config, bool clear_learners);
+    void reset_membership(const partition_configuration &new_pc, bool clear_learners);
     void get_replica_config(partition_status::type status,
                             /*out*/ replica_configuration &config,
                             uint64_t learner_signature = invalid_signature);
-    bool check_exist(::dsn::rpc_address node, partition_status::type status);
-    partition_status::type get_node_status(::dsn::rpc_address addr) const;
+    bool check_exist(const ::dsn::host_port &node, partition_status::type status);
+    partition_status::type get_node_status(const ::dsn::host_port &hp) const;
 
     void do_cleanup_pending_mutations(bool clean_pending_mutations = true);
 
     // reset bulk load states in secondary_bulk_load_states by node address
-    void reset_node_bulk_load_states(const rpc_address &node);
+    void reset_node_bulk_load_states(const host_port &node);
 
     void cleanup_bulk_load_states();
 
     void cleanup_split_states();
 
-    bool secondary_disk_space_insufficient() const;
+    bool secondary_disk_abnormal() const;
 
 public:
     // membership mgr, including learners
-    partition_configuration membership;
+    partition_configuration pc;
     node_statuses statuses;
     learner_map learners;
     uint64_t next_learning_version;
@@ -138,7 +150,7 @@ public:
 
     // Used for partition split
     // child addresses who has been caught up with its parent
-    std::unordered_set<dsn::rpc_address> caught_up_children;
+    std::unordered_set<dsn::host_port> caught_up_children;
 
     // Used for partition split
     // whether parent's write request should be sent to child synchronously
@@ -158,7 +170,7 @@ public:
 
     // Used partition split
     // secondary replica address who has paused or canceled split
-    std::unordered_set<rpc_address> split_stopped_secondary;
+    std::unordered_set<host_port> split_stopped_secondary;
 
     // Used for partition split
     // primary parent query child on meta_server task
@@ -169,15 +181,16 @@ public:
     // group bulk_load response tasks of RPC_GROUP_BULK_LOAD for each secondary replica
     node_tasks group_bulk_load_pending_replies;
     // bulk_load_state of secondary replicas
-    std::unordered_map<rpc_address, partition_bulk_load_state> secondary_bulk_load_states;
+    std::unordered_map<host_port, partition_bulk_load_state> secondary_bulk_load_states;
     // if primary send an empty prepare after ingestion succeed to gurantee secondary commit its
     // ingestion request
     bool ingestion_is_empty_prepare_sent{false};
 
-    // secondary rpc_address -> secondary disk_status
-    std::unordered_map<rpc_address, disk_status::type> secondary_disk_status;
+    // secondary host_port -> secondary disk_status
+    std::unordered_map<host_port, disk_status::type> secondary_disk_status;
 };
 
+// Context of the secondary replica.
 class secondary_context
 {
 public:
@@ -192,6 +205,7 @@ public:
     ::dsn::task_ptr catchup_with_private_log_task;
 };
 
+// Context of the potential secondary replica.
 class potential_secondary_context
 {
 public:
@@ -240,6 +254,7 @@ public:
     ::dsn::task_ptr completion_notify_task;
 };
 
+// Context of the partition split replica.
 class partition_split_context
 {
 public:
@@ -270,7 +285,7 @@ public:
     // see more in function `child_check_split_context` and `parent_check_states`
     task_ptr check_state_task;
 
-    // Used for split related perf-counter
+    // Used for split-related metrics.
     uint64_t splitting_start_ts_ns{0};
     uint64_t splitting_start_async_learn_ts_ns{0};
     uint64_t splitting_copy_file_count{0};
@@ -280,9 +295,9 @@ public:
 
 //---------------inline impl----------------------------------------------------------------
 
-inline partition_status::type primary_context::get_node_status(::dsn::rpc_address addr) const
+inline partition_status::type primary_context::get_node_status(const ::dsn::host_port &hp) const
 {
-    auto it = statuses.find(addr);
+    auto it = statuses.find(hp);
     return it != statuses.end() ? it->second : partition_status::PS_INACTIVE;
 }
 } // namespace replication

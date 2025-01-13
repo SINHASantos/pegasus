@@ -24,30 +24,25 @@
  * THE SOFTWARE.
  */
 
-#include <vector>
+#include <stdlib.h>
+#include <time.h>
+#include <chrono>
+#include <cstdint>
 #include <string>
-#include <functional>
 #include <thread>
+#include <utility>
+#include <vector>
 
-#include <boost/lexical_cast.hpp>
-#include <gtest/gtest.h>
-
-#include "runtime/api_task.h"
-#include "runtime/api_layer1.h"
-#include "runtime/app_model.h"
-#include "utils/api_utilities.h"
-#include "utils/error_code.h"
-#include "utils/threadpool_code.h"
-#include "runtime/task/task_code.h"
-#include "common/gpid.h"
-#include "runtime/rpc/serialization.h"
-#include "runtime/rpc/rpc_stream.h"
-#include "runtime/serverlet.h"
+#include "gtest/gtest.h"
 #include "runtime/service_app.h"
-#include "runtime/rpc/rpc_address.h"
-
+#include "task/task.h"
+#include "task/task_code.h"
+#include "utils/autoref_ptr.h"
+#include "utils/distributed_lock_service.h"
+#include "utils/error_code.h"
+#include "utils/fmt_logging.h"
+#include "utils/threadpool_code.h"
 #include "zookeeper/distributed_lock_service_zookeeper.h"
-#include "zookeeper/lock_struct.h"
 
 using namespace dsn;
 using namespace dsn::dist;
@@ -68,9 +63,9 @@ public:
 
     error_code start(const std::vector<std::string> &args)
     {
-        LOG_INFO("name: %s, argc=%u", info().full_name.c_str(), args.size());
+        LOG_INFO("name: {}, argc={}", info().full_name, args.size());
         for (const std::string &s : args)
-            LOG_INFO("argv: %s", s.c_str());
+            LOG_INFO("argv: {}", s);
         while (!ss_start)
             std::this_thread::sleep_for(std::chrono::seconds(1));
 
@@ -87,10 +82,7 @@ public:
                 [this](error_code ec, const std::string &name, int version) {
                     EXPECT_TRUE(ERR_OK == ec);
                     EXPECT_TRUE(name == this->info().full_name);
-                    LOG_INFO("lock: error_code: %s, name: %s, lock version: %d",
-                             ec.to_string(),
-                             name.c_str(),
-                             version);
+                    LOG_INFO("lock: error_code: {}, name: {}, lock version: {}", ec, name, version);
                 },
                 DLOCK_CALLBACK,
                 [](error_code, const std::string &, int) { CHECK(false, "session expired"); },
@@ -106,7 +98,7 @@ public:
             task_ptr unlock_task = _dlock_service->unlock(
                 "test_lock", info().full_name, true, DLOCK_CALLBACK, [](error_code ec) {
                     EXPECT_TRUE(ERR_OK == ec);
-                    LOG_INFO("unlock, error code: %s", ec.to_string());
+                    LOG_INFO("unlock, error code: {}", ec);
                 });
             unlock_task->wait();
             task_pair.second->cancel(false);
@@ -145,7 +137,7 @@ TEST(distributed_lock_service_zookeeper, simple_lock_unlock)
     while (!ss_finish)
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    LOG_INFO("actual result: %lld, expect_result:%lld", result, expect_reuslt);
+    LOG_INFO("actual result: {}, expect_result: {}", result, expect_reuslt);
     EXPECT_TRUE(result == expect_reuslt);
 }
 
@@ -171,14 +163,14 @@ TEST(distributed_lock_service_zookeeper, abnormal_api_call)
     cb_pair.first->wait();
 
     opt.create_if_not_exist = true;
-    cb_pair =
-        dlock_svc->lock(lock_id,
-                        my_id,
-                        DLOCK_CALLBACK,
-                        [](error_code ec, const std::string &, int) { ASSERT_TRUE(ec == ERR_OK); },
-                        DLOCK_CALLBACK,
-                        nullptr,
-                        opt);
+    cb_pair = dlock_svc->lock(
+        lock_id,
+        my_id,
+        DLOCK_CALLBACK,
+        [](error_code ec, const std::string &, int) { ASSERT_TRUE(ec == ERR_OK); },
+        DLOCK_CALLBACK,
+        nullptr,
+        opt);
     ASSERT_TRUE(cb_pair.first != nullptr && cb_pair.second != nullptr);
     cb_pair.first->wait();
 
@@ -216,16 +208,17 @@ TEST(distributed_lock_service_zookeeper, abnormal_api_call)
         });
     tsk->wait();
 
-    cb_pair2 = dlock_svc->lock(lock_id,
-                               my_id2,
-                               DLOCK_CALLBACK,
-                               [my_id2](error_code ec, const std::string &name, int) {
-                                   ASSERT_TRUE(ec == ERR_OK);
-                                   ASSERT_TRUE(name == my_id2);
-                               },
-                               DLOCK_CALLBACK,
-                               nullptr,
-                               opt);
+    cb_pair2 = dlock_svc->lock(
+        lock_id,
+        my_id2,
+        DLOCK_CALLBACK,
+        [my_id2](error_code ec, const std::string &name, int) {
+            ASSERT_TRUE(ec == ERR_OK);
+            ASSERT_TRUE(name == my_id2);
+        },
+        DLOCK_CALLBACK,
+        nullptr,
+        opt);
 
     bool result = cb_pair2.first->wait(2000);
     ASSERT_FALSE(result);
